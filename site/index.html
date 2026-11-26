@@ -245,8 +245,31 @@ section{position:relative;padding:150px var(--pad) 0}
 .rx{padding:150px 0 0}
 .rx .sh{padding:0 var(--pad);margin-bottom:0}
 .rx-track{position:relative;height:380vh}
-.rx-sticky{position:sticky;top:0;height:100vh;height:100svh;display:flex;flex-direction:column;justify-content:center;gap:30px;overflow:hidden}
+.rx-sticky{position:sticky;top:0;height:100vh;height:100svh;display:flex;flex-direction:column;justify-content:center;gap:26px;overflow:hidden;padding-top:40px}
 .rx-rail{display:flex;align-items:stretch;padding:0 var(--pad);will-change:transform}
+/* 步骤导航：告诉用户「这里能横向推进、一共几步、现在第几步」 */
+.rx-nav{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px 20px;padding:0 var(--pad)}
+.rx-steps{display:flex;flex-wrap:wrap;gap:6px}
+.rx-steps button{display:inline-flex;align-items:center;gap:8px;height:38px;padding:0 14px 0 8px;border:1px solid var(--line2);border-radius:9px;font:12.5px var(--mono);color:var(--fg3);transition:color .25s,border-color .25s,background .25s}
+.rx-steps button i{display:grid;place-items:center;min-width:26px;height:24px;padding:0 4px;border-radius:5px;background:var(--bg3);font:700 11px var(--mono);font-style:normal;color:var(--fg2);transition:.25s}
+.rx-steps button:hover{color:var(--ink);border-color:var(--line3)}
+.rx-steps button.done{color:var(--fg2)}.rx-steps button.done i{color:var(--ph)}
+.rx-steps button.on{color:var(--ink);border-color:rgba(var(--accent-rgb),.55);background:rgba(var(--accent-rgb),.06)}
+.rx-steps button.on i{background:var(--ph);color:#000;box-shadow:0 0 14px rgba(var(--accent-rgb),.5)}
+.rx-ctl{display:flex;align-items:center;gap:8px}
+.rx-hint{display:inline-flex;align-items:center;gap:10px;margin-right:8px;font:12px var(--mono);color:var(--fg2);transition:opacity .4s}
+.rx-hint.hide{opacity:0}
+.mouse{position:relative;width:16px;height:24px;border:1.5px solid var(--fg3);border-radius:8px}
+.mouse::after{content:"";position:absolute;left:50%;top:5px;width:2px;height:5px;margin-left:-1px;border-radius:1px;background:var(--ph);animation:wheel 1.6s var(--ease) infinite}
+@keyframes wheel{0%{transform:translateY(0);opacity:1}70%{transform:translateY(7px);opacity:0}100%{opacity:0}}
+.rx-btn{display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line2);border-radius:50%;font:16px var(--mono);color:var(--ink);transition:border-color .2s,background .2s,opacity .2s}
+.rx-btn:hover{border-color:var(--ph);background:rgba(var(--accent-rgb),.08)}
+.rx-btn:disabled{opacity:.3;cursor:default;border-color:var(--line2);background:none}
+.rx-bar{grid-column:1/-1;height:2px;border-radius:2px;background:var(--line2);overflow:hidden}
+.rx-bar i{display:block;height:100%;background:var(--ph);box-shadow:0 0 10px var(--ph);transform-origin:0 50%;transform:scaleX(0)}
+/* 视口两侧渐隐，暗示右边还有内容；可拖动 */
+.rx-view{overflow:hidden;cursor:grab;touch-action:pan-y;-webkit-mask:linear-gradient(90deg,transparent,#000 3%,#000 90%,transparent);mask:linear-gradient(90deg,transparent,#000 3%,#000 90%,transparent)}
+.rx-view.drag{cursor:grabbing}.rx-view.drag *{user-select:none}
 .st{position:relative;flex:none;width:clamp(300px,34vw,470px);display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:18px;background:var(--bg2);overflow:hidden;isolation:isolate;transition:border-color .4s}
 .st::before{content:"";position:absolute;right:-30px;top:-50px;width:230px;height:230px;border-radius:50%;background:radial-gradient(circle,var(--ph),var(--ph2) 45%,transparent 70%);filter:blur(50px);opacity:0;transition:opacity .6s;z-index:-1}
 .st.on{border-color:rgba(var(--accent-rgb),.4)}.st.on::before{opacity:.45}
@@ -274,7 +297,7 @@ section{position:relative;padding:150px var(--pad) 0}
 .energy svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
 .energy path{fill:none;vector-effect:non-scaling-stroke}
 .energy .base{stroke:var(--line2);stroke-width:1.2}
-.energy .lit{stroke:var(--ph);stroke-width:1.8;filter:drop-shadow(0 0 6px rgba(var(--accent-rgb),.7))}
+.energy .lit{stroke:var(--ph);stroke-width:1.8;filter:drop-shadow(0 0 6px rgba(var(--accent-rgb),.7));vector-effect:none}  /* 虚线长度按路径单位计算，不能用 non-scaling-stroke */
 .energy .ax{stroke:var(--line);stroke-dasharray:2 4;vector-effect:non-scaling-stroke}
 .en-dot{position:absolute;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border-radius:50%;background:var(--ph);box-shadow:0 0 0 4px rgba(var(--accent-rgb),.15),0 0 14px var(--ph)}
 .en-lab{position:absolute;transform:translate(-50%,-50%);font:10.5px var(--mono);color:var(--fg3)}
@@ -473,29 +496,22 @@ section{position:relative;padding:150px var(--pad) 0}
 .end h2 code{color:var(--ph);font-weight:500}
 .end p{margin:18px auto 30px;max-width:520px}
 .end .btns{display:flex;flex-wrap:wrap;justify-content:center;gap:10px}
-/* 荧光地平线字标：常亮的流光字 + 扫描线 + 终端光标 + 网格地面倒影 */
-.wm-wrap{position:relative;margin:90px calc(-1 * var(--pad)) 0;padding:0 var(--pad);isolation:isolate;user-select:none;-webkit-user-select:none}
-.wm-glow{position:absolute;left:var(--gx,50%);top:42%;width:min(1100px,90%);height:80%;transform:translate(-50%,-50%);z-index:-1;pointer-events:none;
-  background:radial-gradient(ellipse at 50% 50%,rgba(var(--accent-rgb),.32),rgba(63,174,95,.16) 38%,rgba(31,111,139,.1) 58%,transparent 72%);filter:blur(46px);transition:left .9s var(--ease);animation:wmBreath 7s ease-in-out infinite}
-@keyframes wmBreath{50%{opacity:.7;transform:translate(-50%,-50%) scale(1.06,.94)}}
-.wm{position:relative;display:inline-flex;align-items:flex-end;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap}
-.wm-t{position:relative;
-  background:linear-gradient(100deg,var(--ph2) 0%,var(--ph) 18%,#f6ffd8 27%,var(--ph) 36%,#8fd94a 52%,var(--ph2) 68%,#2f9a7a 82%,var(--ph2) 100%);background-size:240% 100%;
-  -webkit-background-clip:text;background-clip:text;color:transparent;animation:wmFlow 12s linear infinite;filter:drop-shadow(0 0 30px rgba(var(--accent-rgb),.35))}
-@keyframes wmFlow{to{background-position:-240% 0}}
-/* 鼠标白热高光：同一段文字叠一层，只在光斑处显形 */
-.wm-t::after{content:attr(data-t);position:absolute;inset:0;background:radial-gradient(260px circle at var(--mx,-999px) var(--my,-999px),#fff,rgba(246,255,216,.6) 30%,transparent 62%);-webkit-background-clip:text;background-clip:text;color:transparent}
-/* 终端扫描线 */
-.wm::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(var(--overlay-rgb),.32) 0 1px,transparent 1px 4px)}
-.wm-car{flex:none;width:.13em;height:.68em;margin:0 0 .1em .07em;background:var(--ph);box-shadow:0 0 30px var(--ph),0 0 90px rgba(var(--accent-rgb),.5);animation:wmBlink 1.1s steps(1) infinite}
-@keyframes wmBlink{60%{opacity:.12}}
-/* 倒影 + 地面 */
-.wm-ref{display:block;margin-top:-.04em;height:.55em;overflow:hidden;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap;transform:scaleY(-1);opacity:.2;pointer-events:none;
-  -webkit-mask:linear-gradient(to top,#000,transparent 85%);mask:linear-gradient(to top,#000,transparent 85%)}
-.wm-ref span{display:block;margin-top:-.35em;background:linear-gradient(100deg,var(--ph3),var(--ph2) 30%,var(--ph) 45%,var(--ph2) 70%,var(--ph3));-webkit-background-clip:text;background-clip:text;color:transparent;filter:blur(1.5px)}
-.wm-floor{position:absolute;left:0;right:0;bottom:0;height:42%;z-index:-1;pointer-events:none;
-  background-image:linear-gradient(rgba(var(--accent-rgb),.2) 1px,transparent 1px),linear-gradient(90deg,rgba(var(--accent-rgb),.2) 1px,transparent 1px);background-size:56px 56px;
-  transform:perspective(420px) rotateX(62deg);transform-origin:50% 100%;-webkit-mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);opacity:.55}
+/* 电子轨道字标：一颗电子绕字运行，走到哪照亮哪；鼠标靠近时电子被吸引过去 */
+.wm-wrap{position:relative;margin:90px calc(-1 * var(--pad)) 0;padding:6vw var(--pad) 3vw;isolation:isolate;user-select:none;-webkit-user-select:none}
+.wm-glow{position:absolute;left:0;top:0;width:min(760px,70vw);height:min(420px,40vw);margin:calc(min(420px,40vw) / -2) 0 0 calc(min(760px,70vw) / -2);z-index:-2;pointer-events:none;border-radius:50%;
+  background:radial-gradient(closest-side,rgba(var(--accent-rgb),.22),rgba(63,174,95,.1) 50%,transparent);filter:blur(30px);will-change:transform}
+.wm-orb{position:absolute;inset:0;width:100%;height:100%;z-index:-1;overflow:visible;pointer-events:none}
+.wm-orb ellipse{fill:none;stroke:rgba(var(--accent-rgb),.16);stroke-width:1;stroke-dasharray:3 7}
+.wm{position:relative;display:inline-block;font:700 clamp(44px,15vw,280px)/.9 var(--mono);letter-spacing:-.07em;white-space:nowrap}
+.wm-t{display:inline-block;
+  background:radial-gradient(var(--lr,360px) circle at var(--lx,30%) var(--ly,50%),#fbffe8 0,var(--ph) 13%,var(--ph2) 30%,#2b3426 58%,#20251e 78%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-stroke:1px rgba(var(--ink-rgb),.07)}
+.wm-e{position:absolute;left:0;top:0;z-index:2;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;background:#f6ffd6;pointer-events:none;will-change:transform;
+  box-shadow:0 0 10px 2px var(--ph),0 0 44px 10px rgba(var(--accent-rgb),.35)}
+.wm-e.back{z-index:-1}
+.wm-floor{position:absolute;left:0;right:0;bottom:0;height:40%;z-index:-2;pointer-events:none;
+  background-image:linear-gradient(rgba(var(--accent-rgb),.18) 1px,transparent 1px),linear-gradient(90deg,rgba(var(--accent-rgb),.18) 1px,transparent 1px);background-size:56px 56px;
+  transform:perspective(420px) rotateX(62deg);transform-origin:50% 100%;-webkit-mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);mask:radial-gradient(ellipse at 50% 100%,#000 10%,transparent 70%);opacity:.5}
 footer{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px;padding:26px var(--pad) calc(34px + env(safe-area-inset-bottom));border-top:1px solid var(--line);font:12px var(--mono);color:var(--fg3)}
 footer nav{display:flex;flex-wrap:wrap;gap:6px 18px}
 footer nav a:hover{color:var(--ph)}
@@ -591,6 +607,8 @@ footer nav a:hover{color:var(--ph)}
   .rx-track{height:auto}
   .rx-sticky{position:relative;height:auto;overflow:visible;padding-top:24px}
   .rx-rail{flex-direction:column;transform:none!important}
+  .rx-nav{display:none}
+  .rx-view{-webkit-mask:none;mask:none;cursor:auto;overflow:visible}
   .st,.prod{width:100%}.st p{min-height:0}
   .op{width:100%;height:52px}
   .op small{top:auto;left:calc(50% + 30px)}
@@ -627,13 +645,14 @@ footer nav a:hover{color:var(--ph)}
   .hud-primary .site-mark{width:20px;height:20px}
   .flask-f .btn{width:100%}
 }
-@media (max-height:760px) and (min-width:761px){.st p{display:none}.st-term{min-height:120px}.energy{height:90px}}
+@media (max-height:760px) and (min-width:761px){.st p{display:none}.st-term{min-height:120px}.energy{height:90px}.rx-sticky{gap:18px}}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
   .rv-pending .rv:not(.in){opacity:1;transform:none}
   .rx-track{height:auto}.rx-sticky{position:relative;height:auto;padding:40px 0}
   .rx-rail{flex-wrap:wrap;row-gap:16px;transform:none!important}
+  .rx-nav{display:none}.rx-view{-webkit-mask:none;mask:none}
   .st-term .ln,.det-term .ln{opacity:1;transform:none}
 }
 .brand .site-mark{width:24px;height:24px;flex:none}
@@ -843,7 +862,15 @@ footer nav a:hover{color:var(--ph)}
   </header>
   <div class="rx-track" id="rxTrack">
     <div class="rx-sticky" id="rxSticky">
-      <div class="rx-rail" id="rxRail"></div>
+      <div class="rx-nav" id="rxNav">
+        <div class="rx-steps" id="rxSteps" role="tablist"></div>
+        <div class="rx-ctl">
+          <span class="rx-hint" id="rxHint"><i class="mouse"></i><span data-i="r.hint">继续向下滚动，反应向右推进</span></span>
+          <button class="rx-btn" id="rxPrev" aria-label="上一步">←</button><button class="rx-btn" id="rxNext" aria-label="下一步">→</button>
+        </div>
+        <div class="rx-bar"><i id="rxBar"></i></div>
+      </div>
+      <div class="rx-view" id="rxView"><div class="rx-rail" id="rxRail"></div></div>
       <div class="energy" id="energy" aria-hidden="true">
         <svg viewBox="0 0 1000 120" preserveAspectRatio="none">
           <line class="ax" x1="0" y1="119" x2="1000" y2="119"/>
@@ -938,10 +965,11 @@ footer nav a:hover{color:var(--ph)}
     <a class="btn btn-g" href="docs/zh/index.html" data-doc="index" data-mag data-i="cta.b2">阅读文档</a>
   </div>
   <div class="wm-wrap" id="wmWrap" aria-hidden="true">
-    <div class="wm-glow"></div>
-    <div class="wm"><span class="wm-t" id="wm" data-t="AtomCode">AtomCode</span><i class="wm-car"></i></div>
-    <div class="wm-ref"><span>AtomCode</span></div>
     <div class="wm-floor"></div>
+    <div class="wm-glow" id="wmGlow"></div>
+    <svg class="wm-orb" id="wmOrb"><ellipse/></svg>
+    <div class="wm"><span class="wm-t" id="wm">AtomCode</span></div>
+    <i class="wm-e" id="wmE"></i>
   </div>
 </section>
 </main>
@@ -1064,7 +1092,7 @@ const T={
  't.eb':'§03 · Periodic table of capabilities','t.h':'21 elements<span class="dim"> make one coding agent</span>',
  't.hd':'Hover or use arrow keys to explore','t.hp':'Click to lock · live demo on the right · ⌘K to jump by symbol',
  d1:'Series',d2:'Period · Group',
- 'r.eb':'§04 · The reaction','r.h':'Small steps<span class="dim">, self-repair on failure</span>',
+ 'r.hint':'Keep scrolling — the reaction moves right','r.eb':'§04 · The reaction','r.h':'Small steps<span class="dim">, self-repair on failure</span>',
  'i.eb':'§05 · Workflow','i.h':'Same task<span class="dim">, two ways to verify changes</span>',
  'i.a':'small steps · verify each','i.alt':'Batch edits','i.b':'batch edits · verify at end','i.note':'Illustrative workflows. Step and check counts describe the examples shown.','i.t':'time →','i.t2':'time →',
  'y.eb':'§06 · Synthesis route','y.h':'Three steps<span class="dim"> to your coding agent</span>',
@@ -1326,15 +1354,54 @@ function buildRx(){
     `<div class="prod"><div class="big">✓</div><h3>${zh?'产物：一次已验证的修复':'Product: a verified fix'}</h3><ul>
      <li>${zh?'4 步 · 1 次自我纠错':'4 steps · 1 self-correction'}</li><li>12 passed · 0 failed</li><li>${zh?'Git 工作区可用 /rewind':'use /rewind in a Git workspace'}</li><li>${zh?'可直接提 PR 到 AtomGit':'ready to PR on AtomGit'}</li></ul></div>`;
   stEls=$$('.st',rail);opEls=$$('.op',rail);
+  renderRxSteps();rxLayout();
   $$('.en-lab',energy).forEach(x=>x.remove());
   EN_LAB.forEach(([t,x,y])=>{const s=document.createElement('span');s.className='en-lab'+(t==='✗'?' e':'');s.textContent=t;s.style.left=x/10+'%';s.style.top=y/1.2+'%';energy.appendChild(s)});
   rxScroll();
 }
+// 每个停靠点（4 张卡 + 产物）对应的横向位移
+let rxStops=[],rxMax=0,rxCur=-1;
+function rxLayout(){
+  if(narrow()||reduce){rxTrack.style.height='';return}
+  const vw=rxSticky.clientWidth;rxMax=Math.max(0,rail.scrollWidth-vw);
+  // 竖向滚动距离 ≈ 横向位移，手感 1:1
+  rxTrack.style.height=Math.round(rxMax*1.05+innerHeight)+'px';
+  const stops=[...stEls,$('.prod',rail)];
+  rxStops=stops.map(el=>clamp(el.offsetLeft-(vw-el.offsetWidth)/2,0,rxMax));
+  rxStops[0]=0;rxStops[rxStops.length-1]=rxMax;
+}
+function rxSpan(){return Math.max(1,rxTrack.offsetHeight-innerHeight)}
+function rxGo(i){
+  i=clamp(i,0,rxStops.length-1);
+  const top=rxTrack.getBoundingClientRect().top+scrollY;
+  scrollTo({top:top+(rxMax?rxStops[i]/rxMax:0)*rxSpan(),behavior:reduce?'auto':'smooth'});
+}
+function renderRxSteps(){
+  const zh=lang==='zh';
+  $('#rxSteps').innerHTML=STEPS.map((s,i)=>`<button role="tab" data-k="${i}"><i>${s.s}</i>${String(i+1).padStart(2,'0')} ${esc(L(s.t))}</button>`).join('')+
+    `<button role="tab" data-k="${STEPS.length}"><i>✓</i>${zh?'产物':'Result'}</button>`;
+  rxCur=-1;
+}
+$('#rxSteps').addEventListener('click',e=>{const b=e.target.closest('button');if(b)rxGo(+b.dataset.k)});
+$('#rxPrev').onclick=()=>rxGo(rxCur-1);$('#rxNext').onclick=()=>rxGo(rxCur+1);
+// 鼠标拖动 / 触屏横滑：把横向位移换算成页面滚动
+(()=>{const v=$('#rxView');let x0=null,moved=0;
+  v.addEventListener('pointerdown',e=>{if(narrow()||reduce)return;x0=e.clientX;moved=0;v.setPointerCapture&&v.setPointerCapture(e.pointerId)});
+  v.addEventListener('pointermove',e=>{if(x0===null)return;const dx=e.clientX-x0;x0=e.clientX;moved+=Math.abs(dx);if(moved>4)v.classList.add('drag');
+    scrollBy(0,-dx*rxSpan()/Math.max(1,rxMax))});
+  const end=()=>{x0=null;v.classList.remove('drag')};v.addEventListener('pointerup',end);v.addEventListener('pointercancel',end);
+  // 触控板横向滑动
+  rxSticky.addEventListener('wheel',e=>{if(narrow()||reduce)return;if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){e.preventDefault();scrollBy(0,e.deltaX*rxSpan()/Math.max(1,rxMax))}},{passive:false});
+})();
+addEventListener('keydown',e=>{
+  if(curSec!=='rx'||narrow()||reduce)return;const t=(document.activeElement||{}).tagName;if(t==='INPUT'||t==='TEXTAREA')return;
+  if(e.key==='ArrowRight'){e.preventDefault();rxGo(rxCur+1)}else if(e.key==='ArrowLeft'){e.preventDefault();rxGo(rxCur-1)}
+});
 function rxScroll(){
   if(narrow()||reduce){stEls.forEach(s=>{s.classList.add('on');$$('.ln',s).forEach(l=>l.classList.add('v'))});opEls.forEach(o=>o.classList.add('on'));return}
-  const r=rxTrack.getBoundingClientRect(),span=Math.max(1,rxTrack.offsetHeight-innerHeight);
+  const r=rxTrack.getBoundingClientRect(),span=rxSpan();
   const p=clamp(-r.top/span,0,1);
-  const vw=rxSticky.clientWidth,maxX=Math.max(0,rail.scrollWidth-vw);
+  const vw=rxSticky.clientWidth,maxX=rxMax;
   const tx=p*maxX;rail.style.transform=`translate3d(${(-tx).toFixed(1)}px,0,0)`;
   stEls.forEach((s,i)=>{
     const left=s.offsetLeft-tx,w=s.offsetWidth;
@@ -1344,6 +1411,12 @@ function rxScroll(){
     s.classList.toggle('on',lp>.05);
     if(opEls[i])opEls[i].classList.toggle('on',lp>=1);
   });
+  // 当前停靠点 = 最近的那一个
+  let k=0;rxStops.forEach((v,i)=>{if(Math.abs(v-tx)<Math.abs(rxStops[k]-tx))k=i});
+  if(k!==rxCur){rxCur=k;$$('#rxSteps button').forEach((b,i)=>{b.classList.toggle('on',i===k);b.classList.toggle('done',i<k);b.setAttribute('aria-selected',i===k)})}
+  $('#rxPrev').disabled=p<=.001;$('#rxNext').disabled=p>=.999;
+  $('#rxBar').style.transform=`scaleX(${p.toFixed(4)})`;
+  $('#rxHint').classList.toggle('hide',p>.04);
   enLit.style.strokeDashoffset=enLen*(1-p);
   const pt=enLit.getPointAtLength(enLen*p);enDot.style.left=pt.x/10+'%';enDot.style.top=pt.y/1.2+'%';
 }
@@ -1577,6 +1650,7 @@ function applyLang(){
   palIn.placeholder=zh?'输入命令或元素符号，例如 undo、Ud、npm…':'Type a command or symbol — undo, Ud, npm…';
   pIn.setAttribute('aria-label',zh?'试着向 AtomCode 提问':'Try asking AtomCode');
   knob.setAttribute('aria-label',zh?'拖动分割线对比':'Drag to compare');
+  $('#rxPrev').setAttribute('aria-label',zh?'上一步':'Previous step');$('#rxNext').setAttribute('aria-label',zh?'下一步':'Next step');
   $$('[data-doc]').forEach(a=>a.href=docUrl(a.dataset.doc));
   menuBtn.setAttribute('aria-label',zh?'菜单':'Menu');
   railClose.setAttribute('aria-label',zh?'关闭菜单':'Close menu');
@@ -1608,7 +1682,7 @@ function onScroll(){
   });
 }
 addEventListener('scroll',onScroll,{passive:true});
-let rzT;addEventListener('resize',()=>{clearTimeout(rzT);rzT=setTimeout(()=>{layoutOrb();if(reduce)orbFrame(0);rxScroll();buildCovers()},120)});
+let rzT;addEventListener('resize',()=>{clearTimeout(rzT);rzT=setTimeout(()=>{layoutOrb();if(reduce)orbFrame(0);rxLayout();rxScroll();buildCovers();wmLayout()},120)});
 
 /* ==================== 入场 / 磁吸 / 手电筒 / 光标 ==================== */
 const rvIO=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');rvIO.unobserve(e.target)}}),{rootMargin:'0px 0px -8% 0px'});
@@ -1630,15 +1704,39 @@ if(fine&&!reduce){
   document.documentElement.addEventListener('pointerleave',()=>c.classList.remove('show'));
   (function f(){cx+=(mx-cx)*.2;cy+=(my-cy)*.2;c.style.transform=`translate3d(${cx.toFixed(1)}px,${cy.toFixed(1)}px,0)`;requestAnimationFrame(f)})();
 }
-const wm=$('#wm'),wmWrap=$('#wmWrap');
+const wm=$('#wm'),wmWrap=$('#wmWrap'),wmE=$('#wmE'),wmGlow=$('#wmGlow'),wmEl=$('#wmOrb ellipse');
 watch(wmWrap);
-// 鼠标：字上加白热高光，背后光晕向鼠标方向偏移
-track($('#end'),e=>{const r=wm.getBoundingClientRect(),wr=wmWrap.getBoundingClientRect();
-  wm.style.setProperty('--mx',(e.clientX-r.left)+'px');wm.style.setProperty('--my',(e.clientY-r.top)+'px');
-  wmWrap.style.setProperty('--gx',clamp((e.clientX-wr.left)/wr.width*100,25,75).toFixed(1)+'%')});
-$('#end').addEventListener('pointerleave',()=>{wm.style.setProperty('--mx','-999px');wmWrap.style.removeProperty('--gx')});
-// 首次进入视口时像终端输出一样解码打出
-if(!reduce){const wmIO=new IntersectionObserver(es=>{if(es[0].isIntersecting){wmIO.disconnect();scramble(wm,'AtomCode',1100)}},{threshold:.4});wmIO.observe(wmWrap)}
+// 轨道几何：以字标为中心的倾斜椭圆
+const WO={cx:0,cy:0,rx:0,ry:0,tl:-.12,ox:0,oy:0};
+let wmX=0,wmY=0,wmHover=null;
+function wmLayout(){
+  const wr=wmWrap.getBoundingClientRect(),tr=wm.getBoundingClientRect();
+  WO.ox=tr.left-wr.left;WO.oy=tr.top-wr.top;
+  WO.cx=WO.ox+tr.width/2;WO.cy=WO.oy+tr.height*.52;WO.rx=tr.width*.56;WO.ry=tr.height*.78;
+  wmEl.setAttribute('cx',WO.cx);wmEl.setAttribute('cy',WO.cy);wmEl.setAttribute('rx',WO.rx);wmEl.setAttribute('ry',WO.ry);
+  wmEl.setAttribute('transform',`rotate(${WO.tl*57.3} ${WO.cx} ${WO.cy})`);
+}
+function wmFrame(t){
+  const a=t*.00042,ca=Math.cos(WO.tl),sa=Math.sin(WO.tl);
+  const x0=Math.cos(a)*WO.rx,y0=Math.sin(a)*WO.ry;
+  let tx=WO.cx+x0*ca-y0*sa,ty=WO.cy+x0*sa+y0*ca,front=Math.sin(a)>0;
+  if(wmHover){tx=wmHover[0];ty=wmHover[1];front=true}
+  wmX+=(tx-wmX)*(wmHover?.14:.08);wmY+=(ty-wmY)*(wmHover?.14:.08);
+  const k=front?1:.62;                                  // 在字后方时更小更暗
+  wmE.style.transform=`translate3d(${wmX.toFixed(1)}px,${wmY.toFixed(1)}px,0) scale(${k})`;wmE.classList.toggle('back',!front);
+  wmGlow.style.transform=`translate3d(${wmX.toFixed(1)}px,${wmY.toFixed(1)}px,0)`;
+  wm.style.setProperty('--lx',(wmX-WO.ox).toFixed(1)+'px');wm.style.setProperty('--ly',(wmY-WO.oy).toFixed(1)+'px');
+  wm.style.setProperty('--lr',(front?Math.max(260,WO.rx*.75):Math.max(180,WO.rx*.48)).toFixed(0)+'px');
+}
+track($('#end'),e=>{const wr=wmWrap.getBoundingClientRect();const x=e.clientX-wr.left,y=e.clientY-wr.top;
+  wmHover=(y>-40&&y<wr.height+40)?[x,y]:null});
+$('#end').addEventListener('pointerleave',()=>{wmHover=null});
+wmLayout();wmX=WO.cx-WO.rx*.6;wmY=WO.cy;
+if(reduce)wmFrame(Math.PI/2/.00042*.2);
+else{(function wmLoop(t){if(isVis(wmWrap))wmFrame(t);requestAnimationFrame(wmLoop)})(0);
+  // 首次进入视口时像终端输出一样解码打出
+  const wmIO=new IntersectionObserver(es=>{if(es[0].isIntersecting){wmIO.disconnect();scramble(wm,'AtomCode',1100)}},{threshold:.4});wmIO.observe(wmWrap)}
+if(document.fonts)document.fonts.ready.then(wmLayout);
 
 /* ==================== 启动 ==================== */
 layoutOrb();applyLang();buildCovers();tuiNext();
