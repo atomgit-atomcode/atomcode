@@ -4,7 +4,7 @@ use std::path::Path;
 
 use atomcode_kernel::message::Role;
 
-use super::SessionManager;
+use super::{SessionManager, SessionStoreError};
 
 pub const MAX_REFERENCES: usize = 4;
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
@@ -125,6 +125,20 @@ fn parsed(text: &str) -> Result<(Vec<SessionReference>, Vec<std::ops::Range<usiz
     Ok((result, ranges))
 }
 
+/// Human-readable failure for the one oversize case a person can actually fix:
+/// the referenced session's dialogue snapshot exceeds the attachment budget.
+/// Say what is over, by how much, and the way back — run a compaction there so
+/// the projection shrinks below the budget, then reference it again.
+fn projection_too_large_message(id: &str, limit: usize, actual: usize) -> String {
+    let over = actual.saturating_sub(limit);
+    format!(
+        "Cannot reference session {id}: its reference projection (the snapshot of its \
+         dialogue) is {actual} bytes, over the {limit}-byte attachment budget by {over}. \
+         Run a compaction in that session (e.g. `/compact`) so the projection shrinks \
+         below the budget, then reference it again."
+    )
+}
+
 /// Read strict native aggregates, using the existing committed event projection.
 /// Keep only visible user/assistant text. JSON framing escapes source text so a
 /// source cannot forge another excerpt's metadata or closing delimiters.
@@ -146,7 +160,14 @@ pub fn resolve(root: &Path, references: &[SessionReference]) -> Result<String, S
         }
         let (meta, projected, clipped, captured_through_seq) = SessionManager::with_root(folder)
             .reference_projection(&reference.id, MAX_RETAINED_BYTES)
-            .map_err(|e| format!("Cannot reference session {}: {e}", reference.id))?;
+            .map_err(|e| match &e {
+                SessionStoreError::TooLarge {
+                    kind: "reference projection",
+                    limit,
+                    actual,
+                } => projection_too_large_message(&reference.id, *limit, *actual),
+                _ => format!("Cannot reference session {}: {e}", reference.id),
+            })?;
         if meta.parent.is_some() || meta.origin == super::manager::SessionOrigin::Delegated {
             return Err("A delegated session cannot be referenced independently".into());
         }
@@ -331,6 +352,18 @@ pub fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_too_large_message_says_what_over_by_how_much_and_the_way_back() {
+        assert_eq!(
+            projection_too_large_message("fe2558bb", 8_388_608, 8_388_630),
+            "Cannot reference session fe2558bb: its reference projection (the snapshot of \
+             its dialogue) is 8388630 bytes, over the 8388608-byte attachment budget by 22. \
+             Run a compaction in that session (e.g. `/compact`) so the projection shrinks \
+             below the budget, then reference it again."
+        );
+    }
+
     #[test]
     fn references_are_explicit_stable_and_deduplicated() {
         let r = SessionReference {

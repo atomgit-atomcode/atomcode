@@ -242,7 +242,11 @@ impl fmt::Display for SessionStoreError {
                 limit,
                 actual,
             } => {
-                write!(f, "{kind} exceeds {limit} bytes/items (actual {actual})")
+                let over = actual.saturating_sub(*limit);
+                write!(
+                    f,
+                    "the {kind} is over budget: limit {limit}, got {actual} (over by {over})"
+                )
             }
             Self::FutureSchema {
                 kind,
@@ -6561,6 +6565,19 @@ mod tests {
                 actual: 9
             })
         ));
+    }
+
+    #[test]
+    fn too_large_display_says_what_over_by_how_much() {
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "reference projection",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "the reference projection is over budget: limit 8388608, got 8388630 (over by 22)"
+        );
     }
 
     #[test]
