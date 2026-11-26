@@ -1162,7 +1162,7 @@ impl ModelSaid {
             }
             offset += line.len();
         }
-        start.map(|start| &self.0[start..end]).unwrap_or("")
+        start.and_then(|start| self.0.get(start..end)).unwrap_or("")
     }
 }
 
