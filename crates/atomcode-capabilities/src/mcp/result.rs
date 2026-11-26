@@ -114,7 +114,11 @@ fn remove_duplicate_image_urls(text: &mut String, images: &[ImageContent]) {
         }
     }
     if visit(&mut value, &urls) {
-        *text = serde_json::to_string(&value).expect("JSON value serializes");
+        // A value that parsed re-serializes; should it not, keep the original
+        // text rather than panic inside a tool-result rewrite.
+        if let Ok(rendered) = serde_json::to_string(&value) {
+            *text = rendered;
+        }
     }
 }
 
