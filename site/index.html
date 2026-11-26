@@ -70,7 +70,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
 .frame i:nth-child(1){left:-6px;top:-6px}.frame i:nth-child(2){right:-6px;top:-6px}
 .frame i:nth-child(3){left:-6px;bottom:-6px}.frame i:nth-child(4){right:-6px;bottom:-6px}
 .hud-primary{display:contents}
-.hero-actions,.rail-close{display:none}
+.hero-actions,.rail .rail-close{display:none}
 .hud{position:fixed;z-index:45;display:flex;align-items:center;gap:8px;font:12px/1 var(--mono);color:var(--fg2)}
 .hud-tl{top:calc(var(--fr) + 12px);left:calc(var(--fr) + 12px)}
 .hud-tr{top:calc(var(--fr) + 12px);right:calc(var(--fr) + 12px)}
@@ -167,7 +167,10 @@ section{position:relative;padding:150px var(--pad) 0}
 .orbits{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:1}
 .orbits ellipse{fill:none;stroke:rgba(var(--ink-rgb),.12);stroke-width:1}
 .orbits ellipse.o1{stroke-dasharray:2 6}
-.chip{position:absolute;left:50%;top:50%;display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 11px;border:1px solid rgba(var(--ink-rgb),.16);border-radius:8px;background:rgba(16,19,16,.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);font:11.5px var(--mono);color:var(--ink);white-space:nowrap;will-change:transform,opacity;pointer-events:none}
+.orbit-models{display:contents}
+.orbit-integrations{position:absolute;inset:auto 0 5%;z-index:3;display:flex;justify-content:center;gap:6px}
+.orbit-integrations span{padding:3px 7px;border:1px solid var(--line2);border-radius:6px;background:var(--bg2);color:var(--fg2);font:11px/1.4 var(--mono);white-space:nowrap}
+.chip{position:absolute;left:50%;top:50%;display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 11px;border:1px solid rgba(var(--ink-rgb),.16);border-radius:8px;background:rgba(16,19,16,.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);font:11.5px var(--mono);color:var(--ink);white-space:nowrap;transform:var(--orbit-position);opacity:var(--orbit-opacity,1);z-index:var(--orbit-layer,1);will-change:transform,opacity;pointer-events:none}
 .light .chip{background:rgba(var(--overlay-rgb),.8)}
 .chip i{width:6px;height:6px;border-radius:50%;background:var(--s-model);box-shadow:0 0 8px var(--s-model)}
 .elem-wrap{position:relative;z-index:2;width:min(400px,62%);aspect-ratio:1;perspective:900px}
@@ -454,7 +457,7 @@ section{position:relative;padding:150px var(--pad) 0}
   .rail{top:0;bottom:0;left:0;width:min(300px,84vw);padding:calc(18px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));background:var(--bg2);border-right:1px solid var(--line2);transform:translateX(-102%);transition:transform .4s var(--ease);z-index:70}
   .rail{overflow-y:auto;overscroll-behavior:contain}
   .rail .brand{margin-bottom:18px}
-  .rail-close{display:grid;place-items:center;align-self:flex-end;flex:none;width:44px;height:44px;margin-bottom:12px}
+  .rail .rail-close{display:grid;place-items:center;align-self:flex-end;flex:none;width:44px;height:44px;margin-bottom:12px}
   html:has(.rail.open){overflow:hidden}
   .rail:not(.open){visibility:hidden}
   .rail.open{transform:none}
@@ -547,7 +550,7 @@ footer nav a:hover{color:var(--ph)}
   .hero-actions{display:flex;flex-wrap:wrap;gap:8px}
   .hero-actions .btn{flex:0 1 auto;min-height:44px;padding:0 14px}
   .hero .prompt,.hero .prompt-note,.hero .mini-ins,.hero .h-meta,.elem-note{display:none}
-  .stage{order:0;max-width:280px}
+  .stage{--label-space:80px;order:0;max-width:296px;padding-bottom:var(--label-space)}
   .elem{border-radius:14px;box-shadow:0 16px 38px rgba(0,0,0,.30)}
   .elem-glow{filter:blur(25px)}
   .e-c{font-size:10px}.e-c small{font-size:8px}
@@ -555,7 +558,12 @@ footer nav a:hover{color:var(--ph)}
   .e-tl,.e-bl{left:10px}.e-tr,.e-br{right:10px}
   .e-tl b{font-size:20px}
   .e-sym{font-size:clamp(62px,17vw,93px)}
-  .chip{height:24px;padding:0 7px;font-size:10px;gap:4px}
+  .orbits{inset:0 0 auto;height:calc(100% - var(--label-space))}
+  .orbit-models{position:absolute;inset:auto 0 28px;z-index:3;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+  .chip{position:static;justify-content:center;height:23px;padding:0 4px;font-size:9.5px;gap:4px;transform:none;opacity:1;will-change:auto}
+  .chip i{flex:none}
+  .orbit-integrations{bottom:0}
+  .orbit-integrations span{font-size:10px}
   .surf,.d-grid{grid-template-columns:minmax(0,1fr)}
   .sf:hover{transform:none}
   .sf-b{order:-1;padding:16px}
@@ -655,7 +663,7 @@ footer nav a:hover{color:var(--ph)}
     <a href="#table" data-act="models"><i>[3]</i><span data-i="mn3">模型</span></a>
     <a href="https://ai.atomgit.com/serverless-api"><i>[4]</i><span>CodingPlan</span><em>↗</em></a>
     <a href="https://atomcode-plugin.atomgit.com"><i>[5]</i><span data-i="mn5">Skills 市场</span><em>↗</em></a>
-    <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases"><i>[6]</i><span data-i="mn6">更新日志</span><em>↗</em></a>
+    <a data-doc="changelog" href="docs/zh/changelog.html"><i>[6]</i><span data-i="mn6">更新日志</span></a>
   </nav>
   <div class="rail-ft">
     <a href="https://atomgit.com/atomgit_atomcode/atomcode">AtomGit ↗</a>
@@ -733,6 +741,8 @@ footer nav a:hover{color:var(--ph)}
         <i class="glare"></i>
       </div>
     </div>
+    <div class="orbit-models" id="orbitModels"></div>
+    <div class="orbit-integrations"><span>SiliconFlow</span><span>Ollama · local</span><span>MCP</span></div>
     <span class="elem-note en1" data-i="en1">FIG.01 · 元素 Ac</span>
     <span class="elem-note en2" data-i="en2">多模型绕核运转</span>
   </div>
@@ -907,7 +917,7 @@ footer nav a:hover{color:var(--ph)}
 <section id="docs" data-s="docs" data-n="§07">
   <header class="sh rv">
     <div class="sh-cell"><span>07</span><b>Dc</b></div>
-    <div><p class="eyebrow" data-i="c.eb">§07 · 文档</p><h2 data-i="c.h">19 篇文档<span class="dim">，从安装到自建中继</span></h2></div>
+    <div><p class="eyebrow" data-i="c.eb">§07 · 文档</p><h2 data-i="c.h">产品文档<span class="dim">，从安装到自建中继</span></h2></div>
     <p class="sh-meta">FIG.07 — documentation<br>atomcode.atomgit.com/docs</p>
   </header>
   <div class="docs rv">
@@ -1041,7 +1051,7 @@ const T={
  'u.n3':'Mobile','u.d3':'Install and run AtomCode on your computer. Enter <code>/webui</code> inside AtomCode, then scan the QR code in the terminal or the WebUI Remote Access panel with your phone. Keep AtomCode running on your computer.','u.a3':'Connect your phone','u.m1':'Launch on desktop · Scan on phone',
  'u.n4':'IDE plugins','u.d4':'Call AtomCode without leaving your editor, sharing the same models and config as the terminal.',
  'u.sync':'<code>/sync</code> keeps terminal, browser and phone on the same live session, reusing your local login, models and history',
- 'c.eb':'§07 · Docs','c.h':'19 guides<span class="dim">, from install to self-hosted relay</span>','c.home':'Docs home ↗',
+ 'c.eb':'§07 · Docs','c.h':'Product guides<span class="dim">, from install to self-hosted relay</span>','c.home':'Docs home ↗',
  pf1:'↑↓ select',pf2:'↵ run',pf3:'esc close',
  tag:'Open source · Multi-model · Built in Rust · MIT',
  h1:'The AI coding<br>agent in your terminal<span class="dim">that verifies every step</span>',
@@ -1066,27 +1076,33 @@ const ZH={};$$('[data-i]:not(.pal-list li)').forEach(el=>ZH[el.dataset.i]=el.inn
 const SEC={top:{zh:'元素',en:'Element',c:'element'},surf:{zh:'界面',en:'Surfaces',c:'surfaces'},table:{zh:'周期表',en:'Table',c:'table'},rx:{zh:'反应',en:'Reaction',c:'reaction'},iso:{zh:'工作流程',en:'Workflow',c:'workflow'},syn:{zh:'合成',en:'Synthesis',c:'install'},docs:{zh:'文档',en:'Docs',c:'docs'}};
 
 /* ==================== §01 原子轨道 + 元素卡 ==================== */
-const MLIST=[['Claude Sonnet 4.6',0],['GPT-4.1',1],['DeepSeek V3',2],['GLM-5',0],['Qwen-Max',1],['SiliconFlow',2],['Ollama · local',0],['MCP',1]];
-const ORB=[{r:.47,k:.34,phi:-20,sp:.00016},{r:.40,k:.42,phi:28,sp:-.00021},{r:.5,k:.16,phi:4,sp:.00012}];
-const stage=$('#stage'),orbSvg=$('#orbits');
-const chips=MLIST.map(([n,o],i)=>{const c=document.createElement('span');c.className='chip';c.innerHTML=`<i></i>${esc(n)}`;stage.appendChild(c);return {el:c,o,a:i*2.4+o}});
-let SW=0,OF=1,CH=0;
+const MLIST=[
+  'Qwen-3.8-27B',
+  'GLM-5.3-Flash',
+  'Deepseek-v4.1-Flash',
+  'Minimax-M3.1-Flash',
+];
+const ORB=[{r:.44,k:.61,phi:-20,sp:.00016},{r:.40,k:.42,phi:28,sp:-.00021},{r:.5,k:.16,phi:4,sp:.00012}];
+const stage=$('#stage'),orbSvg=$('#orbits'),orbitModels=$('#orbitModels');
+const chips=MLIST.map((n,i)=>{const c=document.createElement('span');c.className='chip';c.innerHTML=`<i></i>${esc(n)}`;orbitModels.append(c);return {el:c,a:i*2*Math.PI/MLIST.length}});
+let SW=0,CH=0;
 function layoutOrb(){
-  SW=stage.clientWidth;OF=narrow()?.86:1;CH=$('.elem-wrap').offsetWidth/2;const c=SW/2;
+  SW=stage.clientWidth;CH=$('.elem-wrap').offsetWidth/2;const c=SW/2;
   orbSvg.setAttribute('viewBox',`0 0 ${SW} ${SW}`);
-  orbSvg.innerHTML=ORB.map((o,i)=>`<ellipse class="o${i}" cx="${c}" cy="${c}" rx="${o.r*SW*OF}" ry="${o.r*SW*OF*o.k}" transform="rotate(${o.phi} ${c} ${c})"/>`).join('');
+  orbSvg.innerHTML=ORB.map((o,i)=>`<ellipse class="o${i}" cx="${c}" cy="${c}" rx="${o.r*SW}" ry="${o.r*SW*o.k}" transform="rotate(${o.phi} ${c} ${c})"/>`).join('');
 }
 function orbFrame(now){
+  if(narrow())return;
   chips.forEach(ch=>{
-    const o=ORB[ch.o],a=ch.a+now*o.sp,R=o.r*SW*OF;
+    const o=ORB[0],a=ch.a+now*o.sp,R=o.r*SW;
     const x0=Math.cos(a)*R,y0=Math.sin(a)*R*o.k,ph=o.phi*Math.PI/180;
     const x=x0*Math.cos(ph)-y0*Math.sin(ph),y=x0*Math.sin(ph)+y0*Math.cos(ph);
     const d=(Math.sin(a)+1)/2;                     // 0=远（在卡片后）1=近（在卡片前）
-    ch.el.style.transform=`translate(-50%,-50%) translate(${x.toFixed(1)}px,${y.toFixed(1)}px) scale(${(.78+d*.32).toFixed(3)})`;
+    ch.el.style.setProperty('--orbit-position',`translate(-50%,-50%) translate(${x.toFixed(1)}px,${y.toFixed(1)}px) scale(${(.78+d*.32).toFixed(3)})`);
     // 在卡片前方穿过时淡成虚影，不遮挡 Ac 字样
     const over=Math.sin(a)>0&&Math.abs(x)<CH*.72&&Math.abs(y)<CH*.55;
-    ch.el.style.opacity=over?'.12':(.3+d*.7).toFixed(2);
-    ch.el.style.zIndex=Math.sin(a)>0?3:1;
+    ch.el.style.setProperty('--orbit-opacity',over?'.12':(.3+d*.7).toFixed(2));
+    ch.el.style.setProperty('--orbit-layer',Math.sin(a)>0?3:1);
   });
 }
 watch(stage);
@@ -1363,6 +1379,7 @@ const DOCS=[
  [{zh:'使用',en:'Usage'},[['basic-usage','基本使用','Basic usage'],['slash-commands','斜杠命令','Slash commands'],['keybindings','快捷键','Keybindings'],['sessions','会话与撤销','Sessions & undo'],['interactive-questions','交互提问','Interactive questions']]],
  [{zh:'进阶',en:'Advanced'},[['tools','内置工具','Built-in tools'],['subagents','子代理','Subagents'],['approvals','权限审批','Approvals'],['skills','Skills 扩展','Skills'],['mcp','MCP 集成','MCP'],['plugins','Plugin 系统','Plugins'],['memory','永久记忆','Memory'],['project-instructions','项目指令文件','Project instructions'],['webui','WebUI 界面','WebUI'],['webui-remote-access','远程访问指南','Remote access']]],
  [{zh:'问题',en:'Help'},[['faq','常见问题','FAQ']]],
+ [{zh:'发布',en:'Releases'},[['changelog','更新日志','Changelog']]],
 ];
 const docUrl=slug=>`${invitePath?'/':''}docs/${lang==='zh'?'zh':'en'}/${slug}.html`;
 const docQ=$('#docQ'),docGrid=$('#docGrid');
@@ -1445,7 +1462,7 @@ function drawSphere(t){
 const TUI=[[{zh:'修复登录回调 404',en:'fix login 404'},{zh:'，跑测试验证',en:', verify'}],[{zh:'/goal 支持 OAuth',en:'/goal add OAuth'},{zh:' 登录',en:' login'}],['/undo',{zh:' 2 回退对话',en:' 2 rewind chat'}]];
 const pxBox=$('#tuiPx');pxBox.innerHTML='<i></i>'.repeat(12);const pxs=$$('i',pxBox);
 let tuiI=0,tuiT=0;
-function tuiNext(){const [a,b]=TUI[tuiI%TUI.length];$('#tuiTyped').textContent=L(a);scramble($('#tuiGhost'),L(b),700);scramble($('#tuiModel'),MLIST[tuiI%MLIST.length][0],500);tuiI++}
+function tuiNext(){const [a,b]=TUI[tuiI%TUI.length];$('#tuiTyped').textContent=L(a);scramble($('#tuiGhost'),L(b),700);scramble($('#tuiModel'),MLIST[tuiI%MLIST.length],500);tuiI++}
 function drawPx(t){const k=Math.floor(t/90)%(pxs.length+6);pxs.forEach((p,i)=>{p.className=i===k?'on':(i===k-1||i===k+1)?'on2':''})}
 // —— 统一循环：只绘制可见的封面 ——
 const tuiCv=$('.cv-tui');

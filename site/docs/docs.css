@@ -36,8 +36,7 @@ kbd{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 
 /* ==================== 头部 ==================== */
 .dh{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:14px;height:var(--hh);padding:0 20px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
 .dh-brand{display:flex;align-items:center;gap:10px;font:500 13px var(--mono);color:var(--ink);white-space:nowrap}
-.mini{position:relative;display:grid;place-items:center;width:28px;height:28px;border-radius:6px;border:1px solid color-mix(in srgb,var(--ph) 50%,transparent);font:700 12px var(--mono);color:var(--ph);background:var(--phs)}
-.mini sup{position:absolute;left:2px;top:1px;font-size:6.5px;font-weight:500;color:var(--fg3)}
+.dh-mark{width:24px;height:24px;flex:none}
 .dh-brand em{padding:2px 6px;border-radius:4px;background:var(--phs);color:var(--ph);font:500 10px var(--mono);font-style:normal;letter-spacing:.08em}
 .dh-brand small{color:var(--fg3);font-size:11px}
 .dh-search{display:flex;align-items:center;gap:10px;flex:1;max-width:420px;height:38px;margin-left:auto;padding:0 12px;border:1px solid var(--line2);border-radius:9px;background:var(--bg2);font:13px var(--mono);color:var(--fg3);transition:border-color .2s}
@@ -175,6 +174,15 @@ kbd{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 
 .toast.on{opacity:1;transform:translate(-50%,0)}
 
 /* ==================== 响应式 ==================== */
+.prose h2 time{display:inline-block;margin-left:.4em;color:var(--fg3);font:13px var(--mono);letter-spacing:0}
+.release-jump,.release-issues{padding:12px 16px;border:1px solid var(--line2);border-radius:10px;background:var(--bg2)}
+.release-jump{display:none}
+.release-jump summary,.release-issues summary{cursor:pointer;color:var(--ink);font-weight:600}
+.release-jump ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(86px,1fr));gap:6px;list-style:none;padding:0;margin-top:12px}
+.release-jump li+li{margin-top:0}
+.release-jump a{display:flex;align-items:center;min-height:42px;font:12px var(--mono)}
+.release-issues p,.release-issues ul,.release-fallback>*+*{margin-top:1em}
+@media (max-width:1240px){.release-jump{display:block}}
 @media (max-width:1240px){.dl{grid-template-columns:var(--sw) minmax(0,1fr)}.toc{display:none}}
 @media (max-width:900px){
   .dl{grid-template-columns:minmax(0,1fr)}

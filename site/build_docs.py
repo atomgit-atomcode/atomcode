@@ -13,7 +13,7 @@ AtomCode 文档站静态构建脚本（零依赖，仅用 Python 标准库）
 
 产物（写入 docs/）：
   docs/index.html                按语言跳转
-  docs/{zh,en}/<slug>.html       20 页 × 2 语言
+  docs/{zh,en}/<slug>.html       中英文文档（changelog 从仓库根目录的 Markdown 生成）
   docs/search-index.{zh,en}.js   全文搜索索引（file:// 下也能用，无需 fetch）
   docs/docs.css / docs/docs.js   手写维护，构建时不覆盖
 
@@ -70,6 +70,7 @@ GROUPS = [
         ('webui-remote-access', '远程访问指南', 'Remote access', 'Ra'),
     ]),
     (('问题', 'Help'), [('faq', '常见问题', 'FAQ', 'Fq')]),
+    (('发布', 'Releases'), [('changelog', '更新日志', 'Changelog', 'Cl')]),
 ]
 # 不在侧栏中、但由其他页面链接到的页面：(slug, 中文, 英文, 符号, 所属分组)
 HIDDEN = [('headless-daemon', 'Headless 与 Daemon', 'Headless & Daemon', 'Hd', ('进阶', 'Advanced'))]
@@ -136,6 +137,114 @@ def search_sections(body):
     return plain(body[:boundaries[0]]), sections
 
 
+# ==================== 更新日志（Markdown 为唯一来源） ====================
+RELEASE_HEADING = re.compile(r'^## (v\d+\.\d+\.\d+)\b([^\n]*)$', re.M)
+ISSUES_HEADING = re.compile(r'^### Issues[ \t]*$', re.M)
+RELEASE_DATE = re.compile(r' \((\d{4}-\d{2}-\d{2})\)$')
+# Changelog uses inline code, bold leads, and issue links with bracketed labels.
+RELEASE_INLINE = re.compile(
+    r'`(?P<code>[^`]+)`|\*\*(?P<bold>.+?)\*\*|'
+    r'\[(?P<label>(?:[^\[\]]|\[[^\[\]]*\])+)\]\((?P<url>https?://[^\s()]+)\)'
+)
+
+
+def release_inline(text):
+    out, start = [], 0
+    for match in RELEASE_INLINE.finditer(text):
+        out.append(html.escape(text[start:match.start()]))
+        if match['code'] is not None:
+            out.append(f'<code>{html.escape(match["code"])}</code>')
+        elif match['bold'] is not None:
+            out.append(f'<strong>{release_inline(match["bold"])}</strong>')
+        else:
+            out.append(f'<a href="{html.escape(match["url"])}">{release_inline(match["label"])}</a>')
+        start = match.end()
+    return ''.join(out) + html.escape(text[start:])
+
+
+def release_blocks(markdown):
+    out, paragraph, items = [], [], []
+
+    def flush():
+        if paragraph:
+            out.append(f'<p>{release_inline(" ".join(paragraph))}</p>')
+            paragraph.clear()
+        if items:
+            out.append('<ul>' + ''.join(f'<li>{release_inline(item)}</li>' for item in items) + '</ul>')
+            items.clear()
+
+    for line in markdown.splitlines():
+        if not line.strip():
+            flush()
+        elif line.startswith('- '):
+            if paragraph:
+                flush()
+            items.append(line[2:])
+        elif line.startswith('### '):
+            flush()
+            out.append(f'<h3>{release_inline(line[4:])}</h3>')
+        else:
+            if items:
+                flush()
+            paragraph.append(line)
+    flush()
+    return '\n'.join(out)
+
+
+def read_releases(filename):
+    with open(os.path.join(ROOT, '..', filename), encoding='utf-8') as f:
+        text = re.sub(r'<!--.*?-->', '', f.read(), flags=re.S)
+    headings = list(RELEASE_HEADING.finditer(text))
+    if not headings:
+        raise ValueError(f'No version sections in {filename}')
+    boundaries = [heading.start() for heading in headings[1:]] + [len(text)]
+    releases = {}
+    for heading, end in zip(headings, boundaries):
+        version, suffix = heading.groups()
+        if version in releases:
+            raise ValueError(f'Duplicate changelog version {version} in {filename}')
+        parts = ISSUES_HEADING.split(text[heading.end():end], maxsplit=1)
+        releases[version] = (suffix, parts[0], parts[1] if len(parts) == 2 else '')
+    return releases
+
+
+def changelog_page(lang, zh_releases, en_releases):
+    zh = lang == 'zh'
+    title = '更新日志' if zh else 'Changelog'
+    desc = '按版本查看 AtomCode 的新功能、修复和关联议题。' if zh else 'Browse AtomCode features, fixes and related issues by release.'
+    versions = sorted(zh_releases.keys() | en_releases.keys(),
+                      key=lambda version: tuple(map(int, version[1:].split('.'))), reverse=True)
+    jump = '按版本浏览' if zh else 'Browse by version'
+    issues_label = '关联议题' if zh else 'Related issues'
+    source_label = '查看发行版和安装包' if zh else 'View releases and downloads'
+    links = ''.join(f'<li><a href="#{v}">{v}</a></li>' for v in versions)
+    body = [
+        f'<h1>{title}</h1>',
+        f'<p class="lede">{desc}</p>',
+        f'<p><a href="https://atomgit.com/atomgit_atomcode/atomcode/releases">{source_label} ↗</a></p>',
+        f'<details class="release-jump"><summary>{jump}</summary><ul>{links}</ul></details>',
+    ]
+    localized = zh_releases if zh else en_releases
+    for version in versions:
+        entry = localized.get(version) or zh_releases.get(version) or en_releases[version]
+        suffix, notes, issues = entry
+        issues = issues.strip() or zh_releases.get(version, ('', '', ''))[2].strip()
+        date = RELEASE_DATE.search(suffix)
+        label = html.escape(version + (suffix[:date.start()] if date else suffix))
+        if date:
+            label += f' <time datetime="{date[1]}">{date[1]}</time>'
+        body.append(f'<h2 id="{version}">{label}</h2>')
+        if version not in localized:
+            source_lang = 'en' if zh else 'zh-CN'
+            body.append(f'<div lang="{source_lang}" class="release-fallback">{release_blocks(notes)}</div>')
+        else:
+            body.append(release_blocks(notes))
+        if issues:
+            body.append(f'<details class="release-issues"><summary>{issues_label}</summary>'
+                        f'{release_blocks(issues)}</details>')
+    return title, '\n'.join(body), desc
+
+
 # ==================== 页面模板 ====================
 def side_html(lang, cur):
     out, n = [], 0
@@ -176,7 +285,7 @@ def page_html(lang, slug, title, desc, body, minutes):
 <title>{esc(title)} · AtomCode {u['docs']}</title>
 <meta name="description" content="{desc}">
 <meta name="theme-color" content="#050605">
-<link rel="icon" href="https://cdn-news.gitcode.com/news/logo_1794046182088.png">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -189,7 +298,7 @@ def page_html(lang, slug, title, desc, body, minutes):
 <!-- ==================== 头部 ==================== -->
 <header class="dh">
   <button class="ib sb-btn" id="sbBtn" aria-label="{u['menu']}" aria-expanded="false">☰</button>
-  <a class="dh-brand" href="../../index.html"><span class="mini"><sup>21</sup>Ac</span><span>AtomCode</span><em>{u['docs'].upper() if lang == 'en' else 'DOCS'}</em><small>{VERSION}</small></a>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>{u['docs'].upper() if lang == 'en' else 'DOCS'}</em><small>{VERSION}</small></a>
   <button class="dh-search" id="sBtn"><b>/</b><span>{u['search']}</span><kbd>⌘K</kbd></button>
   <nav class="dh-r">
     <a class="ib txt" href="../../index.html">{u['home']}</a>
@@ -238,15 +347,20 @@ def page_html(lang, slug, title, desc, body, minutes):
 
 
 def build(raw_dir=None):
+    zh_releases = read_releases('CHANGELOG.md')
+    en_releases = read_releases('CHANGELOG.en.md')
     for lang in ('zh', 'en'):
         os.makedirs(os.path.join(OUT, lang), exist_ok=True)
         index = []
         for slug, zh, en, sym in [p for _, p in PAGES] + [h[:4] for h in HIDDEN]:
-            src = load_raw(lang, slug, raw_dir)
-            if src is None:
-                print(f'  跳过缺失页面 {lang}/{slug}.html')
-                continue
-            title, body, desc = extract(src)
+            if slug == 'changelog':
+                title, body, desc = changelog_page(lang, zh_releases, en_releases)
+            else:
+                src = load_raw(lang, slug, raw_dir)
+                if src is None:
+                    print(f'  跳过缺失页面 {lang}/{slug}.html')
+                    continue
+                title, body, desc = extract(src)
             title = title or (zh if lang == 'zh' else en)
             text = plain(body)
             # 阅读时长：中文按 400 字/分钟，英文按 220 词/分钟
@@ -261,6 +375,7 @@ def build(raw_dir=None):
     with open(os.path.join(OUT, 'index.html'), 'w', encoding='utf-8') as f:
         f.write('''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>AtomCode 文档 / Documentation</title>
+<link rel="icon" type="image/svg+xml" href="../assets/atomgit-mark.svg">
 <meta http-equiv="refresh" content="0; url=./zh/index.html">
 <script>(function(){var l='zh';try{if(localStorage.getItem('atomcode_lang')==='en')l='en'}catch(e){}
 var q=new URLSearchParams(location.search).get('lang');if(q==='en'||q==='zh')l=q;location.replace('./'+l+'/index.html'+location.hash)})();</script>

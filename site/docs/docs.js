@@ -23,6 +23,15 @@ const cur=$('.sl.on',ds);if(cur)cur.scrollIntoView({block:'center'});
 /* ==================== 标题锚点 + 代码复制 ==================== */
 const prose=$('#prose');
 $$('h2[id],h3[id]',prose).forEach(h=>{if(h.closest('.doc-card'))return;const a=document.createElement('a');a.className='anc';a.href='#'+h.id;a.textContent='#';a.setAttribute('aria-hidden','true');h.prepend(a)});
+if(document.body.dataset.page==='changelog'){
+  const language=$('#langBtn');
+  const localizedPage=language.href;
+  function keepRelease(){
+    const hash=location.hash;
+    language.href=localizedPage+(/^#v\d+\.\d+\.\d+$/.test(hash)?hash:'');
+  }
+  addEventListener('hashchange',keepRelease);keepRelease();
+}
 function copyText(text,btn){
   const ok=()=>{btn.textContent=UI.copied;btn.classList.add('ok');setTimeout(()=>{btn.textContent=UI.copy;btn.classList.remove('ok')},1400)};
   const fb=()=>{const ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');ok()}catch(e){}ta.remove()};
