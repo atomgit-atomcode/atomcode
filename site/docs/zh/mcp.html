@@ -226,8 +226,8 @@ atomcode</code></pre>
       <h2 id="工具命名">工具命名</h2>
       <p>每个远端 tool 注册成 <code>mcp__&lt;server 键名&gt;__&lt;远端 tool 名&gt;</code>。</p>
       <p>例:配置里 <code>"mcpServers": { "github": { ... } }</code>,远端有 <code>get_issue</code>,模型看到的工具名就是 <code>mcp__github__get_issue</code>。</p>
-      <p><code>--disable-tools</code> 也用这个完整名:</p>
-      <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
+      <p>在 TUI 中可用完整名称关闭某一个工具。例如：</p>
+      <pre><code>/toolbox off mcp__github__get_issue</code></pre>
 
       <h2 id="权限审批">权限审批</h2>
       <p>MCP 工具默认 <strong>每次调用都需要确认</strong>(等同 <code>RequireApproval</code>),因为远端是外部不可信代码。</p>

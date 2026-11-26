@@ -72,7 +72,7 @@
 <h1 id="内置工具">内置工具</h1>
       <p class="lede">AtomCode 内置文件与 Shell、代码图谱、Web、自动化和 AtomGit 原生操作等工具。模型会根据任务自动挑选，大多数情况下你不需要手动指定。</p>
 
-      <h2 id="文件与-shell9-个">文件与 Shell(9 个)</h2>
+      <h2 id="文件与-shell9-个">文件与 Shell</h2>
       <div class="tw"><table>
         <thead>
           <tr><th>工具</th><th>作用</th><th>需要确认</th></tr>
@@ -86,7 +86,6 @@
           <tr><td><code>grep</code></td><td>基于 ripgrep 语义的正则搜索</td><td>否</td></tr>
           <tr><td><code>glob</code></td><td>文件名通配符匹配(如 <code>src/**/*.ts</code>)</td><td>否</td></tr>
           <tr><td><code>list_directory</code></td><td>列出目录内容</td><td>否</td></tr>
-          <tr><td><code>change_dir</code></td><td>切换 agent 的当前工作目录</td><td>否</td></tr>
         </tbody>
       </table></div>
 
@@ -97,7 +96,7 @@
 
       <div class="callout callout-info">
         <strong>后台运行长任务</strong>
-        <p>给 <code>bash</code> 传 <code>run_in_background: true</code>,命令会以独立进程在后台启动并<strong>立即返回</strong> PID 与日志文件路径,进程在多轮对话间持续存活 —— 适合开发服务器、文件监听、隧道等长跑任务,不必阻塞会话。</p>
+        <p>长任务用 <code>bash_start</code> 启动，记录返回的 job ID，再用 <code>bash_poll</code> 查看输出或用 <code>bash_kill</code> 停止。支持 PowerShell 的环境可用 <code>pwsh_start</code> 启动，查看输出和停止任务仍用 <code>bash_poll</code> 和 <code>bash_kill</code>。切换会话工作目录用 <code>/cd</code>。</p>
       </div>
 
       <div class="callout callout-warn">
@@ -140,15 +139,15 @@
           <tr><td><code>web_fetch</code></td><td>抓取某个 URL 的内容并转换为 markdown 供模型阅读</td></tr>
         </tbody>
       </table></div>
-      <p>典型用途:查最新的文档、对比不同库的 API、读取一篇 GitHub issue。在离线环境或想省钱时可以用 <code>--disable-tools web_search,web_fetch</code> 关掉它们。</p>
+      <p>常见用途包括查阅文档、对比库的 API 和读取公开 Issue。</p>
 
-      <h2 id="自动化2-个">自动化(2 个)</h2>
+      <h2 id="自动化2-个">Skills</h2>
       <div class="tw"><table>
         <thead>
           <tr><th>工具</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>auto_fix</code></td><td>运行项目的 lint / typecheck,按错误列表循环修复直到通过</td></tr>
+          <tr><td><code>list_skills</code></td><td>查看当前可用的 Skill。</td></tr>
           <tr><td><code>use_skill</code></td><td>调用用户自定义的 skill,把一个多步流程打包成可复用的命令</td></tr>
         </tbody>
       </table></div>
@@ -172,9 +171,7 @@
       <p>当工具结果太长时，AtomCode 会在界面中显示稳定的摘要，并把完整内容保存到当前会话。模型可通过 <code>fetch_output</code> 分页读取后续内容，因此“输出已截断”不代表结果丢失；删除会话时对应的完整输出也会一并清理。</p>
 
       <h2 id="禁用特定工具">禁用特定工具</h2>
-      <p>用 <code>--disable-tools</code> 参数可以在启动时把某些工具对模型完全隐藏。例如在 SWE-bench 沙箱里:</p>
-      <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
-      <p>禁用后的工具不会出现在 tool schemas 里,模型不会尝试去调用一个必然失败的工具。</p>
+      <p>在 TUI 中用 <code>/toolbox</code> 查看当前会话的工具。用 <code>/toolbox off &lt;名称或模式&gt;</code> 关闭匹配项，用 <code>/toolbox on &lt;名称或模式&gt;</code> 恢复。Headless 运行需要关闭整个模型工具目录时使用 <code>--no-tools</code>。</p>
 
       <h2 id="下一步">下一步</h2>
       <ul>

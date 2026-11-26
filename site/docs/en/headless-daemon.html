@@ -86,8 +86,10 @@
           <tr><td><code>-p, --prompt TEXT</code></td><td>Task description to run</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>Read the prompt from a file (good for long input; mutually exclusive with <code>-p</code>)</td></tr>
           <tr><td><code>-v, --verbose</code></td><td>Send tool-call logs, token usage, and turn summaries to <em>stderr</em>; stdout is untouched</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>Hard cap of N LLM calls — keeps the agent from running away. No cap by default</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>Disable specific tools, e.g. <code>bash,web_fetch</code>. Disabled tools are absent from the schema list so the model won't try to call them</td></tr>
+          <tr><td><code>--no-tools</code></td><td>Headless only. Exposes no built-in, MCP, skill, or child-agent tools to the model.</td></tr>
+          <tr><td><code>--ephemeral</code></td><td>Run without creating, resuming, or writing a persistent session.</td></tr>
+          <tr><td><code>--output-format text|jsonl</code></td><td>Write assistant text by default, or versioned JSON Lines events with <code>jsonl</code>.</td></tr>
+          <tr><td><code>--require-approval-hook</code></td><td>Require an enabled, catch-all required approval hook for tools.</td></tr>
           <tr><td><code>-C, --dir PATH</code></td><td>Working directory; defaults to the current directory</td></tr>
           <tr><td><code>--provider / --model</code></td><td>Temporarily override provider or model</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>Disable telemetry for this invocation</td></tr>
@@ -98,9 +100,8 @@
       <pre><code># Generate a project summary and write it to a README draft
 atomcode -p "summarise the project structure and produce a README draft" &gt; README.draft.md
 
-# Auto-fix lint errors in CI
-atomcode -p "run pnpm lint and fix every error; don't modify test files" \
-         --max-turns 30 --disable-tools web_search,web_fetch
+# Explain existing lint output in CI without exposing tools
+atomcode --prompt-file lint-report.txt --no-tools --ephemeral
 
 # Read the prompt from a file
 atomcode --prompt-file task.md -v 2&gt; run.log
@@ -116,18 +117,18 @@ atomcode -p "explain this code" --provider local --model qwen2.5:14b</code></pre
 
       <div class="callout callout-warn">
         <strong>Note: permission model</strong>
-        <p>Headless mode has no interactive permission dialog. In the current implementation, <code>bash</code> calls that would prompt are auto-approved, and the reason is written to stderr:</p>
-        <pre><code>[headless] auto-approved bash: &lt;reason&gt;</code></pre>
-        <p>Other tools that would prompt for confirmation (<code>edit</code>, <code>write</code>, high-risk paths for <code>web_fetch</code>, …) are auto-denied:</p>
-        <pre><code>[approval-denied] tool=&lt;name&gt; reason=&lt;reason&gt;</code></pre>
-        <p>When <code>[approval-denied]</code> fires, the process exits with a non-zero code. If you don't want shell execution in CI, add <code>--disable-tools bash</code> explicitly to remove it from the tool list entirely.</p>
+        <p>A normal <code>-p</code> run has no interactive prompts. Approval requests for <code>bash</code> and <code>bash_start</code> are approved automatically, with the tool name written to stderr:</p>
+        <pre><code>[headless] auto-approved bash</code></pre>
+        <p>Other requests that reach interactive approval are denied by default, for example:</p>
+        <pre><code>[denied] edit_file requires interactive approval</code></pre>
+        <p>An approval denial causes a nonzero exit. Use <code>--no-tools</code> to remove the entire model tool catalog in CI. Unattended scheduled runs deny every tool call that reaches interactive approval.</p>
       </div>
 
       <h2>atomcode-daemon</h2>
       <p><code>atomcode-daemon</code> is a standalone transport adapter over <code>CodingRuntime</code>. It exposes an HTTP + Server-Sent Events API for web frontends, IDE plugins, and editor extensions. The official AtomCode VS Code extension and the AtomCode Air desktop app both connect through it.</p>
 
       <h3>Launching</h3>
-      <pre><code># Recommended: launch via the CLI subcommand — it invokes the sibling atomcode-daemon binary
+      <pre><code># Launch the daemon in the CLI process, bound to 127.0.0.1
 atomcode daemon
 
 # Pick a port and client identity (drives telemetry segmentation)
@@ -144,21 +145,22 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><th>Flag</th><th>Description</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>--host HOST</code></td><td>Listen address; default <code>127.0.0.1</code>. Non-loopback addresses trigger a warning (the daemon has no auth and must not be exposed publicly)</td></tr>
+          <tr><td><code>--host HOST</code></td><td>Standalone <code>atomcode-daemon</code> only. Sets the listen address and defaults to <code>127.0.0.1</code>.</td></tr>
           <tr><td><code>--port PORT</code></td><td>Listen port; default <code>13456</code></td></tr>
-          <tr><td><code>--client NAME</code></td><td>Client identity; currently <code>vscode</code> / <code>atomcode-air</code> are recognised, anything else is treated as a generic IDE. Affects telemetry tagging and some behaviour</td></tr>
-          <tr><td><code>--idle-timeout SECS</code></td><td>Idle timeout in seconds. Default 1800 (30 min); <code>0</code> disables it; non-zero values are clamped to a minimum of 60. Also accepts the env var <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code></td></tr>
+          <tr><td><code>--client NAME</code></td><td>Tags client telemetry. Both entrypoints recognise <code>vscode</code>, <code>jetbrains</code>, and <code>atomcode-air</code>.</td></tr>
+          <tr><td><code>--idle-timeout SECS</code></td><td>Idle timeout. Defaults to 1800 seconds, and <code>0</code> disables it. Also configurable via <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code>. The standalone binary clamps nonzero values to at least 60 seconds.</td></tr>
+          <tr><td><code>--no-auth</code></td><td>Disable API token authentication for isolated local development.</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>Disable telemetry for this process</td></tr>
         </tbody>
       </table></div>
 
       <div class="callout callout-warn">
         <strong>Security</strong>
-        <p>The daemon has no built-in auth and binds <code>127.0.0.1</code> by default. <strong>Never expose it to the public internet or to your LAN directly</strong> — callers gain full execution rights for every tool on your machine (including <code>bash</code>, <code>write</code>, <code>edit</code>). For remote access, terminate at a reverse proxy that handles auth / TLS / origin restrictions.</p>
+        <p>Both daemon entrypoints require API token authentication by default. <code>GET /health</code> is available without a token. For protected endpoints, read the token from <code>$ATOMCODE_HOME/daemon-&lt;port&gt;.json</code> (under <code>~/.atomcode/</code> by default) and send <code>Authorization: Bearer &lt;token&gt;</code>. The standalone binary refuses non-loopback binds with authentication disabled by default. Keep authentication enabled and use TLS for remote access.</p>
       </div>
 
       <h3>Endpoint overview</h3>
-      <p>All endpoints are registered in <code>crates/atomcode-daemon/src/main.rs</code>, grouped below.</p>
+      <p>Common endpoints are listed below. Routes are registered or merged in <code>crates/atomcode-daemon/src/lib.rs</code>.</p>
 
       <h4>Health &amp; lifecycle</h4>
       <div class="tw"><table>

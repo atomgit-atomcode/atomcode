@@ -75,7 +75,7 @@
       <h2 id="requirements">Requirements</h2>
       <ul>
         <li><strong>OS</strong>: macOS (Apple Silicon or Intel), Linux, Windows, or HarmonyOS PC</li>
-        <li><strong>Rust toolchain</strong>: 1.75+ (only required when building from source)</li>
+        <li><strong>Rust toolchain</strong>: 1.88+ (only required when building from source)</li>
         <li><strong>LLM</strong>: an API key for any supported provider, or an AtomGit account (for OAuth login)</li>
       </ul>
 
@@ -102,9 +102,12 @@
       <h3 id="option-4-build-from-source">Option 4: build from source</h3>
       <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
-cargo build --release
-cp target/release/atomcode ~/.local/bin/</code></pre>
-      <p>Release builds take longer to compile but produce a small, fast binary. For day-to-day development a plain <code>cargo build</code> is fine.</p>
+# To use WebUI, build its frontend first (Node.js 22.6+)
+npm ci --prefix webui
+npm run build --prefix webui
+cargo build --release -p atomcode</code></pre>
+      <p>Run <code>./target/release/atomcode</code> after building (the binary is <code>atomcode.exe</code> on Windows), or install it somewhere on your <code>PATH</code>. For terminal-only use, skip the npm commands. After updating the frontend, run <code>cargo clean -p atomcode-daemon</code> and rebuild if Cargo has not recompiled the daemon to embed the new assets.</p>
+      <p>The free official CodingPlan quota requires an official build. With a self-built binary, use <code>/provider</code> to configure your own model and API key.</p>
 
       <h2 id="verify-the-install">Verify the install</h2>
       <pre><code>atomcode --version</code></pre>

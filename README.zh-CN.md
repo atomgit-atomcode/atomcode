@@ -72,7 +72,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 文件与 Shell：
 
 - `read_file`、`write_file`、`edit_file`、`search_replace`
-- `bash`、`grep`、`glob`、`list_directory`、`change_dir`
+- `bash`、`grep`、`glob`、`list_directory`
 - `web_search`、`web_fetch`
 
 代码图谱（语言感知的代码智能）：
@@ -83,7 +83,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 自动化：
 
-- `auto_fix` —— 自动 lint / 类型检查修复循环
+- `list_skills` —— 查看可用技能
 - `use_skill` —— 调用用户自定义 skill
 
 ### 多模型支持

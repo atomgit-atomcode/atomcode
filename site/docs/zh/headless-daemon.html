@@ -86,8 +86,10 @@
           <tr><td><code>-p, --prompt TEXT</code></td><td>要执行的任务描述</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
           <tr><td><code>-v, --verbose</code></td><td>把工具调用日志、token 用量、turn 摘要打到 <em>stderr</em>,不影响 stdout</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>强制上限 N 轮 LLM 调用,避免 agent 在长任务里无限跑。默认不设上限</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>禁用特定工具,比如 <code>bash,web_fetch</code>。被禁用的工具不会出现在 schema 列表中,模型不会尝试调用</td></tr>
+          <tr><td><code>--no-tools</code></td><td>Headless 专用。不给模型提供内置工具、MCP、Skill 工具或子代理工具。</td></tr>
+          <tr><td><code>--ephemeral</code></td><td>不创建、加载或写入持久化会话。</td></tr>
+          <tr><td><code>--output-format text|jsonl</code></td><td>默认输出助手回复文本，<code>jsonl</code> 输出带版本的 JSON Lines 事件。</td></tr>
+          <tr><td><code>--require-approval-hook</code></td><td>要求启用覆盖所有工具的必需审批 Hook。</td></tr>
           <tr><td><code>-C, --dir PATH</code></td><td>工作目录,默认为当前目录</td></tr>
           <tr><td><code>--provider / --model</code></td><td>临时覆盖 provider 或模型</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>本次调用关闭遥测上报</td></tr>
@@ -98,9 +100,8 @@
       <pre><code># 把当前项目总结写进 README
 atomcode -p "总结项目结构并写成 README 草稿" &gt; README.draft.md
 
-# 在 CI 里跑一轮自动修复
-atomcode -p "跑 pnpm lint 并修复所有报错,不修改测试文件" \
-         --max-turns 30 --disable-tools web_search,web_fetch
+# 让 CI 解释已有的 lint 输出，关闭全部工具
+atomcode --prompt-file lint-report.txt --no-tools --ephemeral
 
 # 从文件读取 prompt
 atomcode --prompt-file task.md -v 2&gt; run.log
@@ -116,18 +117,18 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
 
       <div class="callout callout-warn">
         <strong>注意:权限模型</strong>
-        <p>Headless 模式没有交互式权限确认对话框。当前实现中,需要确认的 <code>bash</code> 调用会自动批准,并把原因写到 stderr:</p>
-        <pre><code>[headless] auto-approved bash: &lt;reason&gt;</code></pre>
-        <p>其他需要确认的工具(<code>edit</code>、<code>write</code>、<code>web_fetch</code> 等的高风险路径)会被自动拒绝:</p>
-        <pre><code>[approval-denied] tool=&lt;name&gt; reason=&lt;reason&gt;</code></pre>
-        <p>出现 <code>[approval-denied]</code> 时进程会以非 0 退出码结束。如果你不希望 CI 中执行 shell,可以显式加上 <code>--disable-tools bash</code> 把它从工具列表里彻底移除。</p>
+        <p>普通 <code>-p</code> 模式没有交互式审批。进入审批环节的 <code>bash</code> 和 <code>bash_start</code> 会自动批准，stderr 输出工具名：</p>
+        <pre><code>[headless] auto-approved bash</code></pre>
+        <p>其他进入审批环节的工具默认拒绝，示例：</p>
+        <pre><code>[denied] edit_file requires interactive approval</code></pre>
+        <p>发生审批拒绝时，进程以非零状态退出。CI 需要完全关闭模型工具时使用 <code>--no-tools</code>。定时任务的非交互执行会拒绝所有进入审批环节的调用。</p>
       </div>
 
       <h2>atomcode-daemon</h2>
       <p><code>atomcode-daemon</code> 是构建在 <code>CodingRuntime</code> 之上的独立传输适配器。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
 
       <h3>启动</h3>
-      <pre><code># 推荐:通过 CLI 子命令启动,自动调用同目录下的 atomcode-daemon 二进制
+      <pre><code># 通过 CLI 在当前进程内启动，固定监听 127.0.0.1
 atomcode daemon
 
 # 指定端口与客户端身份(用于遥测分流)
@@ -144,21 +145,22 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><th>参数</th><th>说明</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>--host HOST</code></td><td>监听地址,默认 <code>127.0.0.1</code>。非 loopback 地址会触发警告(daemon 没有鉴权,不应暴露到公网)</td></tr>
+          <tr><td><code>--host HOST</code></td><td>仅独立的 <code>atomcode-daemon</code> 支持，用于指定监听地址。默认 <code>127.0.0.1</code>。</td></tr>
           <tr><td><code>--port PORT</code></td><td>监听端口,默认 <code>13456</code></td></tr>
-          <tr><td><code>--client NAME</code></td><td>客户端身份,目前识别 <code>vscode</code> / <code>atomcode-air</code>,其他值视为通用 IDE。影响遥测打点与部分行为</td></tr>
-          <tr><td><code>--idle-timeout SECS</code></td><td>空闲超时(秒)。默认 1800(30 分钟),<code>0</code> 表示禁用,非零值最小钳制到 60。也可用环境变量 <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code></td></tr>
+          <tr><td><code>--client NAME</code></td><td>为遥测标记客户端。两种入口均识别 <code>vscode</code>、<code>jetbrains</code> 和 <code>atomcode-air</code>。</td></tr>
+          <tr><td><code>--idle-timeout SECS</code></td><td>空闲超时，默认 1800 秒，<code>0</code> 关闭。也可设置 <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code>。独立二进制把非零值下限设为 60 秒。</td></tr>
+          <tr><td><code>--no-auth</code></td><td>关闭 API token 鉴权，适用于隔离的本机开发环境。</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>关闭本次进程的遥测上报</td></tr>
         </tbody>
       </table></div>
 
       <div class="callout callout-warn">
         <strong>安全</strong>
-        <p>daemon 没有内置鉴权,默认只监听 <code>127.0.0.1</code>。<strong>切勿把它直接暴露到公网或局域网</strong> —— 调用方相当于直接拿到本机所有工具的执行权(包括 <code>bash</code>、<code>write</code>、<code>edit</code>)。需要远程使用时,请在前置反代上自行做认证 / TLS / 来源限制。</p>
+        <p>两种 Daemon 入口默认都启用 API token 鉴权。<code>GET /health</code> 可用于无 token 健康检查。访问受保护端点时，从 <code>$ATOMCODE_HOME/daemon-&lt;port&gt;.json</code>（默认在 <code>~/.atomcode/</code> 下）取得 token，并发送 <code>Authorization: Bearer &lt;token&gt;</code>。独立二进制在关闭鉴权且绑定非本机地址时默认拒绝启动。远程使用应保留鉴权并通过 TLS 保护连接。</p>
       </div>
 
       <h3>端点总览</h3>
-      <p>所有端点都注册在 <code>crates/atomcode-daemon/src/main.rs</code>,以下按功能分组。</p>
+      <p>下面列出常用端点。路由从 <code>crates/atomcode-daemon/src/lib.rs</code> 注册或合并。</p>
 
       <h4>健康与生命周期</h4>
       <div class="tw"><table>

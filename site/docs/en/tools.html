@@ -67,12 +67,12 @@
 
   <!-- ==================== 正文 ==================== -->
   <main class="dm">
-    <div class="crumb"><a href="./index.html">Docs</a><span>/</span><span>Advanced</span><span>/</span><b>Built-in Tools</b><em>4 min read</em></div>
+    <div class="crumb"><a href="./index.html">Docs</a><span>/</span><span>Advanced</span><span>/</span><b>Built-in Tools</b><em>3 min read</em></div>
     <article class="prose" id="prose">
 <h1 id="built-in-tools">Built-in Tools</h1>
       <p class="lede">AtomCode ships built-in tools for filesystem &amp; shell, code graph, web, automation, and native AtomGit operations. The model picks tools per task — you almost never need to specify them by hand.</p>
 
-      <h2 id="filesystem-shell-9">Filesystem &amp; shell (9)</h2>
+      <h2 id="filesystem-shell-9">Files &amp; Shell</h2>
       <div class="tw"><table>
         <thead>
           <tr><th>Tool</th><th>Purpose</th><th>Confirmation?</th></tr>
@@ -86,7 +86,6 @@
           <tr><td><code>grep</code></td><td>Regex search with ripgrep semantics</td><td>No</td></tr>
           <tr><td><code>glob</code></td><td>Filename glob matching (e.g. <code>src/**/*.ts</code>)</td><td>No</td></tr>
           <tr><td><code>list_directory</code></td><td>List directory contents</td><td>No</td></tr>
-          <tr><td><code>change_dir</code></td><td>Switch the agent's current working directory</td><td>No</td></tr>
         </tbody>
       </table></div>
 
@@ -97,7 +96,7 @@
 
       <div class="callout callout-info">
         <strong>Background long-running tasks</strong>
-        <p>Pass <code>run_in_background: true</code> to <code>bash</code> and the command launches as a detached process and <strong>returns immediately</strong> with a PID and a log-file path; the process survives across conversation turns — ideal for dev servers, file watchers, and tunnels, without blocking the session.</p>
+        <p>Start long-running commands with <code>bash_start</code>, then use the returned job ID with <code>bash_poll</code> to read output or <code>bash_kill</code> to stop the job. Use <code>pwsh_start</code> to start a PowerShell job, and the same <code>bash_poll</code> and <code>bash_kill</code> tools to manage it. Use <code>/cd</code> to change the session working directory.</p>
       </div>
 
       <div class="callout callout-warn">
@@ -140,15 +139,15 @@
           <tr><td><code>web_fetch</code></td><td>Fetch a URL and convert it to markdown for the model</td></tr>
         </tbody>
       </table></div>
-      <p>Typical uses: looking up the latest docs, comparing library APIs, reading a GitHub issue. In offline environments or to save cost, disable them with <code>--disable-tools web_search,web_fetch</code>.</p>
+      <p>Common uses include reading documentation, comparing library APIs, and reading public issues.</p>
 
-      <h2 id="automation-2">Automation (2)</h2>
+      <h2 id="automation-2">Skills</h2>
       <div class="tw"><table>
         <thead>
           <tr><th>Tool</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>auto_fix</code></td><td>Run the project's lint / typecheck and iterate over the error list until clean</td></tr>
+          <tr><td><code>list_skills</code></td><td>List available skills.</td></tr>
           <tr><td><code>use_skill</code></td><td>Invoke a user-defined skill — package a multi-step flow as a reusable command</td></tr>
         </tbody>
       </table></div>
@@ -172,9 +171,7 @@
       <p>When a tool result is too large, AtomCode shows a stable preview and stores the full content with the current session. The model can page through the remainder with <code>fetch_output</code>, so “output truncated” does not mean the result was lost. Stored output is removed when its session is deleted.</p>
 
       <h2 id="disabling-specific-tools">Disabling specific tools</h2>
-      <p>Use the <code>--disable-tools</code> flag at launch to hide tools from the model entirely. For example, inside the SWE-bench sandbox:</p>
-      <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
-      <p>Disabled tools don't appear in the tool schemas, so the model won't attempt to call a tool guaranteed to fail.</p>
+      <p>In the TUI, use <code>/toolbox</code> to inspect the current session’s tools. Turn matching tools off with <code>/toolbox off &lt;name-or-pattern&gt;</code> and back on with <code>/toolbox on &lt;name-or-pattern&gt;</code>. In headless mode, use <code>--no-tools</code> to remove the entire model tool catalog.</p>
 
       <h2 id="next-steps">Next steps</h2>
       <ul>

@@ -107,15 +107,14 @@ atomcode --dangerously-skip-permissions</code></pre>
           <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>Non-interactive mode: one-shot execution, reply to stdout</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>Read prompt from file (useful for long input; mutually exclusive with <code>-p</code>)</td></tr>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In non-interactive mode, print tool calls and token usage to stderr</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>—</td><td>Cap the number of agent loop iterations; prevents runaway loops</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>Comma-separated tools to disable, e.g. <code>--disable-tools bash,web_fetch</code></td></tr>
+          <tr><td><code>--no-tools</code></td><td>—</td><td>Headless only. Exposes no built-in, MCP, skill, or child-agent tools to the model.</td></tr>
           <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>Skip all permission prompts — auto-approve every tool call (bash, file edits, MCP, etc.). A ⚠ BYPASS badge is shown in the TUI status bar while active</td></tr>
         </tbody>
       </table></div>
 
       <div class="callout callout-tip">
         <strong>Tip</strong>
-        <p><code>--disable-tools</code> makes disabled tools completely invisible to the model (they don't appear in the schemas), so the model won't keep trying to call them. Useful for sandbox evals, offline environments, and CI without network.</p>
+        <p>In the interactive TUI, use <code>/toolbox</code> to inspect available tools and <code>/toolbox off &lt;name-or-pattern&gt;</code> to turn matching tools off. See <a href="./tools.html">Built-in Tools</a>.</p>
       </div>
 
       <div class="callout callout-warning">

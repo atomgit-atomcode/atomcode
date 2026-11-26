@@ -226,8 +226,8 @@ Open the local test page, fill the authorized form and verify the result.
       <h2 id="tool-naming">Tool naming</h2>
       <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>
       <p>Example: with <code>"mcpServers": { "github": { ... } }</code> and a remote <code>get_issue</code> tool, the model sees the tool name <code>mcp__github__get_issue</code>.</p>
-      <p><code>--disable-tools</code> uses the full name too:</p>
-      <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
+      <p>In the TUI you can turn off an individual tool by using its full name. For example:</p>
+      <pre><code>/toolbox off mcp__github__get_issue</code></pre>
 
       <h2 id="permission-approval">Permission approval</h2>
       <p>MCP tools default to <strong>per-call confirmation</strong> (equivalent to <code>RequireApproval</code>) because the remote is external, untrusted code.</p>

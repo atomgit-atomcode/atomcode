@@ -71,6 +71,7 @@
     <article class="prose" id="prose">
 <h1 id="web-ui">Web UI</h1>
       <p class="lede">Besides the terminal TUI, AtomCode ships a built-in <strong>browser interface</strong>: type <code>/webui</code> in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use <code>/sync</code> to mirror one session <strong>live</strong> between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure.</p>
+      <p>First, <a href="./getting-started.html">install AtomCode</a> on your computer. If building from source, follow the installation guide to build the WebUI frontend first. Keep the process that starts WebUI running while you use it.</p>
 
       <p>After context compaction, retained historical user messages are labeled as historical rather than new requests. Use “View full history” above the conversation to read original turns, reasoning and tool records without changing the current task or draft. Refreshing reloads the session view; <code>/reload</code> reloads configuration and does not compact context.</p>
 

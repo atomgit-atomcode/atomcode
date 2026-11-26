@@ -71,6 +71,7 @@
     <article class="prose" id="prose">
 <h1 id="远程访问指南">远程访问指南</h1>
 <p class="lede">在 AtomCode 运行 <code>/webui</code>，手机浏览器扫描中继二维码即可访问，无需蒲公英组网，也无需让电脑监听公网端口。</p>
+      <p>首次使用时，先在电脑上<a href="./getting-started.html">安装 AtomCode</a>。使用 WebUI 时请保持启动它的进程运行。</p>
 <h2 id="使用方式">使用方式</h2>
 <ol><li>电脑保持 AtomCode 运行，执行 <code>/webui</code>。本机浏览器会打开，终端同时显示手机链接和二维码。</li><li>用手机浏览器扫码，或在电脑 WebUI 的“远程访问”面板复制中继链接。手机和电脑可使用不同网络。</li><li>TUI 与手机同步查看和回答同一会话。执行 <code>/webui stop</code>、退出 AtomCode 或在终端登出会停止中继共享。</li></ol>
 <p>独立启动可用 <code>atomcode webui</code>；仅本机访问用 <code>/webui --local</code> 或 <code>atomcode webui --local</code>。显式指定 <code>/webui lan</code> 或 <code>--host &lt;地址&gt;</code> 时使用局域网地址，不自动连接中继。</p>

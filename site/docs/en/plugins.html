@@ -71,6 +71,7 @@
     <article class="prose" id="prose">
 <h1 id="plugin-system">Plugin System</h1>
       <p class="lede">A plugin is a bundle of skills / commands / hooks distributed over a git repository. One <code>/plugin install</code> drops someone else's workflow into AtomCode and you can use it immediately. AtomCode's plugin protocol is compatible with Claude Code — CC-ecosystem plugin repos install and run out of the box.</p>
+      <p>To install from your shell, use <code>atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code> with the name published in the marketplace manifest. A bare plugin name must match exactly one entry across registered marketplaces.</p>
 
       <h2 id="core-concepts">Core concepts</h2>
       <ul>

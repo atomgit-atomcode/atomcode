@@ -71,6 +71,7 @@
     <article class="prose" id="prose">
 <h1 id="remote-access">Remote access</h1>
 <p class="lede">Run <code>/webui</code> and scan the relay QR code with your phone browser. No VPN or public listening port is needed.</p>
+      <p>First, <a href="./getting-started.html">install AtomCode</a> on your computer. Keep the process that starts WebUI running while you use it.</p>
 <h2 id="connect">Connect</h2>
 <ol><li>Keep AtomCode running and run <code>/webui</code>. It opens the local browser and prints a phone link and QR code.</li><li>Scan with your phone browser, or copy the relay link from the WebUI Remote access dialog. The devices may use different networks.</li><li>The phone and TUI share the same conversation. <code>/webui stop</code>, signing out in the terminal, or exiting AtomCode stops relay sharing.</li></ol>
 <p>Standalone: <code>atomcode webui</code>. Local only: <code>/webui --local</code> or <code>atomcode webui --local</code>. Explicit <code>/webui lan</code> or <code>--host &lt;address&gt;</code> uses the local network instead of automatically connecting a relay.</p>

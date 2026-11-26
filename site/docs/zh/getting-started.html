@@ -67,7 +67,7 @@
 
   <!-- ==================== 正文 ==================== -->
   <main class="dm">
-    <div class="crumb"><a href="./index.html">文档</a><span>/</span><span>开始</span><span>/</span><b>快速开始</b><em>8 分钟阅读</em></div>
+    <div class="crumb"><a href="./index.html">文档</a><span>/</span><span>开始</span><span>/</span><b>快速开始</b><em>9 分钟阅读</em></div>
     <article class="prose" id="prose">
 <h1 id="快速开始">快速开始</h1>
       <p class="lede">几分钟内完成安装、首次运行和第一个任务,体验 AtomCode 的完整流程。</p>
@@ -75,7 +75,7 @@
       <h2 id="系统要求">系统要求</h2>
       <ul>
         <li><strong>操作系统</strong>:macOS (Apple Silicon 或 Intel)、Linux、Windows、HarmonyOS PC</li>
-        <li><strong>Rust 工具链</strong>:1.75+(仅在从源码构建时需要)</li>
+        <li><strong>Rust 工具链</strong>:1.88+(仅在从源码构建时需要)</li>
         <li><strong>LLM 模型</strong>:任一支持的 provider 的 API Key,或一个 AtomGit 账号(用于 OAuth 登录)</li>
       </ul>
 
@@ -102,9 +102,12 @@
       <h3 id="方式-4从源码构建">方式 4:从源码构建</h3>
       <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
 cd atomcode
-cargo build --release
-cp target/release/atomcode ~/.local/bin/</code></pre>
-      <p>Release 构建编译时间较长,但生成的二进制体积小、运行速度快。开发调试时用 <code>cargo build</code> 即可。</p>
+# 如需使用 WebUI，先构建前端（Node.js 22.6+）
+npm ci --prefix webui
+npm run build --prefix webui
+cargo build --release -p atomcode</code></pre>
+      <p>构建完成后可运行 <code>./target/release/atomcode</code>（Windows 为 <code>atomcode.exe</code>），或把它安装到 <code>PATH</code> 中。仅使用终端时可跳过两条 npm 命令。更新前端资源后，如果 Cargo 没有重新编译 Daemon，可用 <code>cargo clean -p atomcode-daemon</code> 后重新构建，以嵌入新的前端资源。</p>
+      <p>领取官方 CodingPlan 免费额度需要官方构建。自行构建时，可通过 <code>/provider</code> 使用自己的模型和 API Key。</p>
 
       <h2 id="验证安装">验证安装</h2>
       <pre><code>atomcode --version</code></pre>

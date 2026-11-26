@@ -107,15 +107,14 @@ atomcode --dangerously-skip-permissions</code></pre>
           <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>非交互模式,单次执行并把回复写到 stdout</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
           <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>非交互模式下把工具调用、token 用量等信息打到 stderr</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>—</td><td>强制限制 Agent 循环的最大轮数,防止无限跑下去</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>逗号分隔,禁用某些工具。例如 <code>--disable-tools bash,web_fetch</code></td></tr>
+          <tr><td><code>--no-tools</code></td><td>—</td><td>Headless 专用。不给模型提供内置工具、MCP、Skill 工具或子代理工具。</td></tr>
           <tr><td><code>--dangerously-skip-permissions</code></td><td><code>-y</code></td><td>跳过所有权限确认,自动批准所有工具调用(bash、文件编辑、MCP 等)。TUI 模式下状态栏显示 ⚠ BYPASS 徽章</td></tr>
         </tbody>
       </table></div>
 
       <div class="callout callout-tip">
         <strong>Tip</strong>
-        <p><code>--disable-tools</code> 让被禁用的工具对模型完全不可见(不会出现在 schemas 中),模型就不会重复尝试调用它。在沙箱评测、离线环境、禁止联网的 CI 等场景里非常实用。</p>
+        <p>交互式 TUI 可用 <code>/toolbox</code> 查看当前工具，并用 <code>/toolbox off &lt;名称或模式&gt;</code> 关闭匹配项。详见<a href="./tools.html">内置工具</a>。</p>
       </div>
 
       <div class="callout callout-warning">

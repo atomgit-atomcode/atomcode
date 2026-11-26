@@ -72,7 +72,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 File & shell:
 
 - `read_file`, `write_file`, `edit_file`, `search_replace`
-- `bash`, `grep`, `glob`, `list_directory`, `change_dir`
+- `bash`, `grep`, `glob`, `list_directory`
 - `web_search`, `web_fetch`
 
 Code graph (language-aware code intelligence):
@@ -83,7 +83,7 @@ Code graph (language-aware code intelligence):
 
 Automation:
 
-- `auto_fix` — automatic lint/typecheck fix loop
+- `list_skills` — list available skills
 - `use_skill` — invoke a user-defined skill
 
 ### Grape Remote Workflows

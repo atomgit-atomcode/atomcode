@@ -81,15 +81,18 @@
       <p>You can also use <code>--config /path/to/config.toml</code> to point at any file. On the first run, if the file is missing, the 3-step wizard walks you through initial setup.</p>
 
       <h2 id="minimal-example">Minimal example</h2>
-      <pre><code>default_provider = "deepseek"
+      <pre><code>default_model = "deepseek/chat"
 
-[providers.deepseek]
-type = "openai"
-api_key = "sk-xxxxxxxxxxxxxxxx"
-model = "deepseek-chat"
+[provider_accounts.deepseek]
+provider = "openai-compatible"
 base_url = "https://api.deepseek.com/v1"
+api_key = "$DEEPSEEK_API_KEY"
+
+[models."deepseek/chat"]
+account = "deepseek"
+model = "deepseek-chat"
 context_window = 64000</code></pre>
-      <p>This config is enough to launch atomcode and start chatting with DeepSeek.</p>
+      <p>Set <code>DEEPSEEK_API_KEY</code> in your environment before launching AtomCode. <code>deepseek/chat</code> is the AtomCode selection ID and <code>deepseek-chat</code> is the model name sent to the API.</p>
       <div class="callout callout-info">
         <strong>Provider management in v5.0.7</strong>
         <p>The recommended path is <code>/provider</code>: add a provider account, then add one or more models under it. Protocol, base URL, and API key are shared by the account; model name and context window are stored per model. Legacy <code>[providers.*]</code> entries remain supported and are projected automatically.</p>
@@ -101,8 +104,11 @@ context_window = 64000</code></pre>
           <tr><th>Field</th><th>Type</th><th>Description</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>default_provider</code></td><td>string</td><td>Provider used at launch (must match a key under <code>[providers.*]</code>)</td></tr>
-          <tr><td><code>default_workdir</code></td><td>string?</td><td>Default working directory. <code>/cd</code> writes back here; restored next launch</td></tr>
+          <tr><td><code>default_model</code></td><td>string?</td><td>Default selection ID, matching a key under <code>[models.*]</code>. Takes precedence over <code>default_provider</code>.</td></tr>
+          <tr><td><code>provider_accounts</code></td><td>table</td><td>Provider accounts hold the protocol or preset, base URL, and credentials.</td></tr>
+          <tr><td><code>models</code></td><td>table</td><td>Model profiles reference an account via <code>account</code> and store the model name and settings such as the context window.</td></tr>
+          <tr><td><code>default_provider</code></td><td>string</td><td>Legacy default selection, matching a key under <code>[providers.*]</code>.</td></tr>
+          <tr><td><code>default_workdir</code></td><td>string?</td><td>Daemon default directory. Saved only when explicitly requested. The TUI neither reads nor writes it.</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>Map of provider name to <a href="#provider-config">ProviderConfig</a></td></tr>
           <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>When the main provider can't see images but the user attaches one, forward it to this provider for OCR / description; the result is spliced back into the prompt as text. See <a href="#vision-preprocessor">Vision preprocessor</a></td></tr>
           <tr><td><code>init_prompt_file</code></td><td>string?</td><td>UTF-8 file whose requirements are appended to the built-in <code>/init</code> prompt. Relative paths resolve from <code>$ATOMCODE_HOME</code>; maximum size is 64 KiB. This can also be edited in <code>/config</code>.</td></tr>
