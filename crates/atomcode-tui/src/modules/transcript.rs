@@ -437,12 +437,18 @@ impl Producer for Transcript {
                 match slot {
                     Some((id, acc)) => {
                         acc.push_str(delta);
-                        let content: Arc<dyn crate::block::Content> = if *reasoning {
-                            Arc::new(ModelThought(acc.clone()))
-                        } else {
-                            Arc::new(ModelSaid(acc.clone()))
-                        };
-                        out.amend(*id, content);
+                        // Append in place while the block still owns its
+                        // content. A rebuild is the fallback: a frame (or any
+                        // other holder) may have taken a handle since the last
+                        // fold, and then only a new Arc can change it.
+                        if !out.append(*id, delta) {
+                            let content: Arc<dyn crate::block::Content> = if *reasoning {
+                                Arc::new(ModelThought(acc.clone()))
+                            } else {
+                                Arc::new(ModelSaid(acc.clone()))
+                            };
+                            out.amend(*id, content);
+                        }
                     }
                     None => {
                         let acc = delta.clone();

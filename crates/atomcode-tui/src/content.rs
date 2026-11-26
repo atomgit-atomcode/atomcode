@@ -1192,6 +1192,10 @@ impl Content for ModelSaid {
         let text = self.display_text();
         (!text.is_empty()).then_some(text)
     }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
+    }
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
         let first = self
@@ -1215,6 +1219,10 @@ impl Content for ModelThought {
     }
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
+    }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
     }
     /// Open, the lid stays on top: `⎿ thought, N lines  点击收起`, then the
     /// thought. The lid is how the thought was opened and it is still the thing

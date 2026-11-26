@@ -218,6 +218,16 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Append to this block's text without rebuilding it.
+    ///
+    /// The default refuses. A content that only ever grows (a streamed answer
+    /// or reasoning) overrides this to push the delta onto its own text, so a
+    /// producer does not copy the whole reply for every delta. Return `false`
+    /// when the content cannot grow this way; the caller then replaces it.
+    fn append(&mut self, _delta: &str) -> bool {
+        false
+    }
+
     /// Refuse to be folded.
     ///
     /// For the rare block whose whole point is that it happened — a skill being
@@ -726,6 +736,22 @@ impl StreamWriter<'_> {
         };
         block.content = content;
         true
+    }
+
+    /// Append a delta to a live block's own text, when this writer owns the
+    /// content.
+    ///
+    /// `false` when the block settled or vanished (not ours), when its content
+    /// cannot grow by appending, or when a frame still holds a handle to it.
+    /// The caller then rebuilds the content and calls [`Self::amend`].
+    pub fn append(&mut self, id: BlockId, delta: &str) -> bool {
+        let Some(Slot::Live(block, _)) = self.stream.live_at(id, self.producer) else {
+            return false;
+        };
+        match Arc::get_mut(&mut block.content) {
+            Some(content) => content.append(delta),
+            None => false,
+        }
     }
 
     /// Freeze a block. Idempotent, and a no-op for someone else's.

@@ -6904,6 +6904,10 @@ impl Tui {
     /// the screen emptied and drawn again from what is known of it, the input
     /// and the stream now its. `false` when it was already there.
     fn look_at(&self, session: &str) -> bool {
+        // The buffered deltas are in neither the host stream (about to be
+        // reset) nor the client history (only folded facts reach it). Fold
+        // them before the view changes, so coming back replays them.
+        self.flush_pending_chunks();
         let Some(known) = self.client.look_at(session) else {
             return false;
         };
@@ -6911,7 +6915,6 @@ impl Tui {
         // that would settle it belongs to the view being left, and this screen
         // will not see it.
         let stopped = self.host.take_stopped();
-        self.discard_pending_chunks();
         self.host.switch_view();
         self.hand_back(stopped);
         let seed = self
@@ -19241,5 +19244,61 @@ mod stream_coalescing_tests {
             .map(|slot| slot.block().kind())
             .collect();
         assert_eq!(kinds, ["assistant", "reasoning"]);
+    }
+
+    #[test]
+    fn switching_views_keeps_the_unfolded_tail_for_replay() {
+        let (host, tui) = screen();
+        tui.on_event(chunk(1, "hel", false));
+        tui.on_event(chunk(2, "lo", false));
+
+        // Leave the lead before any frame folded the run.
+        assert!(tui.look_at("member"));
+
+        // The tail is in the lead's history, or coming back loses it.
+        let lead = tui
+            .client
+            .view
+            .lock()
+            .expect("client poisoned")
+            .sessions
+            .get("lead")
+            .expect("lead view")
+            .events
+            .clone();
+        assert!(
+            lead.iter().any(|e| matches!(
+                &e.event,
+                atomcode_kernel::session::SessionEvent::AssistantChunk { delta, .. }
+                    if delta == "hello"
+            )),
+            "the unfolded tail must reach the client history: {lead:?}"
+        );
+
+        // Coming back replays it into a fresh stream.
+        assert!(tui.look_at("lead"));
+        assert_eq!(growing(&host).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_slow_stream_appends_without_rebuilding_the_block() {
+        let (host, tui) = screen();
+        tui.on_event(chunk(1, "hel", false));
+        tui.flush_pending_chunks();
+        let first = {
+            let stream = host.stream.read().expect("stream poisoned");
+            Arc::as_ptr(&stream.slots()[0].block().content)
+        };
+
+        tui.on_event(chunk(2, "lo", false));
+        tui.flush_pending_chunks();
+
+        let same = {
+            let stream = host.stream.read().expect("stream poisoned");
+            assert_eq!(stream.slots().len(), 1);
+            std::ptr::eq(first, Arc::as_ptr(&stream.slots()[0].block().content))
+        };
+        assert!(same, "the delta must append in place, not replace the Arc");
+        assert_eq!(growing(&host).as_deref(), Some("hello"));
     }
 }
