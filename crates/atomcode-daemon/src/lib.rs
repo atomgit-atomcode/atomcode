@@ -11770,6 +11770,130 @@ mod tests {
         );
     }
 
+    // 回归 #1842：/chat 每条输入都重建一个临时 CodingRuntime，每个 runtime 都
+    // 重新推导同样的启动提示（如 claude.md 被 AGENTS.md 遮蔽），并作为首批
+    // ControllerWarning 重发 —— WebUI 里每发一句话就重复展示一次「claude.md …
+    // not loaded」。修复后：同一会话内已展示过的启动提示只在首个回合出现，
+    // 指令文件状态真的变化产生的新提示仍然展示。
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_shows_each_startup_advisory_once_per_session_until_it_changes() {
+        async fn run_turn(
+            home: &ScopedChatHome,
+            dir: &std::path::Path,
+            session_id: &str,
+            request_id: &str,
+            message: &str,
+        ) -> Vec<String> {
+            let (main_url, _main_request, main_task) = spawn_openai_sse("turn done").await;
+            let mut config = Config::with_default_provider("main");
+            config
+                .providers
+                .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+            config
+                .save(&Config::default_path())
+                .expect("save chat test config");
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let active_chats = ActiveChatRegistry::default();
+            let admission = active_chats.admit(None, Some(request_id)).await.unwrap();
+            let operation_id = admission.operation_id.clone();
+            process_chat_request(
+                ChatRequest {
+                    reasoning_effort: None,
+                    message: message.into(),
+                    working_dir: Some(dir.to_path_buf()),
+                    provider: Some("main".into()),
+                    session_id: Some(session_id.into()),
+                    request_id: Some(request_id.into()),
+                    images: Vec::new(),
+                    approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                },
+                event_tx,
+                admission.cancellation,
+                operation_id.clone(),
+                active_chats.clone(),
+                chat_test_telemetry(home),
+                permission_bridge::PermissionResponders::new(),
+                permission_bridge::UserInputResponders::new(),
+                false,
+                false,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .expect("chat turn succeeds");
+            active_chats.complete(&operation_id).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), main_task)
+                .await
+                .expect("provider task finishes");
+
+            let mut warnings = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                if let ChatEvent::Warning { message } = event {
+                    warnings.push(message);
+                }
+            }
+            warnings
+        }
+
+        let home = ScopedChatHome::new();
+        let dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
+        std::fs::write(dir.join("claude.md"), "claude rules").unwrap();
+        let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        // Seed a native session so every turn continues the SAME session id.
+        {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::for_project(
+                &dir,
+                &atomcode_coding::config::product_dirs_from_env(),
+            );
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("seed"),
+            ]);
+            let mut meta = SessionMeta::new(id, dir.to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        // 第 1 条输入：claude.md 遮蔽提示出现一次。
+        let first = run_turn(&home, &dir, id, "chat-advisory-turn-1", "one").await;
+        assert_eq!(
+            first.iter().filter(|w| w.contains("claude.md")).count(),
+            1,
+            "first turn must show the claude.md advisory once: {first:?}"
+        );
+
+        // 第 2 条输入：同一会话，同样的提示不再重复。
+        let second = run_turn(&home, &dir, id, "chat-advisory-turn-2", "two").await;
+        assert!(
+            !second.iter().any(|w| w.contains("claude.md")),
+            "second turn must not repeat the claude.md advisory: {second:?}"
+        );
+
+        // 指令文件状态真的变化：AGENTS.md 变空产生新提示，必须再次展示。
+        std::fs::write(dir.join("AGENTS.md"), "").unwrap();
+        let third = run_turn(&home, &dir, id, "chat-advisory-turn-3", "three").await;
+        assert!(
+            third
+                .iter()
+                .any(|w| w.contains("AGENTS.md") && w.contains("empty")),
+            "a changed instruction state must surface its new advisory: {third:?}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn chat_preprocesses_images_before_submitting_to_a_text_only_model() {
         let home = ScopedChatHome::new();
