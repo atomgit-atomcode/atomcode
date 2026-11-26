@@ -592,6 +592,188 @@ pub struct Collected {
     pub exit: Exit,
 }
 
+/// A byte stream that keeps at most `cap` bytes: the head and the tail.
+///
+/// A command that prints without end (`yes`, `cat /dev/urandom`) must not grow
+/// this process without bound. The caller chooses `cap`; the head gets the
+/// larger share — the opening (a diff header, a log's first lines) is usually
+/// the more useful half — and the tail keeps the most recent bytes (the error,
+/// the status). [`CappedBytes::finish`] marks the dropped middle with an ASCII
+/// marker, and aligns the seam to a UTF-8 boundary only when the retained bytes
+/// really are UTF-8.
+///
+/// A small delta merges into the back chunk, so a world that yields one byte at
+/// a time costs one entry per [`TAIL_CHUNK_BYTES`], not one per byte.
+const TAIL_CHUNK_BYTES: usize = 4 * 1024;
+
+pub(crate) struct CappedBytes {
+    head: Vec<u8>,
+    /// Tail chunks, oldest first. Whole chunks are dropped from the front, so a
+    /// steady stream costs a memcpy per chunk rather than two ring operations
+    /// per byte.
+    tail: std::collections::VecDeque<Vec<u8>>,
+    tail_bytes: usize,
+    head_cap: usize,
+    tail_cap: usize,
+    total: u64,
+}
+
+impl CappedBytes {
+    pub(crate) fn new(cap: usize) -> Self {
+        let head_cap = cap - cap / 4;
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            tail_bytes: 0,
+            head_cap,
+            tail_cap: cap.saturating_sub(head_cap),
+            total: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len() as u64);
+        let mut rest = bytes;
+        if self.head.len() < self.head_cap {
+            let take = (self.head_cap - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() || self.tail_cap == 0 {
+            return;
+        }
+        if rest.len() >= self.tail_cap {
+            // The new bytes alone are at least the whole tail: keep only their
+            // last `tail_cap`. Pushing them all first would defeat the bound.
+            self.tail.clear();
+            self.tail_bytes = 0;
+            self.tail
+                .push_back(rest[rest.len() - self.tail_cap..].to_vec());
+            self.tail_bytes = self.tail_cap;
+            return;
+        }
+        // Merge a small delta into the back chunk. One byte at a time would
+        // otherwise create one heap entry per byte. The chunk stops growing at
+        // `TAIL_CHUNK_BYTES`; the next delta starts a new one.
+        if let Some(back) = self.tail.back_mut() {
+            if back.len() < TAIL_CHUNK_BYTES {
+                back.extend_from_slice(rest);
+                self.tail_bytes += rest.len();
+                self.trim_tail();
+                return;
+            }
+        }
+        self.tail.push_back(rest.to_vec());
+        self.tail_bytes += rest.len();
+        self.trim_tail();
+    }
+
+    /// Drop whole front chunks while the tail still covers `tail_cap` without
+    /// them. The retained bytes may exceed `tail_cap` by less than one chunk;
+    /// [`CappedBytes::finish`] trims that excess. No partial drain here, so a
+    /// steady stream never memmoves the tail.
+    fn trim_tail(&mut self) {
+        while let Some(front) = self.tail.front() {
+            if self.tail_bytes - front.len() < self.tail_cap {
+                break;
+            }
+            self.tail_bytes -= front.len();
+            self.tail.pop_front();
+        }
+    }
+
+    pub(crate) fn finish(self) -> Vec<u8> {
+        let total = self.total;
+        let tail_bytes = self.tail_bytes;
+        let mut tail = Vec::with_capacity(tail_bytes);
+        for chunk in self.tail {
+            tail.extend_from_slice(&chunk);
+        }
+        // The buffer may exceed `tail_cap` by less than one chunk; keep the
+        // most recent `tail_cap` bytes.
+        let excess = tail_bytes.saturating_sub(self.tail_cap);
+        if excess > 0 {
+            tail.drain(..excess);
+        }
+        let kept = self.head.len() + tail.len();
+        if total <= kept as u64 {
+            // Nothing was dropped, so there is no seam to align.
+            let mut out = self.head;
+            out.extend(tail);
+            return out;
+        }
+        // Do not leave half a character either side of the marker. This is
+        // best-effort and UTF-8-specific: `world.decode` may decode the same
+        // bytes as UTF-16 or an OEM/GBK code page, where a UTF-8 continuation
+        // byte is a legal lead or trail byte. Only a head that was cut
+        // mid-character proves the seam is UTF-8. A head that is valid UTF-8
+        // (including pure ASCII) ended at a boundary: a tail starting with
+        // 0x80..=0xBF then belongs to another encoding, or to a character whose
+        // lead byte is in the dropped middle. A UTF-16 head is valid UTF-8 too
+        // (its NULs are), but no sequence is incomplete, so it is left alone.
+        //
+        // Trade-off: a UTF-8 flood whose head ends at a character boundary can
+        // still start its tail mid-character, leaving one replacement character
+        // after the marker. Aligning that would also eat a GBK/OEM byte that
+        // starts the tail with the same value.
+        let mut head = self.head;
+        let head_incomplete = match std::str::from_utf8(&head) {
+            Ok(_) => false,
+            Err(error) => {
+                if error.error_len().is_none() {
+                    head.truncate(error.valid_up_to());
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if head_incomplete {
+            let leading_continuation = tail
+                .iter()
+                .take(3)
+                .take_while(|byte| **byte & 0xC0 == 0x80)
+                .count();
+            tail.drain(..leading_continuation);
+        }
+        let omitted = total.saturating_sub((head.len() + tail.len()) as u64);
+        let marker = format!("\n[atomcode: captured output truncated - {omitted} bytes omitted]\n");
+        let mut out = head;
+        out.extend_from_slice(marker.as_bytes());
+        out.extend(tail);
+        out
+    }
+}
+
+/// One output stream while it is being collected: whole, or bounded.
+enum Retained {
+    Whole(Vec<u8>),
+    Capped(CappedBytes),
+}
+
+impl Retained {
+    fn new(cap: Option<usize>) -> Self {
+        match cap {
+            Some(cap) => Retained::Capped(CappedBytes::new(cap)),
+            None => Retained::Whole(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Retained::Whole(out) => out.extend_from_slice(bytes),
+            Retained::Capped(out) => out.push(bytes),
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        match self {
+            Retained::Whole(out) => out,
+            Retained::Capped(out) => out.finish(),
+        }
+    }
+}
+
 /// A command that is already running.
 ///
 /// # Why a handle and not `run() -> Output`
@@ -676,6 +858,20 @@ pub trait Process: Send + Sync {
         &self,
         limit: Option<std::time::Duration>,
     ) -> Result<Option<Collected>, String> {
+        self.collect_within_capped(limit, None).await
+    }
+
+    /// [`collect_within`](Self::collect_within) that retains at most `cap` bytes
+    /// of each stream.
+    ///
+    /// The retained bytes are the head and the tail, and a marker replaces the
+    /// dropped middle. `None` keeps everything, the contract
+    /// [`collect_within`](Self::collect_within) has always had.
+    async fn collect_within_capped(
+        &self,
+        limit: Option<std::time::Duration>,
+        cap: Option<usize>,
+    ) -> Result<Option<Collected>, String> {
         let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
         let running_out = || async move {
             match deadline {
@@ -683,11 +879,11 @@ pub trait Process: Send + Sync {
                 None => std::future::pending().await,
             }
         };
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let mut stdout = Retained::new(cap);
+        let mut stderr = Retained::new(cap);
         let mut take = |chunk: Chunk| match chunk {
-            Chunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
-            Chunk::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+            Chunk::Stdout(bytes) => stdout.push(&bytes),
+            Chunk::Stderr(bytes) => stderr.push(&bytes),
         };
         let exit = loop {
             tokio::select! {
@@ -717,8 +913,8 @@ pub trait Process: Send + Sync {
             }
         };
         Ok(Some(Collected {
-            stdout,
-            stderr,
+            stdout: stdout.finish(),
+            stderr: stderr.finish(),
             exit,
         }))
     }
@@ -2397,5 +2593,193 @@ mod bounded_line_tests {
         assert!(count_reader_lines(b"first\n".as_slice().chain(Fails), 100)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod capped_output_tests {
+    use super::*;
+
+    #[test]
+    fn capped_bytes_keeps_the_head_and_tail_and_marks_the_middle() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'a'; 60]);
+        bytes.push(&[b'b'; 60]);
+        let out = bytes.finish();
+        let text = String::from_utf8_lossy(&out);
+        assert!(out.starts_with(&[b'a'; 60]), "head is kept");
+        assert!(out.ends_with(&[b'b'; 25]), "tail is kept");
+        assert!(text.contains("output truncated"), "{text}");
+        assert!(text.contains("20 bytes omitted"), "{text}");
+        assert!(out.len() < 200, "{}", out.len());
+    }
+
+    #[test]
+    fn capped_bytes_is_identity_below_the_cap() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(b"hello");
+        bytes.push(b" world");
+        assert_eq!(bytes.finish(), b"hello world");
+    }
+
+    #[test]
+    fn capped_bytes_bounds_a_single_huge_chunk() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'x'; 1_000_000]);
+        let out = bytes.finish();
+        assert!(out.len() < 200, "{}", out.len());
+        assert!(String::from_utf8_lossy(&out).contains("output truncated"));
+    }
+
+    #[test]
+    fn capped_bytes_merges_tiny_chunks() {
+        let mut bytes = CappedBytes::new(1024); // head 768, tail 256
+        for _ in 0..10_000 {
+            bytes.push(b"x");
+        }
+        assert!(
+            bytes.tail.len() <= 2,
+            "one-byte pushes created {} tail entries",
+            bytes.tail.len()
+        );
+        let out = bytes.finish();
+        assert!(out.ends_with(&[b'x'; 10]));
+    }
+
+    #[test]
+    fn capped_bytes_keeps_the_last_tail_bytes_across_chunks() {
+        let mut bytes = CappedBytes::new(20); // head 15, tail 5
+        bytes.push(&[b'a'; 10]);
+        bytes.push(&[b'b'; 10]);
+        bytes.push(&[b'c'; 10]);
+        let out = bytes.finish();
+        assert!(out.starts_with(&[b'a'; 10]), "head kept");
+        assert!(out.ends_with(&[b'c'; 5]), "tail is the newest bytes");
+        assert!(
+            String::from_utf8_lossy(&out).contains("10 bytes omitted"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn capped_bytes_does_not_split_a_multibyte_character_at_the_seam() {
+        // 300 bytes of 3-byte characters. cap 10 gives head 8 and tail 2: the
+        // head cut falls inside the third character and the tail is its
+        // trailing continuation bytes. Both sides must be aligned.
+        let text = "中".repeat(100);
+        let mut bytes = CappedBytes::new(10);
+        bytes.push(text.as_bytes());
+        let out = bytes.finish();
+        let shown = String::from_utf8_lossy(&out);
+        assert!(
+            !shown.contains('\u{FFFD}'),
+            "seam split a character: {shown:?}"
+        );
+        assert!(shown.contains("output truncated"), "{shown:?}");
+        assert!(shown.starts_with("中中"), "{shown:?}");
+    }
+
+    #[test]
+    fn capped_bytes_does_not_align_a_non_utf8_tail() {
+        // The head is invalid UTF-8 (GBK-like). The tail starts with 0x81, a
+        // legal GBK lead byte that also looks like a UTF-8 continuation byte.
+        // It must not be dropped.
+        let mut bytes = CappedBytes::new(100); // head 75, tail 25
+        bytes.push(&[0xFF; 75]);
+        bytes.push(&[0x40]);
+        bytes.push(&[0x81]);
+        bytes.push(&[0x41; 24]);
+        let out = bytes.finish();
+        assert_eq!(out[out.len() - 25], 0x81, "the GBK lead byte was dropped");
+        assert!(out.ends_with(&[0x41; 24]));
+    }
+
+    #[test]
+    fn capped_bytes_does_not_align_a_utf16_tail() {
+        // ASCII UTF-16LE: the head is valid UTF-8 (NULs) and no sequence is
+        // incomplete, so the mid-character rule leaves the tail alone.
+        let mut bytes = CappedBytes::new(100); // head 75, tail 25
+        bytes.push(&"A\0".repeat(38).into_bytes()); // 76 bytes; head takes 75
+        bytes.push(&[0x40]);
+        bytes.push(&[0x81]);
+        bytes.push(&[0x41; 24]);
+        let out = bytes.finish();
+        assert_eq!(out[out.len() - 25], 0x81, "UTF-16 parity was shifted");
+        assert!(out.ends_with(&[0x41; 24]));
+    }
+
+    #[test]
+    #[cfg(feature = "tools")]
+    fn the_capture_marker_is_ascii_and_distinct_from_the_artifact_marker() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'x'; 1_000]);
+        let out = bytes.finish();
+        assert!(
+            out.is_ascii(),
+            "the marker must stay ASCII for OEM decoders"
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("[atomcode: captured output truncated"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(crate::tools::output_artifact::ARTIFACT_TRUNCATION_MARKER_PREFIX),
+            "the capture marker must not look like an artifact preview: {text}"
+        );
+    }
+
+    #[test]
+    fn capped_bytes_does_not_align_a_gbk_tail_behind_an_ascii_head() {
+        // A pure-ASCII head is valid UTF-8, but that does not make a GBK tail
+        // UTF-8. Only a head cut mid-character makes the seam UTF-8.
+        let mut bytes = CappedBytes::new(100); // head 75, tail 25
+        bytes.push(&[b'A'; 75]);
+        bytes.push(&[0x40]);
+        bytes.push(&[0x81]);
+        bytes.push(&[0x41; 24]);
+        let out = bytes.finish();
+        assert_eq!(out[out.len() - 25], 0x81, "the GBK lead byte was dropped");
+        assert!(out.ends_with(&[0x41; 24]));
+    }
+
+    struct Flood {
+        chunks: std::sync::Mutex<std::collections::VecDeque<Chunk>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Process for Flood {
+        async fn next_chunk(&self) -> Option<Chunk> {
+            self.chunks.lock().unwrap().pop_front()
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            Ok(Exit {
+                code: Some(0),
+                signal: None,
+            })
+        }
+        async fn kill(&self) {}
+    }
+
+    #[tokio::test]
+    async fn collect_within_capped_bounds_each_stream_and_marks_the_middle() {
+        let mut chunks = std::collections::VecDeque::new();
+        for _ in 0..100 {
+            chunks.push_back(Chunk::Stdout(vec![b'a'; 100]));
+            chunks.push_back(Chunk::Stderr(vec![b'e'; 100]));
+        }
+        let flood = Flood {
+            chunks: std::sync::Mutex::new(chunks),
+        };
+        let collected = flood
+            .collect_within_capped(None, Some(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(collected.stdout.len() < 1_100, "{}", collected.stdout.len());
+        assert!(collected.stderr.len() < 1_100, "{}", collected.stderr.len());
+        assert!(String::from_utf8_lossy(&collected.stdout).contains("output truncated"));
+        assert!(String::from_utf8_lossy(&collected.stderr).contains("output truncated"));
     }
 }
