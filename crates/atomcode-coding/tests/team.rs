@@ -329,6 +329,45 @@ async fn a_member_that_stops_after_a_progress_note_is_reported_on() {
     );
 }
 
+/// A final report reminds the lead to stop the member once it is satisfied, so a
+/// finished member does not sit idle on the team; a progress note does not.
+#[tokio::test]
+async fn a_done_report_reminds_the_lead_to_stop_the_member() {
+    let dir = scratch("done-stop");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "", calls = [ { name = "tell_parent", args = { kind = "progress", text = "halfway" } }, { name = "tell_parent", args = { text = "all 41 written" } } ] }, { text = "Reported." }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    let mut heard = Vec::new();
+    for _ in 0..100 {
+        heard = heard_by(&app, &lead).await;
+        if heard.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let texts: Vec<&str> = heard.iter().map(|(_, text)| text.as_str()).collect();
+    let progress = texts
+        .iter()
+        .find(|t| t.contains("halfway"))
+        .expect("the note");
+    let done = texts
+        .iter()
+        .find(|t| t.contains("all 41 written"))
+        .expect("the report");
+    assert!(!progress.contains("`stop` it"), "{progress}");
+    assert!(done.contains("`stop` it"), "{done}");
+}
+
 /// A lead that hands writing to a read-only role learns it when it delegates,
 /// not from the member's report after the whole task has been read through.
 #[tokio::test]

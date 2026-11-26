@@ -801,8 +801,15 @@ impl Tool for TellParent {
             #[serde(default)]
             kind: Option<String>,
         }
-        let (text, progress) = match serde_json::from_str::<Args>(args) {
-            Ok(a) => (a.text, a.kind.as_deref() == Some("progress")),
+        let (text, progress, done) = match serde_json::from_str::<Args>(args) {
+            Ok(a) => {
+                let kind = a.kind.as_deref();
+                (
+                    a.text,
+                    kind == Some("progress"),
+                    matches!(kind, None | Some("done")),
+                )
+            }
             Err(e) => return fail(format!("invalid arguments: {e}")),
         };
         let Some(lead) = self.agents.get(self.lead) else {
@@ -815,6 +822,17 @@ impl Tool for TellParent {
         } else {
             format!("[{}] {text}", self.name)
         };
+        // The lead's prompt already says to stop a member whose work is done;
+        // leads act on the report in front of them and skip it, so the report
+        // says it too. A finished member left idle keeps a team place and its
+        // row in the panel.
+        if done {
+            report.push_str(&format!(
+                "\n\n({} reports its task done. Once you have checked it and need nothing more \
+                 from it, `stop` it.)",
+                self.name
+            ));
+        }
         {
             let mut receipt = self.told.lock().expect("told poisoned");
             receipt.sent = true;
