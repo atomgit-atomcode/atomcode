@@ -527,12 +527,6 @@ skipping a matching listed skill or jumping straight to code before following it
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
 does not fix it.\n\
-- EDIT WITH THE EDIT TOOL, NOT THE SHELL: change files with `edit_file` (or `write_file` to \
-rewrite a whole file). NEVER use `sed`/`awk`/`perl -i` or `>`/`>>`/tee redirection to edit \
-source files — it mangles indentation and encoding (worst on Windows) and snowballs into \
-corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
-snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
-shell script.\n\
 - VERIFY BEFORE FINISHING: unless the user explicitly forbids compiling, testing, or running \
 commands/scripts, after editing code actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
@@ -803,7 +797,7 @@ To find files by path/name, use `glob` instead of `bash find` / `fd` unless you 
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 LOCATE then READ: use `grep` / `glob` / `list_symbols` to pin the exact file and line, then `read_file` with `offset`/`limit` (or `ranges`) to pull just that window — don't dump whole files or rebuild them from shell / `python` slices.
 Litmus for bash vs a file tool: a short pipeline that returns a COUNT, frequency, diff, or checksum → `bash`; anything that just reads, pages, slices, or reformats bytes a file tool can fetch → use `read_file` / `grep` / `glob`.
-To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo.
+To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `awk`/`perl -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo, and mangle indentation and encoding (worst on Windows). If `edit_file` can't find your text, RE-READ the file and copy the exact snippet INCLUDING its whitespace, or rewrite the file with `write_file` — never fall back to a shell edit.
 The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
 Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
@@ -1012,16 +1006,16 @@ mod tests {
             !frontier.contains("SKILL/PROCESS FIRST"),
             "frontier → untouched"
         );
-        // DeepSeek's block must also forbid editing files via the shell (the "写着写着跟
-        // sed 干起来" corruption): use edit_file/write_file, never sed. Only in the block.
-        assert!(
-            ds.contains("EDIT WITH THE EDIT TOOL"),
-            "deepseek → discipline block forbids shell-editing (use edit_file, not sed)"
-        );
-        assert!(
-            !frontier.contains("EDIT WITH THE EDIT TOOL"),
-            "frontier → untouched (no execution block)"
-        );
+        // The "写着写着跟 sed 干起来" corruption (DeepSeek, 1b25c44d): the rule and its
+        // recovery path reach every model once, from `## TOOLS` — not restated in the block.
+        for p in [&ds, &frontier] {
+            assert_eq!(
+                p.matches("never fall back to a shell edit").count(),
+                1,
+                "shell-edit rule stated exactly once"
+            );
+        }
+        assert!(!ds.contains("EDIT WITH THE EDIT TOOL"));
     }
 
     #[test]

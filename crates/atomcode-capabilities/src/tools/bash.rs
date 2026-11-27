@@ -522,21 +522,11 @@ fn shell_tool_description(
              stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
              commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
              risky and may require approval.\n\
-             Prefer the dedicated tools over bash for file operations — they are \
-             gitignore-aware, cross-platform, and cheaper: read_file to read a file (NOT \
-             cat/head/tail), grep to search file contents (NOT grep/rg), glob to find \
-             files by name (NOT find/fd), list_directory for a directory tree (NOT ls), \
-             edit_file to MODIFY a file and write_file to create/overwrite one. NEVER edit \
-             a file with a shell command (sed/awk/perl -i, or `>`/`>>`/tee redirection) — \
-             it corrupts indentation and encoding (especially on Windows) and cascades; if \
-             edit_file reports it can't find your text, RE-READ the file and copy the exact \
-             text, or rewrite the whole file with write_file — do not fall back to sed. \
-             Reserve bash for real shell work — git, builds, package managers, running \
-             commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do. For long builds/tests use `bash_start` and wait \
-             for it the way the host's background completion policy says; unless the host \
-             says it resumes you when a job finishes, wait with `bash_poll` until the job \
-             ends before answering. Do not use shell sleep to wait or duplicate a running build.\n\
+             File work goes through the dedicated tools: read_file (NOT cat/head/tail), \
+             grep (NOT grep/rg), glob (NOT find/fd), list_directory (NOT ls), edit_file / \
+             write_file (NEVER sed/awk/perl -i or `>`/`>>`/tee redirection). Reserve bash for \
+             git, builds, package managers, running commands, and aggregation pipelines \
+             (wc, sort, uniq, git log). Long builds/tests go through `bash_start`.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
