@@ -594,6 +594,7 @@ dependencies = [
  "atomcode-plexus",
  "axum",
  "ctor",
+ "fs2",
  "futures",
  "serde",
  "serde_json",

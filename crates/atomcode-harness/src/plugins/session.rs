@@ -4,22 +4,26 @@
 //! can keep the log and drop persistence (an eval run), or keep persistence and
 //! swap the store (a database instead of JSONL), without any of them knowing.
 
+mod jsonl;
+
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::events::{AgentCreated, AgentInfo, SessionEventCommitted};
+use crate::agent::{Agent, AgentId};
+use crate::events::{AgentChange, AgentCreated, AgentInfo, AgentRemoved, SessionEventCommitted};
 use crate::seams::{
-    SessionDefaults, SessionDefaultsSvc, SessionPersistence, SessionPersistenceSvc,
+    AgentsSvc, SessionDefaults, SessionDefaultsSvc, SessionPersistence, SessionPersistenceSvc,
     SessionProjectionsSvc,
 };
-use crate::session::{
-    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionHeader, SessionProjections,
-};
+use crate::session::{Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionProjections};
+
+use self::jsonl::{JsonlStore, LiveJournal};
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionRow {
@@ -182,225 +186,27 @@ struct PersistenceRow {
     project_root: Option<String>,
 }
 
-pub(crate) struct JsonlStore {
-    root: PathBuf,
-    /// The project bucket new sessions are written into.
-    bucket: String,
+struct JournalWriters {
+    active: HashMap<String, (AgentId, Arc<LiveJournal>)>,
+    queue: Option<mpsc::Sender<(Arc<LiveJournal>, LoggedEvent)>>,
 }
 
-impl JsonlStore {
-    /// One path segment, whatever the id claims to be. Ids are minted here but a
-    /// resumed one arrives from outside, and a crafted id must not escape.
-    fn safe(session_id: &str) -> String {
-        session_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
-
-    /// The project's bucket directory.
-    pub(crate) fn dir(&self) -> PathBuf {
-        self.root.join(&self.bucket)
-    }
-
-    fn path(&self, session_id: &str) -> PathBuf {
-        self.dir().join(format!("{}.jsonl", Self::safe(session_id)))
-    }
-
-    /// Where sessions written before bucketing existed still live.
-    ///
-    /// Read-only and deliberately not migrated: a resume must keep working for
-    /// a log the user already has, and rewriting a hundred files on disk to
-    /// tidy a layout is a much worse trade than reading two paths.
-    fn legacy_path(&self, session_id: &str) -> PathBuf {
-        self.root.join(format!("{}.jsonl", Self::safe(session_id)))
-    }
-
-    /// The first line, when it is a header. A file from before headers begins
-    /// with an event instead, and reads the same as one whose header was lost:
-    /// a session with no recorded identity beyond its file name.
-    fn parse_header(path: &std::path::Path, text: &str) -> Result<Option<SessionHeader>, String> {
-        let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
-            return Ok(None);
-        };
-        let value: Value =
-            serde_json::from_str(first).map_err(|e| format!("{}:1: {e}", path.display()))?;
-        let Some(header) = value.get("header") else {
-            return Ok(None);
-        };
-        let header: SessionHeader = serde_json::from_value(header.clone())
-            .map_err(|e| format!("{}:1: header: {e}", path.display()))?;
-        if header.version > crate::session::SESSION_FORMAT_VERSION {
-            return Err(format!(
-                "{}: session format {} is newer than this build reads ({})",
-                path.display(),
-                header.version,
-                crate::session::SESSION_FORMAT_VERSION
-            ));
-        }
-        Ok(Some(header))
-    }
-
-    /// Every session file in this project's bucket, newest first. This
-    /// project's, not every session on the machine: a list that crossed
-    /// projects would make "what did we do here" unanswerable by the same
-    /// amount the flat layout did.
-    fn stored(&self) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(self.dir()) else {
-            return Vec::new();
-        };
-        let mut ids: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                (path.extension()? == "jsonl")
-                    .then(|| path.file_stem()?.to_str().map(str::to_string))
-                    .flatten()
-            })
-            .collect();
-        ids.sort();
-        ids.reverse();
-        ids
-    }
-
-    /// The header this store holds for `session_id`, read synchronously: what a
-    /// description reports as the session's recorded start, which is not the
-    /// in-memory log's when the log was seeded rather than resumed from here.
-    fn stored_header(&self, session_id: &str) -> Option<SessionHeader> {
-        use std::io::BufRead;
-        let path = match self.path(session_id) {
-            p if p.exists() => p,
-            _ => self.legacy_path(session_id),
-        };
-        let file = std::fs::File::open(&path).ok()?;
-        let mut first = String::new();
-        std::io::BufReader::new(file).read_line(&mut first).ok()?;
-        Self::parse_header(&path, &first).ok().flatten()
-    }
-
-    /// Write the header line if the file does not exist yet. Synchronous and
-    /// small on purpose: it must be on disk before the first event lands, and
-    /// the first event is appended from a task this does not wait for.
-    fn begin_sync(&self, header: &SessionHeader) -> Result<(), String> {
-        let path = self.path(&header.id);
-        if path.exists() || self.legacy_path(&header.id).exists() {
+impl JournalWriters {
+    fn keep(&mut self, store: &JsonlStore, agent: &Agent) -> Result<(), String> {
+        let id = agent.session_id();
+        if self.queue.is_none()
+            || !agent.persist()
+            || self
+                .active
+                .get(id)
+                .is_some_and(|(owner, _)| *owner == agent.id())
+        {
             return Ok(());
         }
-        std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
-        let line = serde_json::json!({ "header": header });
-        let mut text = serde_json::to_string(&line).map_err(|e| e.to_string())?;
-        text.push('\n');
-        std::fs::write(&path, text).map_err(|e| e.to_string())
-    }
-
-    fn parse(path: &std::path::Path, text: &str) -> Result<Vec<LoggedEvent>, String> {
-        let mut events = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(line)
-                .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
-            // The header line carries no event; it is read by `parse_header`.
-            if value.get("header").is_some() && value.get("event").is_none() {
-                continue;
-            }
-            let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            let event: SessionEvent =
-                serde_json::from_value(value.get("event").cloned().unwrap_or(Value::Null))
-                    .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
-            // A record written before commit times were kept reads as unknown.
-            let at = value.get("at").and_then(Value::as_u64).unwrap_or(0);
-            events.push(LoggedEvent { seq, at, event });
-        }
-        Ok(events)
-    }
-
-    /// Read one session's events from a path, for a reader that already knows
-    /// which file it wants (the recall row walking the bucket).
-    pub(crate) fn read_at(path: &std::path::Path) -> Result<Vec<LoggedEvent>, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        Self::parse(path, &text)
-    }
-}
-
-#[async_trait]
-impl SessionPersistence for JsonlStore {
-    fn location(&self, session_id: &str) -> Option<String> {
-        Some(self.path(session_id).display().to_string())
-    }
-    async fn begin(&self, header: &SessionHeader) -> Result<(), String> {
-        self.begin_sync(header)
-    }
-    async fn header(&self, session_id: &str) -> Result<Option<SessionHeader>, String> {
-        let path = match self.path(session_id) {
-            p if p.exists() => p,
-            _ => self.legacy_path(session_id),
-        };
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        Self::parse_header(&path, &text)
-    }
-
-    async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
-        let mut buffer = String::new();
-        for logged in events {
-            if logged.event.is_transient() {
-                continue;
-            }
-            let line =
-                serde_json::json!({ "seq": logged.seq, "at": logged.at, "event": logged.event });
-            buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);
-            buffer.push('\n');
-        }
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path(session_id))
-            .map_err(|e| e.to_string())?;
-        file.write_all(buffer.as_bytes()).map_err(|e| e.to_string())
-    }
-
-    async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String> {
-        // The bucket first, then where sessions lived before buckets existed.
-        let path = match self.path(session_id) {
-            p if p.exists() => p,
-            _ => self.legacy_path(session_id),
-        };
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        Self::read_at(&path)
-    }
-
-    async fn list(&self) -> Result<Vec<String>, String> {
-        Ok(self
-            .stored()
-            .into_iter()
-            .filter(|id| self.stored_header(id).is_none_or(|h| h.parent.is_none()))
-            .collect())
-    }
-
-    async fn children(&self, parent: &str) -> Result<Vec<SessionHeader>, String> {
-        Ok(self
-            .stored()
-            .into_iter()
-            .filter_map(|id| self.stored_header(&id))
-            .filter(|h| h.parent.as_deref() == Some(parent))
-            .collect())
+        let journal = store.open_live(agent.session().header())?;
+        self.active
+            .insert(id.to_string(), (agent.id(), Arc::new(journal)));
+        Ok(())
     }
 }
 
@@ -438,7 +244,7 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         // stores under this root stop sharing one level and start agreeing on
         // what a project is.
         let bucket = atomcode_config::util::stable_project_hash(&project);
-        let store = Arc::new(JsonlStore { root, bucket });
+        let store = Arc::new(JsonlStore::new(root, bucket));
         // What this row does, and only that. It used to go on to explain resume
         // and recall, which are other rows' — and in an assembly that keeps its
         // sessions elsewhere and swaps both of those out, this entry was left
@@ -465,17 +271,14 @@ impl Plugin for SessionPersistenceJsonlPlugin {
                 use crate::agent::OnlySession;
                 let log = asking.only_session()?;
                 let persisted = facts_ctx
-                    .service::<crate::seams::AgentsSvc>()
+                    .service::<AgentsSvc>()
                     .and_then(|agents| agents.by_session(log.id()))
                     .map(|agent| agent.persist())
                     .unwrap_or(true);
                 if !persisted {
                     return None;
                 }
-                let mut lines = vec![format!(
-                    "event log: {}",
-                    facts_store.path(log.id()).display()
-                )];
+                let mut lines = vec![format!("event log: {}", facts_store.location(log.id())?)];
                 if let Some(header) = facts_store.stored_header(log.id()) {
                     lines.push(format!(
                         "  started at: {} (unix ms, as the log recorded it)",
@@ -509,74 +312,80 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         // A session's header goes down the moment its agent exists — before
         // any event, which is the only order in which "first line" is true.
         // Inline rather than spawned for the same reason.
+        // A single off-turn writer keeps commit order. The fiber drains it
+        // before releasing leases on shutdown so an immediate resume sees the
+        // complete persisted prefix, including the last queued turn facts.
+        let (writes, queue) = mpsc::channel::<(Arc<LiveJournal>, LoggedEvent)>();
+        let worker = std::thread::Builder::new()
+            .name("harness-session-jsonl".into())
+            .spawn(move || {
+                for (journal, logged) in queue {
+                    journal.commit(&logged);
+                }
+            })
+            .map_err(|e| format!("start session journal writer: {e}"))?;
+        let writers = Arc::new(Mutex::new(JournalWriters {
+            active: HashMap::new(),
+            queue: Some(writes),
+        }));
+        let stopping = writers.clone();
+        let _ = ctx.effect(move || {
+            {
+                let mut writers = stopping.lock().expect("journal registry poisoned");
+                writers.queue.take();
+                writers.active.clear();
+            }
+            if worker.join().is_err() {
+                eprintln!("session-persistence: journal writer terminated unexpectedly");
+            }
+        });
+
+        let created_writers = writers.clone();
         let header_ctx = ctx.clone();
         let header_store = store.clone();
         let _ = ctx.on_emit::<AgentCreated>(move |created: &AgentInfo| {
             let Some(agent) = header_ctx
-                .service::<crate::seams::AgentsSvc>()
+                .service::<AgentsSvc>()
                 .and_then(|a| a.get(created.id))
             else {
                 return;
             };
-            if !agent.persist() {
-                return;
+            if let Err(e) = created_writers
+                .lock()
+                .expect("journal registry poisoned")
+                .keep(&header_store, &agent)
+            {
+                agent.reject_creation(format!("session-persistence: {e}"));
             }
-            if let Err(e) = header_store.begin_sync(agent.session().header()) {
-                eprintln!("session-persistence: {e}");
+        });
+        let removed_writers = writers.clone();
+        let _ = ctx.on_emit::<AgentRemoved>(move |removed: &AgentChange| {
+            let mut writers = removed_writers.lock().expect("journal registry poisoned");
+            if writers
+                .active
+                .get(&removed.session)
+                .is_some_and(|(id, _)| *id == removed.id)
+            {
+                writers.active.remove(&removed.session);
             }
         });
 
-        // ONE writer, fed by a queue — not a task per event.
-        //
-        // The previous shape spawned a `tokio::spawn` per committed fact, for a
-        // good reason (a slow disk must not stall the turn) and with a bad
-        // consequence: the tasks raced, so the file was written in whatever
-        // order the scheduler happened to pick. Sequence numbers are minted in
-        // order at commit; the LINES were not in that order. Measured on real
-        // sessions: ~10-18% of all facts out of order, and 2-10 of the
-        // MODEL-VISIBLE ones per session — and nothing sorts on the way back in
-        // (`JsonlStore::parse` reads lines in file order, `SessionLog::restore`
-        // stores them as given, `derive_messages` folds them as stored). A
-        // resumed conversation could therefore show the model two tool results
-        // swapped, or context after the message it was meant to precede.
-        //
-        // A queue keeps the property that mattered — the turn never waits on the
-        // disk, because `send` is non-blocking — and restores the one that was
-        // lost, because a single consumer appends in the order it receives.
-        // Same shape as `capabilities::datalog::DatalogWriter`, for the same
-        // reason.
-        //
-        // The task ends when the sender drops, which happens when this row
-        // unloads: no shutdown handshake, and nothing left writing into a store
-        // whose row is gone.
-        let (writes, mut queue) =
-            tokio::sync::mpsc::unbounded_channel::<(String, crate::session::LoggedEvent)>();
-        let writer_store = store.clone();
-        tokio::spawn(async move {
-            while let Some((id, logged)) = queue.recv().await {
-                if let Err(e) = writer_store
-                    .append(&id, std::slice::from_ref(&logged))
-                    .await
-                {
-                    eprintln!("session-persistence: {e}");
-                }
+        // A config patch can mount this row after agents already exist.
+        if let Some(agents) = ctx.service::<AgentsSvc>() {
+            let mut active = writers.lock().expect("journal registry poisoned");
+            for agent in agents.list() {
+                active.keep(&store, &agent)?;
             }
-        });
+        }
 
-        let agents_ctx = ctx.clone();
         let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
-            let keep = agents_ctx
-                .service::<crate::seams::AgentsSvc>()
-                .and_then(|a| a.by_session(&committed.session))
-                .map(|a| a.persist())
-                .unwrap_or(true);
-            if !keep {
-                return;
+            let writers = writers.lock().expect("journal registry poisoned");
+            if let (Some(queue), Some((_, journal))) =
+                (&writers.queue, writers.active.get(&committed.session))
+            {
+                // Pending facts retain the lease even after agent removal.
+                let _ = queue.send((journal.clone(), committed.logged()));
             }
-            // Non-blocking, so the turn still never waits on the disk. A closed
-            // channel means the row is unloading; the fact is dropped rather
-            // than reported, because "we are shutting down" is not a failure.
-            let _ = writes.send((committed.session.clone(), committed.logged()));
         });
         Ok(())
     }

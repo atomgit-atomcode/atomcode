@@ -829,3 +829,44 @@ async fn incomplete_tool_calls_cannot_bypass_the_no_progress_recovery_limit() {
     app.stop();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn remounting_jsonl_keeps_persisting_the_live_session() {
+    let root = std::env::temp_dir().join(format!("atomcode-jsonl-remount-{}", std::process::id()));
+    let new_root = root.join("new-store");
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(VecDeque::from([
+            vec![
+                StreamEvent::TextDelta("before remount".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+            vec![
+                StreamEvent::TextDelta("saved after remount".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+    });
+    let mut app = app(&root, provider, false).await;
+    run_turn(&app, "open the session").await.unwrap();
+    let id = app.context().only_session().unwrap().id().to_string();
+    let path = bundle::toml_string(&new_root.to_string_lossy());
+    let patch = Layer::from_toml(&format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {path}, project_root = {path} }}"
+    ))
+    .unwrap();
+    app.patch(&patch).await.unwrap();
+
+    assert_eq!(app.context().only_session().unwrap().id(), id);
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .unwrap();
+    run_turn(&app, "persist this").await.unwrap();
+    drop(app);
+    let events = store.load(&id).await.unwrap();
+    let messages = atomcode_kernel::session::derive_messages_with_meta(&events);
+    assert!(messages.iter().any(|m| m.text == "saved after remount"));
+    std::fs::remove_dir_all(root).unwrap();
+}

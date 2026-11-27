@@ -856,6 +856,12 @@ pub trait SessionPersistence: Send + Sync {
     /// Replay a session's events in order.
     async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String>;
 
+    /// Delete an inactive session and its owned files. Returns false when no
+    /// session exists. Backends must opt in to this destructive operation.
+    async fn delete(&self, _session_id: &str) -> Result<bool, String> {
+        Err("this session store does not support deletion".into())
+    }
+
     /// The sessions a person can pick up, newest first where the backend can
     /// tell. A delegated agent's session — a team member, a task child — is
     /// not one of them: it is kept under its parent, not beside it
