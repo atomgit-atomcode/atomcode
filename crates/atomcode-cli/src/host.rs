@@ -2307,6 +2307,31 @@ impl HostControl for RuntimeControl {
             HostCommand::ListSessions { working_dir } => {
                 session_disk(move || Ok(Self::list(working_dir))).await
             }
+            HostCommand::ListTaskSessions { session } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                let parent = session.clone();
+                let sessions = session_disk(move || {
+                    let dirs = atomcode_coding::config::product_dirs_from_env();
+                    let manager = SessionManager::for_project(&here, &dirs);
+                    Ok(manager
+                        .children(&parent)
+                        .into_iter()
+                        .filter_map(|meta| manager.read_event_header(&meta.id).ok())
+                        .filter_map(|header| {
+                            atomcode_host_api::TaskSession::from_header(header, &parent)
+                        })
+                        .collect())
+                })
+                .await?;
+                self.addressed(&session)?;
+                Ok(HostReply::TaskSessions { sessions })
+            }
             HostCommand::DeleteSession { session } => {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)

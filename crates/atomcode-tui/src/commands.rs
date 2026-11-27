@@ -950,8 +950,7 @@ fn session_catalogue() -> Vec<Command> {
             "[prompt|persona]".into(),
             t(Msg::CmdAboutContext),
         ),
-        Command::said("agents", t(Msg::CmdAboutAgents))
-            .with_aliases(&["subagents"]),
+        Command::said("agents", t(Msg::CmdAboutAgents)).with_aliases(&["subagents"]),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
         // `/session` is the same fresh start, named the way the reference does,
@@ -1766,15 +1765,16 @@ impl CommandSet for SessionCommands {
                         .about(root.clone()),
                     );
                 }
-                for (name, session, gone) in roster.members() {
+                let members = roster.members();
+                for (name, session, gone) in &members {
                     rows.push(
                         crate::sheet::Row::new(
                             format!("/look {session}"),
                             // Where it stands is part of what the row is: a
                             // stopped member's conversation is still there and
                             // is not something to talk to.
-                            if gone {
-                                t(Msg::AgentsStopped { name: &name }).into_owned()
+                            if *gone {
+                                t(Msg::AgentsStopped { name }).into_owned()
                             } else {
                                 name.clone()
                             },
@@ -1782,29 +1782,35 @@ impl CommandSet for SessionCommands {
                         .about(session.clone()),
                     );
                 }
-                // One-shot `task` children are on no roster: they are not team
-                // members, and the delegation is over the moment the tool call
-                // returns. Their sessions are kept under the lead's all the
-                // same, and the header's label is what the picker lists them
-                // by — the task's own short description, not a minted id.
-                if let Some(store) = ctx.service::<atomcode_harness::seams::SessionPersistenceSvc>()
-                {
-                    let children = store.children(&root).await.unwrap_or_default();
-                    let listed = |session: &str| {
-                        roster.members().iter().any(|(_, s, _)| s == session)
-                    };
-                    for header in children {
-                        if header.member.is_some() || listed(&header.id) {
-                            continue;
+                // The host owns the retained logs. The picker takes only
+                // names and ids, and /look replays the selected session.
+                if let Some(control) = control.filter(|_| !root.is_empty()) {
+                    let reply = control
+                        .call(HostCommand::ListTaskSessions {
+                            session: root.clone(),
+                        })
+                        .await;
+                    if client.root() != root {
+                        return Outcome::Quiet;
+                    }
+                    match reply {
+                        Ok(HostReply::TaskSessions { sessions }) => {
+                            for child in sessions {
+                                if members.iter().any(|(_, session, _)| session == &child.id) {
+                                    continue;
+                                }
+                                let label = child.label.as_deref().unwrap_or(&child.id);
+                                rows.push(
+                                    crate::sheet::Row::new(
+                                        format!("/look {}", child.id),
+                                        t(Msg::AgentsTaskChild { label }).into_owned(),
+                                    )
+                                    .about(child.id),
+                                );
+                            }
                         }
-                        let label = header.label.as_deref().unwrap_or(&header.id);
-                        rows.push(
-                            crate::sheet::Row::new(
-                                format!("/look {}", header.id),
-                                t(Msg::AgentsTaskChild { label }).into_owned(),
-                            )
-                            .about(header.id.clone()),
-                        );
+                        Ok(_) => return Outcome::Refused(t(Msg::NoHost).into_owned()),
+                        Err(error) => return Outcome::Refused(refusal(error)),
                     }
                 }
                 if rows.is_empty() {
@@ -8450,6 +8456,68 @@ mod tests {
         assert!(
             c.all().iter().all(|x| x.name != "look"),
             "`/look` is hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_is_one_alias_and_lists_retained_tasks_from_the_host() {
+        let commands = builtin_for_test();
+        let app = bare();
+        let ctx = app.context();
+        let roster = Arc::new(crate::plugin::Roster::default());
+        roster.note_for_test("lead/scout", "scout", true);
+        let _ = ctx.provide::<crate::plugin::TeamRosterSvc>(roster).unwrap();
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::TaskSessions {
+                sessions: vec![
+                    atomcode_host_api::TaskSession {
+                        id: "sub-a".into(),
+                        label: Some("Audit parser".into()),
+                    },
+                    atomcode_host_api::TaskSession {
+                        id: "sub-old".into(),
+                        label: None,
+                    },
+                ],
+            }));
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.connect(tokio::sync::mpsc::unbounded_channel().0, host.clone());
+        client.follow("lead");
+        let _ = ctx
+            .provide::<crate::plugin::AgentClientSvc>(client)
+            .unwrap();
+
+        assert_eq!(commands.find("subagents").unwrap().name, "agents");
+        assert!(commands
+            .all()
+            .iter()
+            .all(|command| command.name != "subagents"));
+        let sheet = sheet_of(commands.dispatch("/subagents", &ctx).await);
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("an agent picker");
+        };
+        assert!(list.rows.iter().any(|row| row.value == "/look lead/scout"));
+        assert!(list
+            .rows
+            .iter()
+            .any(|row| row.value == "/look sub-old" && row.label.contains("sub-old")));
+        let task = list
+            .rows
+            .iter()
+            .find(|row| row.label.contains("Audit parser"))
+            .unwrap();
+        assert_eq!(
+            commands.dispatch(&task.value, &ctx).await,
+            Outcome::Do(Action::LookAt("sub-a".into()))
+        );
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![HostCommand::ListTaskSessions {
+                session: "lead".into()
+            }]
         );
     }
 
