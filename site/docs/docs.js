@@ -15,8 +15,13 @@ $('#themeBtn').onclick=()=>{const l=document.documentElement.classList.toggle('l
 
 /* ==================== 侧栏抽屉（窄屏） ==================== */
 const ds=$('#ds'),dsBg=$('#dsBg'),sbBtn=$('#sbBtn');
-function side(on){ds.classList.toggle('open',on);dsBg.classList.toggle('on',on);sbBtn.setAttribute('aria-expanded',on)}
+function side(on){ds.classList.toggle('open',on);dsBg.classList.toggle('on',on);sbBtn.setAttribute('aria-expanded',on);
+  /* 抽屉打开时锁住背景滚动：滚动容器是 html，只锁 body 无效 */
+  document.documentElement.style.overflow=on?'hidden':'';
+  document.body.style.overflow=on?'hidden':'';
+}
 sbBtn.onclick=()=>side(!ds.classList.contains('open'));dsBg.onclick=()=>side(false);
+addEventListener('resize',()=>{if(innerWidth>900&&ds.classList.contains('open'))side(false)});
 // 当前页滚动到侧栏可见区
 const cur=$('.sl.on',ds);if(cur)cur.scrollIntoView({block:'center'});
 
@@ -55,6 +60,7 @@ const prog=$('#prog');let raf=0;
 function onScroll(){if(raf)return;raf=requestAnimationFrame(()=>{raf=0;
   const h=document.documentElement.scrollHeight-innerHeight;prog.style.transform=`scaleX(${h>0?Math.min(1,scrollY/h):0})`;
   let k=-1;const y=innerHeight*.28;heads.forEach((hd,i)=>{if(hd.getBoundingClientRect().top<y)k=i});
+  if(k<0&&heads.length)k=0; /* 页面在首个标题之上时兜底高亮第一项，避免右栏目录全灭 */
   tocA.forEach((a,i)=>a.classList.toggle('on',i===k));
   const on=tocA[k];if(on){const r=on.getBoundingClientRect(),tr=toc.getBoundingClientRect();if(r.top<tr.top+40||r.bottom>tr.bottom-40)on.scrollIntoView({block:'nearest'})}
 })}

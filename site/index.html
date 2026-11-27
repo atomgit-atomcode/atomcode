@@ -153,12 +153,12 @@ section{position:relative;padding:150px var(--pad) 0}
 .p-in{position:absolute;inset:0;width:100%;opacity:0;font-size:16px;border:0;background:none;cursor:text;z-index:3}
 @keyframes blink{50%{opacity:0}}
 /* 迷你安装条 */
-.mini-ins{display:flex;align-items:center;gap:6px;max-width:580px;margin-top:14px;font:12.5px var(--mono)}
-.mini-ins .tabs{display:flex;gap:2px;flex:none}
+.mini-ins{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;max-width:580px;margin-top:14px;font:12.5px var(--mono)}
+.mini-ins .tabs{display:flex;gap:2px;flex:none;width:100%}
 .mini-ins .tabs button{height:32px;padding:0 9px;border-radius:7px;color:var(--fg3);transition:.2s}
 .mini-ins .tabs button.on{color:var(--ink);background:var(--bg3);box-shadow:inset 0 0 0 1px var(--line2)}
-.mini-ins code{flex:1;min-width:0;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:8px;border-left:1px solid var(--line)}
-.mini-ins .cp{flex:none;height:32px;padding:0 10px;border-radius:7px;color:var(--ph)}
+.mini-ins code{flex:1 1 0;min-width:0;color:var(--fg2);white-space:pre-wrap;overflow-wrap:break-word;padding-left:8px;border-left:1px solid var(--line);line-height:1.55}
+.mini-ins .cp{flex:none;align-self:flex-start;height:32px;padding:0 10px;border-radius:7px;color:var(--ph)}
 .mini-ins .cp:hover{background:rgba(var(--accent-rgb),.08)}
 .h-meta{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:40px;font:11.5px var(--mono);color:var(--fg3)}
 .h-meta b{color:var(--fg2);font-weight:500}
@@ -294,7 +294,8 @@ section{position:relative;padding:150px var(--pad) 0}
 .st.on{border-color:rgba(var(--accent-rgb),.4)}.st.on::before{opacity:.45}
 .st-hd{display:flex;align-items:flex-start;justify-content:space-between;padding:20px 22px 0}
 .st-z{font:11px/1.5 var(--mono);color:var(--fg3)}.st-z b{display:block;font:500 13px var(--mono);color:var(--ph);letter-spacing:.08em}
-.st-sym{font:700 clamp(64px,7vw,104px)/.85 var(--mono);letter-spacing:-.07em;color:var(--bg);-webkit-text-stroke:1px rgba(var(--ink-rgb),.22);transition:text-shadow .6s,-webkit-text-stroke-color .6s}
+.st-sym{font:700 clamp(64px,7vw,104px)/.85 var(--mono);letter-spacing:-.07em;color:var(--bg);-webkit-text-stroke:1px rgba(var(--ink-rgb),.28);transition:text-shadow .6s,-webkit-text-stroke-color .6s}
+.light .st-sym{-webkit-text-stroke-color:rgba(var(--ink-rgb),.22)}
 .st.on .st-sym{-webkit-text-stroke-color:rgba(var(--accent-rgb),.6);text-shadow:0 0 40px rgba(var(--accent-rgb),.55)}
 .st h3{padding:4px 22px 0;font:600 26px var(--sans);color:var(--ink);letter-spacing:-.02em}
 .st p{padding:6px 22px 0;font-size:14px;color:var(--fg2);min-height:52px}
@@ -726,11 +727,11 @@ footer nav a:hover{color:var(--ph)}
   <button class="pill rail-close" id="railClose" aria-label="关闭菜单" type="button">×</button>
   <a class="brand" href="#top"><img class="site-mark" src="assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>v5.2.9</em></a>
   <nav class="menu" id="menu">
-    <a data-doc="index" href="docs/zh/index.html"><i>[1]</i><span data-i="mn1">文档</span></a>
-    <a href="#surf"><i>[2]</i><span data-i="mn2">产品</span></a>
-    <a href="#table" data-act="models"><i>[3]</i><span data-i="mn3">模型</span></a>
-    <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener"><i>[4]</i><span>CodingPlan</span><em>↗</em></a>
-    <a href="skillhub/index.html"><i>[5]</i><span data-i="mn5">SkillHub</span></a>
+    <a href="#surf"><i>[1]</i><span data-i="mn2">产品</span></a>
+    <a href="#table" data-act="models"><i>[2]</i><span data-i="mn3">模型</span></a>
+    <a data-doc="index" href="docs/zh/index.html"><i>[3]</i><span data-i="mn1">文档</span></a>
+    <a href="skillhub/index.html"><i>[4]</i><span data-i="mn5">SkillHub</span></a>
+    <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener"><i>[5]</i><span>CodingPlan</span><em>↗</em></a>
     <a data-doc="changelog" href="docs/zh/changelog.html"><i>[6]</i><span data-i="mn6">更新日志</span></a>
   </nav>
   <div class="rail-ft">
@@ -1334,7 +1335,8 @@ function renderInstall(){
   $('#hudCopy').hidden=m.binary;
   const downloadLabel=lang==='zh'?'选择平台下载':'Choose a platform to download';
   $('#miniTabs').innerHTML=INSTALL.slice(0,4).map((x,i)=>`<button data-k="${i}" class="${i===sel?'on':''}">${esc(L(x.k))}</button>`).join('');
-  $('#miniCmd').textContent=(m.binary?downloadLabel:m.cmd.split('\n')[0]);
+  /* 折行断点放在 / 之后：URL 不在单词中间断开；复制仍走 INSTALL[sel].cmd，不受 wbr 影响 */
+  $('#miniCmd').innerHTML=esc(m.binary?downloadLabel:m.cmd.split('\n')[0]).replace(/\//g,'/<wbr>');
   $('#synTabs').innerHTML=INSTALL.map((x,i)=>`<button aria-pressed="${i===sel}" data-k="${i}" class="${i===sel?'on':''}">${esc(L(x.k))}</button>`).join('');
   $('#synCmd').textContent=m.cmd;$('#synNote').textContent=L(m.note);
   $('#hudCmd').textContent=m.binary?downloadLabel:'$ '+m.cmd.split('\n')[0];
@@ -1474,7 +1476,7 @@ let stEls=[],opEls=[];
 function buildRx(){
   const zh=lang==='zh';
   rail.innerHTML=STEPS.map((s,i)=>`<article class="st">
-    <div class="st-hd"><span class="st-z">${String(i+1).padStart(2,'0')} / 04<b>${s.w}</b></span><span class="st-sym">${s.s}</span></div>
+    <div class="st-hd"><span class="st-z">${String(i+1).padStart(2,'0')} / 04<b>${s.w}</b></span><span class="st-sym" aria-hidden="true">${s.s}</span></div>
     <h3>${esc(L(s.t))}</h3><p>${esc(L(s.d))}</p>
     <div class="st-term">${s.l.map(([c,t])=>`<div class="ln ${c}">${esc(L(t))}</div>`).join('')}</div>
     <span class="st-chip">${esc(L(s.chip))}</span></article>`+
@@ -1586,19 +1588,25 @@ const DOCS=[
 ];
 const docUrl=slug=>`${invitePath?'/':''}docs/${lang==='zh'?'zh':'en'}/${slug}.html`;
 const docQ=$('#docQ'),docGrid=$('#docGrid');
+/* 默认只列分组入口（各组页数 + 首篇直达），输入关键词时才展开匹配的具体页面：
+   逐条清单由 docs 站侧栏承担，避免首页再维护一份会漂移的手写目录 */
 function renderDocs(){
-  let n=0;
-  docGrid.innerHTML=DOCS.map(([g,items])=>`<div class="d-col"><h3>${esc(L(g))}<em>${items.length}</em></h3>`+
-    items.map(([slug,zh,en])=>`<a href="${docUrl(slug)}" data-k="${esc((slug+' '+zh+' '+en).toLowerCase())}"><i>${String(++n).padStart(2,'0')}</i><span>${esc(lang==='zh'?zh:en)}</span><em>↗</em></a>`).join('')+'</div>').join('')+
-    `<p class="d-none" hidden>${lang==='zh'?'没有匹配的文档':'No matching guide'}</p>`;
-  filterDocs();
+  const q=docQ.value.trim().toLowerCase();
+  const empty=`<p class="d-none">${lang==='zh'?'没有匹配的文档':'No matching guide'}</p>`;
+  if(!q){
+    docGrid.innerHTML=DOCS.map(([g,items])=>
+      `<div class="d-col"><h3>${esc(L(g))}<em>${items.length}</em></h3>`+
+      `<a href="${docUrl(items[0][0])}"><i>→</i><span>${esc(L(g))}</span><em>↗</em></a></div>`).join('')+empty;
+    $('.d-none',docGrid).hidden=true;
+    return;
+  }
+  const hits=DOCS.flatMap(([,items])=>items.filter(([slug,zh,en])=>(slug+' '+zh+' '+en).toLowerCase().includes(q)));
+  if(!hits.length){docGrid.innerHTML=empty;$('.d-none',docGrid).hidden=false;return}
+  docGrid.innerHTML=`<div class="d-col"><h3>${lang==='zh'?'匹配':'Matches'}<em>${hits.length}</em></h3>`+
+    hits.map(([slug,zh,en])=>`<a href="${docUrl(slug)}"><i>→</i><span>${esc(lang==='zh'?zh:en)}</span><em>↗</em></a>`).join('')+'</div>'+empty;
+  $('.d-none',docGrid).hidden=true;
 }
-function filterDocs(){
-  const q=docQ.value.trim().toLowerCase();let any=false;
-  $$('.d-col',docGrid).forEach(col=>{let c=0;$$('a',col).forEach(a=>{const hit=!q||a.dataset.k.includes(q);a.classList.toggle('hide',!hit);if(hit)c++});col.classList.toggle('empty',!c);$('h3 em',col).textContent=c;if(c)any=true});
-  $('.d-none',docGrid).hidden=any;
-}
-docQ.addEventListener('input',filterDocs);
+docQ.addEventListener('input',renderDocs);
 $('#surfGrid').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy)});
 
 

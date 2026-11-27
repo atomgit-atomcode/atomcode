@@ -463,9 +463,9 @@ function renderStats(){
 function renderSpec(){
   /* 触屏上光谱条太细不便点，只作展示，筛选交给下方图例 */
   const tag=fine?'button':'span';
-  $('#specBar').innerHTML=D.cats.map(c=>`<${tag} class="c-${esc(c.k)}${st.c===c.k?' on':''}" style="--n:${c.n}" data-c="${esc(c.k)}" title="${esc(catName(c.k))} · ${c.n}"${fine?` aria-label="${esc(catName(c.k))}"`:' aria-hidden="true"'}></${tag}>`).join('');
-  $('#specLg').innerHTML=`<button class="${st.c?'':'on'}" data-c="" style="--sc:var(--ink)"><i></i>${L('全部','All')}<em>${D.total}</em></button>`+
-    D.cats.map(c=>`<button class="c-${esc(c.k)}${st.c===c.k?' on':''}" data-c="${esc(c.k)}"><i></i>${esc(catName(c.k))}<em>${c.n}</em></button>`).join('');
+  $('#specBar').innerHTML=D.cats.map(c=>`<${tag} class="c-${esc(c.k)}${st.c===c.k?' on':''}" style="--n:${c.n}" data-c="${esc(c.k)}" title="${esc(catName(c.k))} · ${c.n}"${fine?` aria-label="${esc(catName(c.k))} · ${c.n}" aria-pressed="${st.c===c.k}"`:' aria-hidden="true"'}></${tag}>`).join('');
+  $('#specLg').innerHTML=`<button class="${st.c?'':'on'}" data-c="" style="--sc:var(--ink)" aria-pressed="${!st.c}"><i></i>${L('全部','All')}<em>${D.total}</em></button>`+
+    D.cats.map(c=>`<button class="c-${esc(c.k)}${st.c===c.k?' on':''}" data-c="${esc(c.k)}" aria-pressed="${st.c===c.k}"><i></i>${esc(catName(c.k))}<em>${c.n}</em></button>`).join('');
   $('#spec').classList.toggle('f',!!st.c);
   $('#specNow').textContent=st.c?catName(st.c).toUpperCase():L('全部系列','ALL SERIES');
 }
