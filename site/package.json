@@ -8,7 +8,8 @@
     "build": "npm run build:css && npm run build:search",
     "watch:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --watch",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build:docs": "python3 build_docs.py"
+    "build:docs": "python3 build_docs.py",
+    "build:skills": "python3 build_skills.py"
   },
   "keywords": [],
   "author": "",

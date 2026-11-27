@@ -709,13 +709,13 @@ footer nav a:hover{color:var(--ph)}
     <a data-doc="index" href="docs/zh/index.html"><i>[1]</i><span data-i="mn1">文档</span></a>
     <a href="#surf"><i>[2]</i><span data-i="mn2">产品</span></a>
     <a href="#table" data-act="models"><i>[3]</i><span data-i="mn3">模型</span></a>
-    <a href="https://ai.atomgit.com/serverless-api"><i>[4]</i><span>CodingPlan</span><em>↗</em></a>
-    <a href="https://atomcode-plugin.atomgit.com"><i>[5]</i><span data-i="mn5">Skills 市场</span><em>↗</em></a>
+    <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener"><i>[4]</i><span>CodingPlan</span><em>↗</em></a>
+    <a href="skillhub/index.html"><i>[5]</i><span data-i="mn5">SkillHub</span></a>
     <a data-doc="changelog" href="docs/zh/changelog.html"><i>[6]</i><span data-i="mn6">更新日志</span></a>
   </nav>
   <div class="rail-ft">
-    <a href="https://atomgit.com/atomgit_atomcode/atomcode">AtomGit ↗</a>
-    <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">Issue ↗</a>
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener">AtomGit ↗</a>
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener">Issue ↗</a>
   </div>
 </aside>
 <div class="rail-bg" id="railBg"></div>
@@ -1006,7 +1006,7 @@ footer nav a:hover{color:var(--ph)}
   <span>© 2026 AtomCode · MIT</span>
   <nav>
     <a href="docs/zh/index.html" data-doc="index" data-i="ft1">/文档</a>
-    <a href="https://atomcode-plugin.atomgit.com">/skills</a>
+    <a href="skillhub/index.html">/skillhub</a>
     <a href="https://ai.atomgit.com/serverless-api">/codingplan</a>
     <a href="https://atomgit.com/atomgit_atomcode/atomcode">/repo</a>
     <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases">/releases</a>
@@ -1101,7 +1101,7 @@ const REPO='https://atomgit.com/atomgit_atomcode/atomcode';
 /* ==================== 英文文案（中文直接取自 HTML） ==================== */
 const T={
  'hud.cmd':'Commands',cp:'Copy',cp2:'Copy command',
- s1:'01 Element',s2:'02 Surfaces',s3:'03 Table',s4:'04 Reaction',s5:'05 Workflow',s6:'06 Synthesis',s7:'07 Docs','hud.doc':'Docs',mn1:'Docs',mn2:'Product',mn3:'Models',mn5:'Skills market',mn6:'Changelog','u.esc':'esc interrupt','u.ph':'Ask anything, / for commands, @ for context…','u.loc':'Local','u.gh':';  // Ac: prefix fixed ✓',
+ s1:'01 Element',s2:'02 Surfaces',s3:'03 Table',s4:'04 Reaction',s5:'05 Workflow',s6:'06 Synthesis',s7:'07 Docs','hud.doc':'Docs',mn1:'Docs',mn2:'Product',mn3:'Models',mn5:'SkillHub',mn6:'Changelog','u.esc':'esc interrupt','u.ph':'Ask anything, / for commands, @ for context…','u.loc':'Local','u.gh':';  // Ac: prefix fixed ✓',
  'u.eb':'§02 · Surfaces','u.h':'One core<span class="dim">, four surfaces</span>','u.t0':'fix the login callback 404',
  'u.n1':'Terminal TUI','u.d1':'A terminal UI for your shell, editor terminal, or remote server.','u.a1':'Install AtomCode','u.l1':'Download packages →',
  'u.n2':'WebUI · Desktop app','u.d2':'Install AtomCode on your computer first. Run <code>atomcode webui</code> in your shell or <code>/webui</code> inside AtomCode. Once the browser opens, you can install it as a desktop app from Chrome or Edge.','u.a2':'Install and launch','u.l2':'Already installed? Copy launch command','u.w1':'match the mock spacing','u.w2':'3 edits · tests pass ✓',
@@ -1607,7 +1607,7 @@ function CMDS(){const zh=lang==='zh';return [
  {g:'sys',c:'/lang',d:zh?'切换到 English':'切换到中文',run:toggleLang},
  {g:'link',c:'/login',d:zh?'领取 CodingPlan 免费额度':'claim free CodingPlan quota',run:nav('https://ai.atomgit.com/serverless-api')},
  {g:'link',c:'/docs',d:zh?'阅读文档':'read the docs',run:nav(docUrl('index'))},
- {g:'link',c:'/skills',d:zh?'Skills 插件市场':'skills marketplace',run:nav('https://atomcode-plugin.atomgit.com')},
+ {g:'link',c:'/skillhub',d:zh?'SkillHub 技能元素库':'SkillHub skill library',run:nav('skillhub/index.html')},
  {g:'link',c:'/repo',d:zh?'AtomGit 开源仓库':'source on AtomGit',run:nav(REPO)},
 ]}
 const pal=$('#pal'),palIn=$('#palIn'),palList=$('#palList');

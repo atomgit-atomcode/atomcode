@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SkillHub · AtomCode 技能元素库</title>
+<meta name="theme-color" content="#050605">
+<meta name="description" content="AtomCode SkillHub：发现、搜索并安装 AtomCode 插件与 Skills。官方目录 + 社区技能，一条命令装进你的智能体。">
+<link rel="icon" type="image/svg+xml" href="../assets/atomgit-mark.svg">
+<script>
+(() => {
+  let saved;
+  try { saved = localStorage.getItem('atomcode_theme'); } catch (e) {}
+  const light = saved === 'light' || (saved !== 'dark' && matchMedia('(prefers-color-scheme: light)').matches);
+  document.documentElement.classList.toggle('light', light);
+  document.querySelector('meta[name="theme-color"]').content = light ? '#f4f6ed' : '#050605';
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ==================== 设计令牌（与官网 v5 同源） ==================== */
+:root{
+  --bg:#050605;--bg2:#0a0c0a;--bg3:#101310;--bg4:#151915;
+  --ink:#eceee8;--fg2:#a3a99f;--fg3:#848d80;--fg4:#71796f;
+  --ink-rgb:236,238,232;--overlay-rgb:8,10,8;--accent-rgb:198,242,78;
+  --line:rgba(var(--ink-rgb),.075);--line2:rgba(var(--ink-rgb),.14);--line3:rgba(var(--ink-rgb),.24);
+  --ph:#c6f24e;--ph2:#3fae5f;--on-accent:#050605;--on-ink:#050605;--accent-hover:#d6ff66;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:Inter,-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  --pad:clamp(20px,4.4vw,72px);
+  --hh:64px;
+  --ease:cubic-bezier(.2,.7,.2,1);--spring:cubic-bezier(.34,1.56,.64,1);
+  color-scheme:dark;
+}
+/* 浅色主题：与官网 / 文档站同一套令牌 */
+:root.light{
+  --bg:#f4f6ed;--bg2:#fcfdf8;--bg3:#e8ecdf;--bg4:#dfe4d4;
+  --ink:#20271d;--fg2:#495447;--fg3:#576251;--fg4:#656f60;
+  --ink-rgb:32,39,29;--overlay-rgb:252,253,248;--accent-rgb:66,97,15;
+  --line:rgba(32,39,29,.12);--line2:rgba(32,39,29,.20);--line3:rgba(32,39,29,.35);
+  --ph:#42610f;--ph2:#286340;--on-accent:#fff;--on-ink:#fff;--accent-hover:#334d09;
+  color-scheme:light;
+}
+@supports (padding:max(0px)){:root{--pad:max(clamp(20px,4.4vw,72px),calc(env(safe-area-inset-left) + 16px),calc(env(safe-area-inset-right) + 16px))}}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--fg2);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+body.lock{overflow:hidden}
+a{color:inherit;text-decoration:none}
+button,input,select{font:inherit;color:inherit;background:none;border:0}
+button{cursor:pointer}
+code,kbd{font-family:var(--mono)}
+img{display:block}
+::selection{background:var(--ph);color:var(--on-accent)}
+:focus-visible{outline:1.5px solid var(--ph);outline-offset:3px;border-radius:6px}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:88px 88px;opacity:.35;-webkit-mask:radial-gradient(ellipse at 50% 20%,#000,transparent 75%);mask:radial-gradient(ellipse at 50% 20%,#000,transparent 75%)}
+
+/* ==================== 系列色：沿官网光谱延展为 11 段 ==================== */
+.c-development{--scb:#c6f24e}.c-productivity{--scb:#e8d44e}.c-testing{--scb:#5ee08f}.c-ai-ml{--scb:#3fd0c9}
+.c-creative{--scb:#b18cff}.c-industry{--scb:#f2a24e}.c-security{--scb:#ff6b5e}.c-automation{--scb:#46e0b0}
+.c-devops{--scb:#5aa9ea}.c-data-analytics{--scb:#7c8cff}.c-other{--scb:#9aa39a}
+[class^="c-"],[class*=" c-"]{--sc:var(--scb)}
+:root.light [class^="c-"],:root.light [class*=" c-"]{--sc:color-mix(in srgb,var(--scb) 55%,#141a10)}
+
+/* ==================== 顶栏 ==================== */
+.top{position:fixed;left:0;right:0;top:0;z-index:50;display:flex;align-items:center;gap:10px;height:calc(var(--hh) + env(safe-area-inset-top));padding:env(safe-area-inset-top) var(--pad) 0;
+  background:linear-gradient(var(--bg) 30%,transparent);transition:background .3s}
+.top.solid{background:rgba(var(--overlay-rgb),.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.pill{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:38px;padding:0 13px;border:1px solid var(--line2);border-radius:9px;background:rgba(var(--overlay-rgb),.72);font:12.5px/1 var(--mono);color:var(--fg2);white-space:nowrap;transition:border-color .25s,color .25s}
+.pill:hover{border-color:var(--line3);color:var(--ink)}
+.brand{gap:10px;padding:0 12px 0 8px;color:var(--ink);font:500 13px var(--mono)}
+.brand img{width:22px;height:22px;object-fit:contain}
+.brand em{font-style:normal;color:var(--ph)}
+.brand i{font-style:normal;color:var(--fg4)}
+.top .sp{flex:1}
+.top kbd{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 4px;border:1px solid var(--line2);border-radius:4px;font-size:10.5px;color:var(--fg3)}
+.top .ext::after{content:"↗";color:var(--fg3);font-size:11px}
+
+/* ==================== 首屏 ==================== */
+.hero{position:relative;padding:calc(var(--hh) + 80px) var(--pad) 40px;max-width:1500px;margin:0 auto}
+.eyebrow{font:12px var(--mono);color:var(--ph);letter-spacing:.06em;margin-bottom:18px}
+.eyebrow b{font-weight:500;color:var(--fg3)}
+.hero h1{font:600 clamp(40px,6.4vw,96px)/1.02 var(--sans);letter-spacing:-.045em;color:var(--ink);max-width:14ch}
+.hero h1 .dim{color:transparent;-webkit-text-stroke:1px rgba(var(--ink-rgb),.32)}
+.hero-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:40px;align-items:end;margin-top:34px}
+.lead{max-width:560px;font-size:17px;color:var(--fg2)}
+.lead code{color:var(--ph);font-size:.92em}
+.stats{display:flex;gap:0;border:1px solid var(--line2);border-radius:12px;overflow:hidden;background:rgba(10,12,10,.6)}
+.stats div{padding:14px 20px;border-left:1px solid var(--line)}
+.stats div:first-child{border-left:0}
+.stats b{display:block;font:600 26px/1.1 var(--mono);color:var(--ink);letter-spacing:-.03em}
+.stats span{font:11px var(--mono);color:var(--fg3)}
+/* 一键接入命令 */
+.mk{display:flex;align-items:center;gap:12px;max-width:820px;margin-top:30px;height:52px;padding:0 6px 0 16px;border:1px solid var(--line2);border-radius:12px;background:var(--bg2);font:13px var(--mono)}
+.mk .p{color:var(--ph)}
+.mk code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+.mk button{height:40px;padding:0 14px;border-radius:8px;background:var(--ph);color:var(--on-accent);font:500 12.5px var(--mono)}
+.mk button:hover{background:var(--accent-hover)}
+.note{margin-top:10px;font:12px var(--mono);color:var(--fg3)}
+
+/* ==================== 光谱条：分类占比即筛选器 ==================== */
+.spec{max-width:1500px;margin:56px auto 0;padding:0 var(--pad)}
+.spec-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;font:11.5px var(--mono);color:var(--fg3);letter-spacing:.04em}
+.spec-bar{display:flex;height:14px;border-radius:7px;overflow:hidden;gap:2px}
+.spec-bar>*{flex:var(--n) 1 0;min-width:6px;background:var(--sc);opacity:.75;transition:opacity .25s,transform .35s var(--spring)}
+.spec-bar>*:hover{opacity:1}
+.spec.f .spec-bar>*{opacity:.16}.spec.f .spec-bar>.on{opacity:1}
+.spec-lg{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+.spec-lg button{display:inline-flex;align-items:center;gap:8px;height:34px;padding:0 12px;border:1px solid var(--line);border-radius:999px;font:12px var(--mono);color:var(--fg2);transition:.2s}
+.spec-lg button i{width:8px;height:8px;border-radius:50%;background:var(--sc);box-shadow:0 0 8px var(--sc)}
+.spec-lg button em{font-style:normal;color:var(--fg4)}
+.spec-lg button:hover{border-color:var(--line3);color:var(--ink)}
+.spec-lg button.on{border-color:color-mix(in srgb,var(--sc) 60%,transparent);background:color-mix(in srgb,var(--sc) 9%,transparent);color:var(--ink)}
+.spec-lg button.on em{color:var(--sc)}
+
+/* ==================== 工具栏（吸顶） ==================== */
+.bar{position:sticky;top:calc(var(--hh) + env(safe-area-inset-top));z-index:40;max-width:1500px;margin:34px auto 0;padding:12px var(--pad);background:linear-gradient(var(--bg) 70%,transparent)}
+.bar-in{display:flex;align-items:center;gap:10px}
+.search{position:relative;flex:1;min-width:0;display:flex;align-items:center;gap:10px;height:48px;padding:0 14px;border:1px solid var(--line2);border-radius:11px;background:var(--bg2);transition:border-color .2s,box-shadow .2s}
+.search:focus-within{border-color:rgba(var(--accent-rgb),.5);box-shadow:0 0 0 4px rgba(var(--accent-rgb),.07)}
+.search .p{font:14px var(--mono);color:var(--ph)}
+.search input{flex:1;min-width:0;height:100%;outline:0;font:14px var(--mono);color:var(--ink)}
+.search input::placeholder{color:var(--fg3)}
+.search kbd{font-size:11px;color:var(--fg3);border:1px solid var(--line2);border-radius:4px;padding:1px 6px}
+.search .clr{display:none;width:28px;height:28px;border-radius:6px;color:var(--fg3)}
+.search.has .clr{display:grid;place-items:center}.search.has kbd{display:none}
+.sel{position:relative;height:48px}
+.sel select{appearance:none;-webkit-appearance:none;height:100%;padding:0 34px 0 14px;border:1px solid var(--line2);border-radius:11px;background:var(--bg2);font:12.5px var(--mono);color:var(--fg2);cursor:pointer;max-width:200px}
+.sel::after{content:"▾";position:absolute;right:13px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--fg3);pointer-events:none}
+.sel select:hover{border-color:var(--line3)}
+.sel option{background:var(--bg2)}
+.tg{display:flex;height:48px;padding:4px;border:1px solid var(--line2);border-radius:11px;background:var(--bg2)}
+.tg button{display:grid;place-items:center;width:40px;border-radius:7px;color:var(--fg3);font:13px var(--mono)}
+.tg button.on{background:var(--bg4);color:var(--ink)}
+.meta{display:flex;justify-content:space-between;gap:12px;margin-top:10px;font:11.5px var(--mono);color:var(--fg3)}
+.meta b{color:var(--ph);font-weight:500}
+.meta .rs{color:var(--fg2)}
+.meta .rs:hover{color:var(--ph)}
+
+/* ==================== 技能元素格 ==================== */
+.grid{max-width:1500px;margin:8px auto 0;padding:0 var(--pad);display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.el{position:relative;display:flex;flex-direction:column;min-height:236px;padding:16px 18px 16px;border:1px solid var(--line);border-radius:14px;background:var(--bg2);text-align:left;overflow:hidden;isolation:isolate;
+  transition:border-color .3s,transform .45s var(--spring),background .3s;animation:in .5s var(--ease) both;animation-delay:calc(var(--i,0) * 18ms)}
+@keyframes in{from{opacity:0;transform:translateY(10px)}}
+.el::before{content:"";position:absolute;inset:0;z-index:-1;opacity:0;transition:opacity .35s;
+  background:radial-gradient(320px circle at var(--mx,50%) var(--my,0%),color-mix(in srgb,var(--sc) 16%,transparent),transparent 65%)}
+.el::after{content:"";position:absolute;left:0;top:18px;bottom:18px;width:2px;border-radius:2px;background:var(--sc);opacity:.55;transition:opacity .3s,top .35s var(--ease),bottom .35s var(--ease)}
+.el:hover{border-color:color-mix(in srgb,var(--sc) 38%,transparent);background:var(--bg3)}
+.el:hover::before{opacity:1}.el:hover::after{opacity:1;top:0;bottom:0}
+.el-top{display:flex;justify-content:space-between;align-items:center;font:11px var(--mono);color:var(--fg3)}
+.el-top .ct{display:inline-flex;align-items:center;gap:6px;color:var(--fg3)}
+.el-top .ct i{width:6px;height:6px;border-radius:50%;background:var(--sc)}
+.el-sym{margin:16px 0 4px;font:700 46px/1 var(--mono);letter-spacing:-.06em;color:var(--ink);transition:color .3s,text-shadow .3s}
+.el:hover .el-sym{color:var(--sc);text-shadow:0 0 28px color-mix(in srgb,var(--sc) 45%,transparent)}
+.el-n{font:500 14.5px var(--mono);color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.el-d{margin-top:6px;font-size:13px;line-height:1.55;color:var(--fg3);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.el-ft{display:flex;align-items:center;gap:8px;margin-top:auto;padding-top:14px;font:11.5px var(--mono);color:var(--fg3)}
+.av{flex:none;display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--bg4);border:1px solid var(--line2);overflow:hidden;font:700 9px var(--mono);color:var(--fg2)}
+.av img{width:100%;height:100%;object-fit:cover}
+.el-ft .wrap-au{display:flex;align-items:center;gap:8px;min-width:0}
+.el-ft .au{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.el-ft .st{margin-left:auto;flex:none}
+.ok{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:5px;background:rgba(var(--accent-rgb),.1);color:var(--ph);font:500 10.5px var(--mono)}
+/* 列表视图：更密的一行一项 */
+.grid.list{grid-template-columns:1fr;gap:0;border-top:1px solid var(--line)}
+.grid.list .el{display:grid;grid-template-columns:64px minmax(0,220px) minmax(0,1fr) 180px 80px;align-items:center;gap:18px;min-height:0;padding:14px 16px;border:0;border-bottom:1px solid var(--line);border-radius:0;background:none}
+.grid.list .el::after{top:14px;bottom:14px}
+.grid.list .el-top{display:none}
+.grid.list .el-sym{margin:0;font-size:24px}
+.grid.list .el-d{margin:0;-webkit-line-clamp:1}
+.grid.list .el-ft{display:contents}
+.grid.list .el-ft .st{text-align:right}
+.grid.list .el .wrap-au{display:flex;align-items:center;gap:8px;min-width:0}
+.sent{height:1px}
+.empty{display:none;max-width:1500px;margin:20px auto;padding:80px var(--pad);text-align:center;font:13px var(--mono);color:var(--fg3)}
+.empty b{display:block;margin-bottom:10px;font:700 64px/1 var(--mono);color:var(--fg4);letter-spacing:-.06em}
+.empty.on{display:block}
+
+/* ==================== 详情抽屉 ==================== */
+.scrim{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.45);opacity:0;visibility:hidden;transition:.3s}
+.scrim.on{opacity:1;visibility:visible}
+.dw{position:fixed;z-index:81;top:0;right:0;bottom:0;width:min(560px,100vw);display:flex;flex-direction:column;background:var(--bg2);border-left:1px solid var(--line2);transform:translateX(102%);transition:transform .45s var(--ease);
+  padding:calc(18px + env(safe-area-inset-top)) 0 env(safe-area-inset-bottom)}
+.dw.on{transform:none}
+.dw-h{display:flex;align-items:center;gap:8px;padding:0 22px 14px;border-bottom:1px solid var(--line);font:11.5px var(--mono);color:var(--fg3)}
+.dw-h .sp{flex:1}
+.dw-x{display:grid;place-items:center;width:40px;height:40px;border:1px solid var(--line2);border-radius:9px;color:var(--fg2)}
+.dw-x:hover{color:var(--ink);border-color:var(--line3)}
+.dw-b{flex:1;overflow-y:auto;overscroll-behavior:contain;padding:26px 22px 30px}
+.dw-cell{position:relative;display:grid;place-items:center;width:124px;height:124px;border:1px solid color-mix(in srgb,var(--sc) 55%,transparent);border-radius:16px;
+  background:radial-gradient(circle at 50% 30%,color-mix(in srgb,var(--sc) 18%,transparent),transparent 70%),var(--bg);box-shadow:0 0 40px color-mix(in srgb,var(--sc) 18%,transparent)}
+.dw-cell b{font:700 54px/1 var(--mono);letter-spacing:-.06em;color:var(--sc)}
+.dw-cell span{position:absolute;left:10px;top:8px;font:11px var(--mono);color:var(--fg3)}
+.dw-cell em{position:absolute;right:10px;bottom:8px;font:11px var(--mono);font-style:normal;color:var(--fg3)}
+.dw h2{margin-top:22px;font:600 26px/1.2 var(--mono);letter-spacing:-.03em;color:var(--ink);overflow-wrap:anywhere}
+.dw .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.dw .tag{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--line2);border-radius:999px;font:11.5px var(--mono);color:var(--fg2)}
+.dw .tag i{width:6px;height:6px;border-radius:50%;background:var(--sc)}
+.dw p.ds{margin-top:18px;font-size:15px;line-height:1.75;color:var(--fg2)}
+.dw h3{margin:28px 0 10px;font:500 11.5px var(--mono);color:var(--fg3);letter-spacing:.08em}
+.ins{border:1px solid var(--line2);border-radius:12px;background:var(--bg);overflow:hidden}
+.ins-t{display:flex;border-bottom:1px solid var(--line)}
+.ins-t button{height:40px;padding:0 14px;font:12px var(--mono);color:var(--fg3);border-bottom:1.5px solid transparent;margin-bottom:-1px}
+.ins-t button.on{color:var(--ink);border-color:var(--ph)}
+.ins-c{display:flex;align-items:center;gap:10px;padding:14px 8px 14px 14px;font:13px var(--mono)}
+.ins-c .p{color:var(--ph)}
+.ins-c code{flex:1;min-width:0;color:var(--ink);overflow-wrap:anywhere}
+.ins-c button{flex:none;height:38px;padding:0 13px;border-radius:8px;background:var(--ph);color:var(--on-accent);font:500 12px var(--mono)}
+.ins-n{padding:0 14px 12px;font:11.5px/1.6 var(--mono);color:var(--fg3)}
+.kv{display:grid;grid-template-columns:110px minmax(0,1fr);border-top:1px solid var(--line)}
+.kv>*{padding:11px 0;border-bottom:1px solid var(--line);font:12.5px var(--mono)}
+.kv dt{color:var(--fg3)}
+.kv dd{color:var(--ink);overflow-wrap:anywhere;display:flex;align-items:center;gap:8px}
+.links{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:44px;padding:0 16px;border-radius:10px;font:500 13px var(--mono);white-space:nowrap;transition:.2s}
+.btn-p{background:var(--ph);color:var(--on-accent)}.btn-p:hover{background:var(--accent-hover)}
+.btn-g{border:1px solid var(--line2);color:var(--ink)}.btn-g:hover{border-color:var(--line3)}
+.warn{margin-top:22px;padding:12px 14px;border:1px dashed var(--line2);border-radius:10px;font:11.5px/1.7 var(--mono);color:var(--fg3)}
+.warn b{color:var(--fg2);font-weight:500}
+
+/* ==================== 页脚 / Toast ==================== */
+footer{max-width:1500px;margin:110px auto 0;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px;padding:26px var(--pad) calc(34px + env(safe-area-inset-bottom));border-top:1px solid var(--line);font:12px var(--mono);color:var(--fg3)}
+footer nav{display:flex;flex-wrap:wrap;gap:6px 18px}
+footer nav a:hover{color:var(--ph)}
+.toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));z-index:95;transform:translate(-50%,14px);padding:11px 16px;border-radius:10px;background:var(--ink);color:var(--on-ink);font:13px var(--mono);opacity:0;pointer-events:none;transition:.35s var(--spring);max-width:calc(100vw - 32px)}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.top-btn{position:fixed;right:max(18px,env(safe-area-inset-right));bottom:calc(18px + env(safe-area-inset-bottom));z-index:45;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line2);border-radius:50%;background:rgba(var(--overlay-rgb),.8);color:var(--fg2);opacity:0;visibility:hidden;transition:.3s}
+.top-btn.on{opacity:1;visibility:visible}
+
+/* ==================== 响应式 ==================== */
+@media (max-width:1080px){
+  .hero-row{grid-template-columns:minmax(0,1fr);gap:26px}
+  .grid.list .el{grid-template-columns:52px minmax(0,1fr) 120px;row-gap:4px}
+  .grid.list .el-d{grid-column:2/-1;grid-row:2}
+  .grid.list .el .st{display:none}
+}
+@media (max-width:760px),(max-height:500px) and (orientation:landscape){
+  :root{--hh:58px}
+  .top{gap:8px}
+  .top .hide-m{display:none}
+  .brand i,.brand .t2{display:none}
+  .hero{padding-top:calc(var(--hh) + 44px)}
+  .hero h1{font-size:clamp(36px,11vw,56px)}
+  .lead{font-size:15px}
+  .stats{width:100%}.stats div{flex:1;padding:12px}.stats b{font-size:20px}
+  .mk{height:auto;flex-wrap:wrap;padding:12px 12px 12px 14px;row-gap:10px}
+  .mk code{flex-basis:calc(100% - 20px);white-space:normal;overflow-wrap:anywhere}
+  .mk button{width:100%;height:44px}
+  .spec{margin-top:40px}
+  .spec-lg{flex-wrap:nowrap;overflow-x:auto;margin:14px calc(-1 * var(--pad)) 0;padding:0 var(--pad) 4px;scrollbar-width:none}
+  .spec-lg::-webkit-scrollbar{display:none}
+  .spec-lg button{flex:none;height:40px}
+  .bar{padding-top:10px}
+  .bar-in{flex-wrap:wrap}
+  .search{flex-basis:100%}
+  .search kbd{display:none}
+  .sel{flex:1;min-width:0;height:44px}.sel select{width:100%;max-width:none}
+  .tg{height:44px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:10px}
+  .el{min-height:0}
+  .el-sym{font-size:38px;margin-top:12px}
+  .grid.list .el{grid-template-columns:44px minmax(0,1fr);gap:4px 14px;padding:14px 4px 14px 14px}
+  .grid.list .el-sym{font-size:20px;grid-row:span 2}
+  .grid.list .el-d{grid-column:2}
+  .grid.list .el .wrap-au{display:none}
+  /* 抽屉在手机上变成底部弹层 */
+  .dw{top:auto;left:0;width:100%;height:min(88vh,100%);border-left:0;border-top:1px solid var(--line2);border-radius:18px 18px 0 0;transform:translateY(102%);padding-top:10px}
+  .dw::before{content:"";align-self:center;width:40px;height:4px;margin-bottom:12px;border-radius:2px;background:var(--line3)}
+  .dw-cell{width:96px;height:96px}.dw-cell b{font-size:42px}
+  .kv{grid-template-columns:92px minmax(0,1fr)}
+  footer{margin-top:80px}
+}
+/* 触屏：可点元素 ≥44px，关闭鼠标专属特效 */
+@media (pointer:coarse){
+  .pill{height:44px;min-width:44px}
+  .spec-lg button{min-height:44px}
+  .ins-t button{height:44px}
+  .ins-c button{height:44px}
+  .tg{padding:0}.tg button{width:44px}
+  footer nav a{display:inline-flex;align-items:center;min-height:44px}
+  .el::before{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  html{scroll-behavior:auto}
+}
+</style>
+</head>
+<body>
+
+<!-- ==================== 顶栏 ==================== -->
+<header class="top" id="top">
+  <a class="pill brand" href="../index.html"><img src="../assets/atomgit-mark.svg" alt="" width="22" height="22"><span class="t1">AtomCode</span><i>/</i><em>SkillHub</em></a>
+  <span class="sp"></span>
+  <button class="pill hide-m" id="kBtn" aria-label="搜索"><span data-i="t.search">搜索</span><kbd>/</kbd></button>
+  <a class="pill hide-m" href="../docs/zh/plugins.html" id="docLink" data-i="t.docs">插件文档</a>
+  <a class="pill ext hide-m" href="https://atomgit.com/atomgit_atomcode/atomcode-plugins-official" target="_blank" rel="noopener" data-i="t.repo">官方目录</a>
+  <button class="pill" id="themeBtn" type="button" aria-label="切换主题">☀</button>
+  <button class="pill" id="langBtn" aria-label="Language">EN</button>
+</header>
+
+<main>
+<!-- ==================== 首屏 ==================== -->
+<section class="hero">
+  <div class="eyebrow">§ SKILLHUB <b>·</b> <span data-i="h.ey">技能元素库</span></div>
+  <h1 data-i="h.t">给智能体<br>装上<span class="dim">新元素</span></h1>
+  <div class="hero-row">
+    <div>
+      <p class="lead" data-i="h.lead">发现、搜索并安装 AtomCode 插件与 Skills。每个技能都是一个可组合的元素：一条 <code>/plugin install</code> 装进来，用斜杠命令随时调用。</p>
+      <div class="mk"><span class="p">›</span><code id="mkCmd">/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git</code><button id="mkCp" data-i="cp">复制</button></div>
+      <p class="note" data-i="h.note">新版 AtomCode 已内置官方目录，可跳过这一步直接安装。</p>
+    </div>
+    <div class="stats" id="stats"></div>
+  </div>
+</section>
+
+<!-- ==================== 光谱条 ==================== -->
+<section class="spec" id="spec">
+  <div class="spec-h"><span data-i="s.h">SPECTRUM · 按系列筛选</span><span id="specNow"></span></div>
+  <div class="spec-bar" id="specBar"></div>
+  <div class="spec-lg" id="specLg"></div>
+</section>
+
+<!-- ==================== 工具栏 ==================== -->
+<div class="bar" id="bar">
+  <div class="bar-in">
+    <label class="search" id="search"><span class="p">/</span><input id="q" type="search" autocomplete="off" spellcheck="false" placeholder="搜索技能名称、描述、作者…"><kbd>⌘K</kbd><button class="clr" id="qClr" type="button" aria-label="清空">✕</button></label>
+    <div class="sel"><select id="au" aria-label="作者"></select></div>
+    <div class="sel"><select id="sort" aria-label="排序"><option value="hot" data-i="o.hot">按热度</option><option value="az" data-i="o.az">按名称</option><option value="new" data-i="o.new">最新收录</option></select></div>
+    <div class="tg" role="group" aria-label="视图"><button id="vGrid" class="on" aria-label="网格">▦</button><button id="vList" aria-label="列表">☰</button></div>
+  </div>
+  <div class="meta"><span id="count"></span><button class="rs" id="reset" hidden data-i="m.rs">清除筛选 ×</button></div>
+</div>
+
+<div class="grid" id="grid"></div>
+<div class="sent" id="sent"></div>
+<div class="empty" id="empty"><b>∅</b><span data-i="m.empty">没有匹配的技能，换个关键词试试</span></div>
+</main>
+
+<footer>
+  <span>© 2026 AtomCode · SkillHub</span>
+  <nav>
+    <a href="../index.html" data-i="f.home">官网</a>
+    <a href="../docs/zh/plugins.html" id="docLink2" data-i="f.docs">插件文档</a>
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode-plugins-official" target="_blank" rel="noopener" data-i="f.repo">官方目录 ↗</a>
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode-plugins-official/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener" data-i="f.pub">发布技能 ↗</a>
+    <a href="https://atomgit.com/atomgit_atomcode/atomcode-plugins-official/issues" target="_blank" rel="noopener">Issue ↗</a>
+  </nav>
+</footer>
+
+<!-- ==================== 详情抽屉 ==================== -->
+<div class="scrim" id="scrim"></div>
+<aside class="dw" id="dw" role="dialog" aria-modal="true" aria-labelledby="dwName">
+  <div class="dw-h"><span id="dwCrumb">SKILLHUB / —</span><span class="sp"></span><button class="dw-x" id="dwX" aria-label="关闭">✕</button></div>
+  <div class="dw-b" id="dwB"></div>
+</aside>
+<button class="top-btn" id="topBtn" aria-label="回到顶部">↑</button>
+<div class="toast" id="toast" role="status"></div>
+
+<script src="skills-data.js"></script>
+<script>
+(()=>{
+'use strict';
+/* ==================== 基础工具 ==================== */
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const D=window.SKILLS_DATA||{skills:[],cats:[],authors:[],total:0};
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const fine=matchMedia('(hover:hover) and (pointer:fine)').matches;
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=n=>n>=1e6?(n/1e6).toFixed(1).replace(/\.0$/,'')+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1).replace(/\.0$/,'')+'k':String(n||0);
+const num=i=>String(i+1).padStart(3,'0');
+let toastT;
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('on'),1900)}
+function copy(text){
+  const ok=()=>toast(L('已复制 ✓','Copied ✓'));
+  if(navigator.clipboard&&isSecureContext){navigator.clipboard.writeText(text).then(ok,()=>fallback())}else fallback();
+  function fallback(){const a=document.createElement('textarea');a.value=text;a.style.cssText='position:fixed;opacity:0';document.body.appendChild(a);a.select();try{document.execCommand('copy');ok()}catch(e){toast(text)}a.remove()}
+}
+
+/* ==================== 国际化：中文取自 DOM，英文查表 ==================== */
+let lang=(()=>{try{return localStorage.getItem('ac-lang')||localStorage.getItem('atomcode_lang')||'zh'}catch(e){return 'zh'}})();
+const L=(zh,en)=>lang==='zh'?zh:en;
+const T={
+  't.search':'Search','t.docs':'Plugin docs','t.repo':'Catalog',
+  'h.ey':'The skill element library','h.t':'Give your agent<br><span class="dim">new elements</span>',
+  'h.lead':'Discover, search and install AtomCode plugins &amp; skills. Each skill is a composable element — one <code>/plugin install</code> and it is a slash command away.',
+  'h.note':'Recent AtomCode builds ship with the official catalog — you can skip this and install directly.',
+  cp:'Copy','s.h':'SPECTRUM · FILTER BY SERIES','o.hot':'Most popular','o.az':'Name A–Z','o.new':'Newest',
+  'm.rs':'Clear filters ×','m.empty':'No skills match — try another keyword',
+  'f.home':'Home','f.docs':'Plugin docs','f.repo':'Catalog ↗','f.pub':'Publish a skill ↗'
+};
+const ZH={};$$('[data-i]').forEach(e=>ZH[e.dataset.i]=e.innerHTML);
+function applyLang(){
+  document.documentElement.lang=lang==='zh'?'zh-CN':'en';
+  $$('[data-i]').forEach(e=>{const k=e.dataset.i,v=lang==='zh'?ZH[k]:T[k];if(v!=null)e.innerHTML=v});
+  $('#langBtn').textContent=lang==='zh'?'EN':'中';
+  $('#q').placeholder=L('搜索技能名称、描述、作者…','Search name, description, author…');
+  const dl=`../docs/${lang==='zh'?'zh':'en'}/plugins.html`;$('#docLink').href=dl;$('#docLink2').href=dl;
+  document.title=L('SkillHub · AtomCode 技能元素库','SkillHub · AtomCode skill library');
+  renderStats();renderSpec();renderAuthors();render(true);
+  if(cur)openSkill(cur,true);
+}
+$('#langBtn').addEventListener('click',()=>{lang=lang==='zh'?'en':'zh';try{localStorage.setItem('ac-lang',lang);localStorage.setItem('atomcode_lang',lang)}catch(e){}applyLang();syncTheme()});
+
+/* ==================== 数据索引 ==================== */
+const S=D.skills.map((s,i)=>Object.assign(s,{i,_q:(s.n+' '+s.d+' '+s.dz+' '+s.a).toLowerCase()}));
+const CAT=Object.fromEntries(D.cats.map(c=>[c.k,c]));
+const AU=Object.fromEntries(D.authors.map(a=>[a.u,a]));
+const catName=k=>CAT[k]?(lang==='zh'?CAT[k].zh:CAT[k].en):k;
+const desc=s=>lang==='zh'?(s.dz||s.d):(s.d||s.dz);
+const auName=u=>(AU[u]&&AU[u].n)||u;
+
+/* ==================== 状态（同步到 URL hash，可分享） ==================== */
+const st={c:'',a:'',q:'',sort:'hot',view:'grid'};
+let cur=null;
+(function readHash(){
+  const h=new URLSearchParams(location.hash.slice(1));
+  st.c=h.get('c')||'';st.a=h.get('a')||'';st.q=h.get('q')||'';st.sort=h.get('sort')||'hot';
+  try{st.view=localStorage.getItem('skillhub_view')||'grid'}catch(e){}
+  cur=h.get('s')||null;
+})();
+function writeHash(){
+  const h=new URLSearchParams();
+  if(st.c)h.set('c',st.c);if(st.a)h.set('a',st.a);if(st.q)h.set('q',st.q);if(st.sort!=='hot')h.set('sort',st.sort);if(cur)h.set('s',cur);
+  const s=h.toString();history.replaceState(null,'',s?'#'+s:location.pathname+location.search);
+}
+
+/* ==================== 首屏统计 ==================== */
+function renderStats(){
+  const ok=S.filter(s=>s.ok).length;
+  $('#stats').innerHTML=[[D.total,L('个技能','skills')],[D.cats.length,L('个系列','series')],[D.authors.length,L('位作者','authors')],[ok,L('官方验证','verified')]]
+    .map(([n,l])=>`<div><b data-n="${n}">${n}</b><span>${l}</span></div>`).join('');
+}
+
+/* ==================== 光谱条 + 图例 ==================== */
+function renderSpec(){
+  /* 触屏上光谱条太细不便点，只作展示，筛选交给下方图例 */
+  const tag=fine?'button':'span';
+  $('#specBar').innerHTML=D.cats.map(c=>`<${tag} class="c-${c.k}${st.c===c.k?' on':''}" style="--n:${c.n}" data-c="${c.k}" title="${esc(catName(c.k))} · ${c.n}"${fine?` aria-label="${esc(catName(c.k))}"`:' aria-hidden="true"'}></${tag}>`).join('');
+  $('#specLg').innerHTML=`<button class="${st.c?'':'on'}" data-c="" style="--sc:var(--ink)"><i></i>${L('全部','All')}<em>${D.total}</em></button>`+
+    D.cats.map(c=>`<button class="c-${c.k}${st.c===c.k?' on':''}" data-c="${c.k}"><i></i>${esc(catName(c.k))}<em>${c.n}</em></button>`).join('');
+  $('#spec').classList.toggle('f',!!st.c);
+  $('#specNow').textContent=st.c?catName(st.c).toUpperCase():L('全部系列','ALL SERIES');
+}
+$('#spec').addEventListener('click',e=>{const b=e.target.closest('button[data-c]');if(!b)return;st.c=st.c===b.dataset.c?'':b.dataset.c;renderSpec();render(true)});
+
+/* ==================== 作者下拉 ==================== */
+function renderAuthors(){
+  const sel=$('#au');
+  sel.innerHTML=`<option value="">${L('全部作者','All authors')}</option>`+D.authors.map(a=>`<option value="${esc(a.u)}">${esc(a.n)} · ${a.k}</option>`).join('');
+  sel.value=st.a;
+}
+$('#au').addEventListener('change',e=>{st.a=e.target.value;render(true)});
+$('#sort').addEventListener('change',e=>{st.sort=e.target.value;render(true)});
+
+/* ==================== 搜索（防抖 + 快捷键） ==================== */
+const q=$('#q');let qT;
+q.value=st.q;$('#search').classList.toggle('has',!!st.q);
+q.addEventListener('input',()=>{$('#search').classList.toggle('has',!!q.value);clearTimeout(qT);qT=setTimeout(()=>{st.q=q.value.trim();render(true)},140)});
+$('#qClr').addEventListener('click',()=>{q.value='';st.q='';$('#search').classList.remove('has');render(true);q.focus()});
+const focusSearch=()=>{$('#bar').scrollIntoView({behavior:reduce?'auto':'smooth',block:'start'});setTimeout(()=>q.focus({preventScroll:true}),reduce?0:300)};
+$('#kBtn').addEventListener('click',focusSearch);
+addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&cur){closeSkill();return}
+  const typing=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  if((e.key==='/'&&!typing)||((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k')){e.preventDefault();focusSearch()}
+});
+
+/* ==================== 视图切换 ==================== */
+function setView(v){st.view=v;$('#grid').classList.toggle('list',v==='list');$('#vGrid').classList.toggle('on',v==='grid');$('#vList').classList.toggle('on',v==='list');try{localStorage.setItem('skillhub_view',v)}catch(e){}}
+$('#vGrid').addEventListener('click',()=>setView('grid'));$('#vList').addEventListener('click',()=>setView('list'));
+
+/* ==================== 过滤 + 排序 ==================== */
+function filtered(){
+  const words=st.q.toLowerCase().split(/\s+/).filter(Boolean);
+  let r=S.filter(s=>(!st.c||s.c===st.c)&&(!st.a||s.a===st.a)&&words.every(w=>s._q.includes(w)));
+  if(st.sort==='hot')r.sort((a,b)=>b.ok-a.ok||b.st-a.st||a.i-b.i);
+  else if(st.sort==='az')r.sort((a,b)=>a.n.localeCompare(b.n));
+  else r.sort((a,b)=>b.i-a.i);
+  return r;
+}
+
+/* ==================== 渲染：分批追加，滚到底自动续 ==================== */
+const PAGE=36;let list=[],shown=0;
+const avatar=(s)=>{const a=s.av||(AU[s.a]&&AU[s.a].av);return a?`<span class="av"><img src="${esc(a)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.textContent='${esc(auName(s.a)[0]||'?').toUpperCase()}'"></span>`:`<span class="av">${esc((auName(s.a)[0]||'?').toUpperCase())}</span>`};
+function card(s,k){
+  return `<button class="el c-${s.c}" data-n="${esc(s.n)}" style="--i:${k%PAGE}">
+    <span class="el-top"><span>#${num(s.i)}</span><span class="ct"><i></i>${esc(catName(s.c))}</span></span>
+    <span class="el-sym">${esc(s.sy)}</span>
+    <span class="el-n">${esc(s.n)}</span>
+    <span class="el-d">${esc(desc(s))}</span>
+    <span class="el-ft"><span class="wrap-au">${avatar(s)}<span class="au">${esc(auName(s.a))}</span></span>${s.ok?`<span class="ok">✓ ${L('官方','official')}</span>`:''}<span class="st">${s.st?'★ '+fmt(s.st):''}</span></span>
+  </button>`;
+}
+function more(){
+  if(shown>=list.length)return;
+  const html=list.slice(shown,shown+PAGE).map((s,k)=>card(s,shown+k)).join('');
+  $('#grid').insertAdjacentHTML('beforeend',html);shown=Math.min(list.length,shown+PAGE);
+}
+function render(reset){
+  list=filtered();
+  if(reset){$('#grid').innerHTML='';shown=0}
+  more();
+  const n=list.length,f=st.c||st.a||st.q;
+  $('#count').innerHTML=f?L(`找到 <b>${n}</b> / ${D.total} 个技能`,`<b>${n}</b> of ${D.total} skills`):L(`共 <b>${n}</b> 个技能`,`<b>${n}</b> skills`);
+  $('#reset').hidden=!f;
+  $('#empty').classList.toggle('on',n===0);
+  writeHash();
+}
+$('#reset').addEventListener('click',()=>{st.c=st.a=st.q='';q.value='';$('#search').classList.remove('has');$('#au').value='';renderSpec();render(true)});
+new IntersectionObserver(es=>{if(es[0].isIntersecting)more()},{rootMargin:'800px 0px'}).observe($('#sent'));
+
+/* ==================== 卡片：光标聚光（仅精确指针） ==================== */
+if(fine&&!reduce){
+  let raf=0,ev=null;
+  $('#grid').addEventListener('pointermove',e=>{ev=e;if(raf)return;raf=requestAnimationFrame(()=>{raf=0;const el=ev.target.closest('.el');if(!el)return;const r=el.getBoundingClientRect();el.style.setProperty('--mx',(ev.clientX-r.left)+'px');el.style.setProperty('--my',(ev.clientY-r.top)+'px')})});
+}
+$('#grid').addEventListener('click',e=>{const el=e.target.closest('.el');if(el)openSkill(el.dataset.n)});
+
+/* ==================== 详情抽屉 ==================== */
+let insMode='tui',lastFocus=null;
+const cmds=s=>({tui:`/plugin install ${s.n}@atomcode`,cli:`atomcode plugin install ${s.n}`});
+function openSkill(name,silent){
+  const s=S.find(x=>x.n===name);if(!s){cur=null;writeHash();return}
+  cur=name;writeHash();
+  const dw=$('#dw');dw.className='dw on c-'+s.c;
+  $('#dwCrumb').textContent=`SKILLHUB / ${catName(s.c).toUpperCase()} / #${num(s.i)}`;
+  const c=cmds(s);
+  $('#dwB').innerHTML=`
+    <div class="dw-cell"><span>#${num(s.i)}</span><b>${esc(s.sy)}</b><em>${esc(s.v||'')}</em></div>
+    <h2 id="dwName">${esc(s.n)}</h2>
+    <div class="tags"><span class="tag"><i></i>${esc(catName(s.c))}</span>${s.ok?`<span class="tag" style="color:var(--ph);border-color:rgba(var(--accent-rgb),.4)">✓ ${L('官方验证','Verified')}</span>`:`<span class="tag">🌐 ${L('社区','Community')}</span>`}${s.st?`<span class="tag">★ ${fmt(s.st)}</span>`:''}</div>
+    <p class="ds">${esc(desc(s))}</p>
+    <h3>${L('安装','INSTALL')}</h3>
+    <div class="ins">
+      <div class="ins-t"><button data-m="tui" class="${insMode==='tui'?'on':''}">${L('TUI 内','In TUI')}</button><button data-m="cli" class="${insMode==='cli'?'on':''}">${L('命令行','Shell')}</button></div>
+      <div class="ins-c"><span class="p">${insMode==='tui'?'›':'$'}</span><code id="insCmd">${esc(c[insMode])}</code><button id="insCp">${L('复制','Copy')}</button></div>
+      <p class="ins-n">${insMode==='tui'?L('在 AtomCode 会话中输入；装完后以 /'+esc(s.n)+' 或命名空间形式调用。','Type inside an AtomCode session; then call it as /'+esc(s.n)+' or by its namespace.'):L('在终端执行，无需进入会话。','Run in your shell — no session needed.')}</p>
+    </div>
+    <h3>${L('元信息','META')}</h3>
+    <dl class="kv">
+      <dt>${L('作者','Author')}</dt><dd>${avatar(s)}${esc(auName(s.a))}</dd>
+      <dt>${L('系列','Series')}</dt><dd>${esc(catName(s.c))}</dd>
+      ${s.v?`<dt>${L('版本','Version')}</dt><dd>${esc(s.v)}</dd>`:''}
+      <dt>${L('来源','Source')}</dt><dd>${esc((s.src||'').replace(/^https?:\/\//,''))}</dd>
+    </dl>
+    <div class="links">
+      ${s.h?`<a class="btn btn-p" href="${esc(s.h)}" target="_blank" rel="noopener">${L('在 AtomGit 查看','View on AtomGit')} ↗</a>`:''}
+      ${s.gh?`<a class="btn btn-g" href="${esc(s.gh)}" target="_blank" rel="noopener">GitHub ↗</a>`:''}
+      <button class="btn btn-g" id="shareBtn">${L('复制链接','Copy link')}</button>
+    </div>
+    ${s.ok?'':`<p class="warn"><b>${L('社区技能','Community skill')}</b> · ${L('收录时由维护者审查过固定版本；作者后续推送的代码不在审查范围内，安装前请先阅读源码。','A maintainer reviewed the pinned revision when it was listed; later pushes by the author are not audited. Read the source before installing.')}</p>`}`;
+  $$('.ins-t button',dw).forEach(b=>b.addEventListener('click',()=>{insMode=b.dataset.m;openSkill(name,true)}));
+  $('#insCp').addEventListener('click',()=>copy(c[insMode]));
+  $('#shareBtn').addEventListener('click',()=>copy(location.href));
+  if(!silent){lastFocus=document.activeElement;$('#dwB').scrollTop=0}
+  $('#scrim').classList.add('on');document.body.classList.add('lock');
+  if(!silent)setTimeout(()=>$('#dwX').focus({preventScroll:true}),60);
+}
+function closeSkill(){
+  cur=null;writeHash();$('#dw').classList.remove('on');$('#scrim').classList.remove('on');document.body.classList.remove('lock');
+  if(lastFocus&&lastFocus.focus)lastFocus.focus({preventScroll:true});
+}
+$('#dwX').addEventListener('click',closeSkill);$('#scrim').addEventListener('click',closeSkill);
+/* 手机底部弹层：下滑关闭 */
+(()=>{let y0=null;const dw=$('#dw');
+  dw.addEventListener('touchstart',e=>{y0=$('#dwB').scrollTop<=0?e.touches[0].clientY:null},{passive:true});
+  dw.addEventListener('touchend',e=>{if(y0!=null&&e.changedTouches[0].clientY-y0>90&&innerWidth<=760)closeSkill();y0=null},{passive:true});
+})();
+
+/* ==================== 顶栏 / 回到顶部 ==================== */
+const onScroll=()=>{const y=scrollY;$('#top').classList.toggle('solid',y>40);$('#topBtn').classList.toggle('on',y>innerHeight*1.5)};
+addEventListener('scroll',onScroll,{passive:true});
+$('#topBtn').addEventListener('click',()=>scrollTo({top:0,behavior:reduce?'auto':'smooth'}));
+$('#mkCp').addEventListener('click',()=>copy($('#mkCmd').textContent));
+
+/* ==================== 主题切换（与官网共用 atomcode_theme） ==================== */
+const themeBtn=$('#themeBtn');
+function syncTheme(){
+  const light=document.documentElement.classList.contains('light');
+  themeBtn.textContent=light?'☾':'☀';
+  const label=light?L('切换到深色','Switch to dark'):L('切换到浅色','Switch to light');
+  themeBtn.setAttribute('aria-label',label);themeBtn.title=label;
+  $('meta[name="theme-color"]').content=light?'#f4f6ed':'#050605';
+}
+themeBtn.addEventListener('click',()=>{
+  const light=!document.documentElement.classList.contains('light');
+  document.documentElement.classList.toggle('light',light);
+  try{localStorage.setItem('atomcode_theme',light?'light':'dark')}catch(e){}
+  syncTheme();
+});
+
+/* ==================== 启动 ==================== */
+$('#sort').value=st.sort;setView(st.view);
+applyLang();syncTheme();onScroll();
+})();
+</script>
+</body>
+</html>
