@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 use crate::events::{ToolExec, ToolsExecute};
 use crate::seams::ToolsSvc;
 
+pub(crate) const MALFORMED_TOOL_NAME: &str = "Tool call not executed: the tool name contains an argument markup tag. Retry using an exact name from the available tool definitions and put parameters in the arguments field. If this tool is optional, continue without it.";
+
 /// Run one call through the `tools/execute` waterfall.
 ///
 /// A denial is a *result*, not an error: the model has to see why its call did
@@ -152,6 +154,9 @@ pub async fn execute_one(
 
 /// Suggestions describe only the live catalog. They never repair or dispatch a call.
 fn unknown_tool_message(name: &str, available: &[String]) -> String {
+    if name.contains("</argValue>") || name.contains("</argKey>") {
+        return MALFORMED_TOOL_NAME.into();
+    }
     let leaf = |name: &str| {
         name.rsplit("__")
             .next()

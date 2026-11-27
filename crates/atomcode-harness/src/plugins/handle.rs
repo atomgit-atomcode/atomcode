@@ -1342,7 +1342,7 @@ fn send_snapshot(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>) {
             messages.push(atomcode_kernel::message::Message::system(system));
         }
     }
-    messages.extend(crate::session::derive_messages_with_meta(&log.events()));
+    messages.extend(log.read_events(crate::session::derive_messages_with_meta));
     let _ = events.send(AgentEvent::Snapshot {
         snapshot: SessionSnapshot::new(messages),
     });

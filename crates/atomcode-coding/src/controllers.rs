@@ -89,6 +89,9 @@ pub struct GoalRunReport {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GoalProgress {
+    /// Live controller identity. Restoring a checkpoint assigns a new ID.
+    #[serde(skip)]
+    pub control_id: uuid::Uuid,
     pub active: bool,
     pub terminal: Option<GoalTerminal>,
     pub phase: GoalPhase,
@@ -151,8 +154,9 @@ pub(crate) struct GoalState {
     pub evaluation_only: bool,
     pub evidence_expanded: bool,
     recovery_wait_started: Option<Instant>,
-    elapsed_before: u64,
+    elapsed_before: Duration,
     pub id: u64,
+    pub control_id: uuid::Uuid,
     pub condition: String,
     pub active: bool,
     pub phase: GoalPhase,
@@ -220,8 +224,9 @@ impl GoalState {
             evaluation_only: false,
             evidence_expanded: false,
             recovery_wait_started: None,
-            elapsed_before: 0,
+            elapsed_before: Duration::ZERO,
             id,
+            control_id: uuid::Uuid::new_v4(),
             condition,
             active: true,
             phase: GoalPhase::Pursuing,
@@ -252,7 +257,7 @@ impl GoalState {
     pub fn resume_paused_for_evaluation(&mut self) {
         self.cancel = CancellationToken::new();
         self.invalidate_work();
-        self.active = true;
+        self.set_active(true);
         self.phase = GoalPhase::Pursuing;
         self.terminal = None;
         self.last_reason = Some("仅重新评估已完成的工作".into());
@@ -272,7 +277,7 @@ impl GoalState {
             remaining,
         );
         state.max_duration_secs = progress.report.time_limit_secs;
-        state.elapsed_before = progress.elapsed_secs;
+        state.elapsed_before = Duration::from_secs(progress.elapsed_secs);
         state.report = progress.report.clone();
         state.tokens_used = progress.report.tokens;
         state.round = progress.round;
@@ -284,8 +289,26 @@ impl GoalState {
         state
     }
 
+    fn elapsed(&self) -> Duration {
+        if self.active {
+            self.elapsed_before
+                .saturating_add(self.started_at.elapsed())
+        } else {
+            self.elapsed_before
+        }
+    }
+
+    fn set_active(&mut self, active: bool) {
+        if active != self.active {
+            self.elapsed_before = self.elapsed();
+            self.started_at = Instant::now();
+            self.active = active;
+        }
+    }
+
     pub fn progress(&self) -> GoalProgress {
         GoalProgress {
+            control_id: self.control_id,
             active: self.active,
             terminal: if self.active || self.phase == GoalPhase::Paused {
                 self.terminal
@@ -295,9 +318,7 @@ impl GoalState {
             phase: self.phase,
             round: self.round,
             max_rounds: self.max_rounds,
-            elapsed_secs: self
-                .elapsed_before
-                .saturating_add(self.started_at.elapsed().as_secs()),
+            elapsed_secs: self.elapsed().as_secs(),
             report: GoalRunReport {
                 tokens: self.tokens_used,
                 remaining_time_secs: self.deadline.map(|at| {
@@ -445,7 +466,7 @@ impl GoalState {
 
     pub fn finish(&mut self, terminal: GoalTerminal, reason: impl Into<String>) {
         self.invalidate_work();
-        self.active = false;
+        self.set_active(false);
         self.phase = match terminal {
             GoalTerminal::Met => GoalPhase::Satisfied,
             _ => GoalPhase::Ended,
@@ -456,7 +477,7 @@ impl GoalState {
 
     pub fn mark_satisfied(&mut self, verdict: impl Into<String>) {
         self.invalidate_work();
-        self.active = false;
+        self.set_active(false);
         self.phase = GoalPhase::Satisfied;
         self.terminal = Some(GoalTerminal::Met);
         self.last_reason = Some(verdict.into());
@@ -464,7 +485,7 @@ impl GoalState {
 
     pub fn pause_at_cap(&mut self, note: impl Into<String>) {
         self.invalidate_work();
-        self.active = false;
+        self.set_active(false);
         self.phase = GoalPhase::PausedAtCap;
         self.terminal = Some(GoalTerminal::Stopped);
         self.last_reason = Some(note.into());
@@ -473,7 +494,7 @@ impl GoalState {
 
     pub fn pause_for_recovery(&mut self, note: impl Into<String>) {
         self.invalidate_work();
-        self.active = false;
+        self.set_active(false);
         self.phase = GoalPhase::PausedAtCap;
         self.terminal = Some(GoalTerminal::Stopped);
         self.last_reason = Some(note.into());
@@ -483,7 +504,7 @@ impl GoalState {
     pub fn pause(&mut self, note: impl Into<String>) {
         self.invalidate_work();
         self.cancel.cancel();
-        self.active = false;
+        self.set_active(false);
         self.phase = GoalPhase::Paused;
         self.terminal = None;
         self.last_reason = Some(note.into());
@@ -491,7 +512,7 @@ impl GoalState {
 
     pub fn resume(&mut self, new_max_rounds: u32) {
         self.cancel = CancellationToken::new();
-        self.active = true;
+        self.set_active(true);
         self.phase = GoalPhase::Pursuing;
         self.round = 0;
         self.max_rounds = (new_max_rounds != 0).then_some(new_max_rounds);
@@ -515,7 +536,7 @@ impl GoalState {
     pub fn resume_paused(&mut self) {
         debug_assert_eq!(self.phase, GoalPhase::Paused);
         self.cancel = CancellationToken::new();
-        self.active = true;
+        self.set_active(true);
         self.phase = GoalPhase::Pursuing;
         self.invalidate_work();
         self.terminal = None;
@@ -2335,6 +2356,24 @@ mod tests {
 #[cfg(test)]
 mod checkpoint_budget_audit_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn paused_goal_elapsed_excludes_waiting_for_user() {
+        let mut state = GoalState::new(1, "finish".into(), 10, 60);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        state.pause("paused");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let paused = state.progress();
+        assert_eq!(paused.elapsed_secs, 1);
+        assert_eq!(paused.report.remaining_time_secs, Some(49));
+
+        state.resume_paused();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(state.progress().elapsed_secs, 2);
+        state.finish(GoalTerminal::Cancelled, "cleared");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(state.progress().elapsed_secs, 2);
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn checkpoint_restores_the_current_renewed_time_window() {

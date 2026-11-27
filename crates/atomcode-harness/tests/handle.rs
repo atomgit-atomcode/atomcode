@@ -567,6 +567,77 @@ async fn allow_always_stops_it_being_asked_twice() {
 
 // ---- lifecycle ----------------------------------------------------------
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn malformed_tool_names_get_one_retry_despite_changing_suffixes() {
+    let dir = scratch("malformed-tool-name");
+    std::fs::write(dir.join("input.txt"), "CORRECTED_CALL_RAN").unwrap();
+    let script = replay(
+        r#"{ calls = [ { name = "todowriteough11z35b</argValue>", args = {} } ] },
+           { calls = [ { name = "todowriteough11z36b</argValue>", args = {} } ] },
+           { calls = [ { name = "read_file</argValue>", args = {} } ] },
+           { calls = [ { name = "read_file", args = { file_path = "input.txt" } },
+                       { name = "todowriteough11z37b</argValue>", args = {} } ] },
+           { text = "Corrected." }"#,
+    );
+    let app = start(tree(&dir, &script, &[])).await;
+    let mut handle = handle_of(&app);
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "Update the list".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let events = drain_turn(&mut handle).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::TurnComplete {
+                reason: StopReason::ToolLoopDetected,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult { result, .. } if result.is_error => {
+                Some(result.content.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("Retry using an exact name"));
+    assert!(errors[1].contains("malformed tool names again"));
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "Continue".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let next = drain_turn(&mut handle).await;
+    assert!(
+        next.iter().any(|event| matches!(event,
+            AgentEvent::ToolResult { result }
+                if !result.is_error && result.content.contains("CORRECTED_CALL_RAN")
+        )),
+        "{next:?}"
+    );
+    assert!(
+        matches!(
+            next.last(),
+            Some(AgentEvent::TurnComplete {
+                reason: StopReason::Stopped,
+                ..
+            })
+        ),
+        "{next:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
     let dir = scratch("cancel");
@@ -1155,7 +1226,7 @@ async fn a_note_from_another_session_is_logged_as_that_sessions_and_runs_a_turn(
             &e.event,
             atomcode_harness::session::SessionEvent::Injected {
                 text,
-                origin: atomcode_harness::session::InjectionOrigin::Peer { from, outside },
+                origin: atomcode_harness::session::InjectionOrigin::Peer { from, outside, .. },
                 ..
             } if text == "the review came back" && from == "bg-7" && *outside
         )),
@@ -1940,6 +2011,41 @@ fn fact_seqs(events: &[AgentEvent], session: &str) -> Vec<u64> {
         .collect()
 }
 
+/// What a subscriber was sent against what the log holds once the turn is
+/// over: every durable fact exactly once and in log order, and beyond them only
+/// the chunks it saw streaming — a settled round's chunks leave the log, so
+/// they are the one thing a subscriber may have seen that the log no longer
+/// has.
+fn assert_history_then_live(
+    events: &[AgentEvent],
+    session: &str,
+    log: &atomcode_harness::session::SessionLog,
+) {
+    let facts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => Some(c),
+            _ => None,
+        })
+        .collect();
+    let seqs: Vec<u64> = facts.iter().map(|c| c.seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "every fact once, in log order: {seqs:?}"
+    );
+    let logged: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    assert!(!logged.is_empty());
+    let durable: Vec<u64> = facts
+        .iter()
+        .filter(|c| !c.event.is_transient())
+        .map(|c| c.seq)
+        .collect();
+    assert_eq!(
+        durable, logged,
+        "the durable facts are the log's: {events:#?}"
+    );
+}
+
 /// Read events until a fact with `seq` of `session` has arrived, the turn has
 /// ended, and nothing more is queued.
 async fn drain_turn_and_facts(handle: &mut AgentHandle) -> Vec<AgentEvent> {
@@ -1982,12 +2088,11 @@ async fn a_subscriber_gets_the_history_then_live_facts_with_no_gap_or_repeat() {
     handle.commands.send(message("second")).unwrap();
     let after = drain_turn_and_facts(&mut handle).await;
 
-    let seqs = fact_seqs(&after, &session);
-    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
-    assert!(!expected.is_empty());
-    assert_eq!(
-        seqs, expected,
-        "history then live, every fact once, in log order"
+    assert_history_then_live(&after, &session, &log);
+    assert!(
+        after.iter().any(|e| matches!(e, AgentEvent::Fact(c)
+            if c.session == session && c.event.is_transient())),
+        "the second turn's chunks arrived live: {after:#?}"
     );
 }
 
@@ -2013,9 +2118,7 @@ async fn subscribing_while_a_turn_runs_misses_and_repeats_nothing() {
     handle.commands.send(message("go")).unwrap();
     let events = drain_turn_and_facts(&mut handle).await;
 
-    let seqs = fact_seqs(&events, &session);
-    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
-    assert_eq!(seqs, expected, "{events:#?}");
+    assert_history_then_live(&events, &session, &log);
 }
 
 #[tokio::test]

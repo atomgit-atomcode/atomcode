@@ -2305,7 +2305,11 @@ impl CodingRuntimeHandle {
             }
             DriverCommand::PauseGoal => {
                 let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::PauseGoal { generation, done }
+                CodingRuntimeControl::PauseGoal {
+                    generation,
+                    control_id: None,
+                    done,
+                }
             }
             DriverCommand::Compact(focus) => CodingRuntimeControl::Compact { generation, focus },
             DriverCommand::SetMode(mode) => {
@@ -2381,7 +2385,11 @@ impl CodingRuntimeHandle {
             }
             DriverCommand::StopGoal => {
                 let (done, _result) = oneshot::channel();
-                CodingRuntimeControl::StopGoal { generation, done }
+                CodingRuntimeControl::StopGoal {
+                    generation,
+                    control_id: None,
+                    done,
+                }
             }
             DriverCommand::StartLoop(prompt) => {
                 let (done, _result) = oneshot::channel();
@@ -2690,11 +2698,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn pause_goal(&self) -> Result<(), RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.pause_goal_at_generation(self.status().generation, None)
+            .await
+    }
+
+    pub async fn pause_goal_at_generation(
+        &self,
+        generation: u64,
+        control_id: Option<uuid::Uuid>,
+    ) -> Result<(), RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::PauseGoal {
-                generation: runtime_state_generation(state),
+                generation,
+                control_id,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -3638,11 +3655,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn stop_goal(&self) -> Result<(), RuntimeError> {
-        let state = self.state.load(Ordering::Acquire);
+        self.stop_goal_at_generation(self.status().generation, None)
+            .await
+    }
+
+    pub async fn stop_goal_at_generation(
+        &self,
+        generation: u64,
+        control_id: Option<uuid::Uuid>,
+    ) -> Result<(), RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::StopGoal {
-                generation: runtime_state_generation(state),
+                generation,
+                control_id,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -4194,6 +4220,7 @@ pub enum CodingRuntimeControl {
     },
     PauseGoal {
         generation: u64,
+        control_id: Option<uuid::Uuid>,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     Quality {
@@ -4462,6 +4489,7 @@ pub enum CodingRuntimeControl {
     },
     StopGoal {
         generation: u64,
+        control_id: Option<uuid::Uuid>,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     StartLoop {
@@ -5026,8 +5054,9 @@ fn spawn_runtime_owner_with_optional_agent(
                 follow_up = None;
             }
 
-            if cancel_pending
-                || persistence_failure.is_some()
+            // A cancel is not here: it stops the turn, not the jobs the turn
+            // started, so their completions still wake the model once it settles.
+            if persistence_failure.is_some()
                 || pending_policy_intervention.is_some()
                 || !agent_available
             {
@@ -7177,7 +7206,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
-                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
+                        // The jobs the turn started keep running, and so do
+                        // their notifications: the stop is the turn's.
+                        if request_generation == generation { follow_up = None; }
                         if request_generation == generation {
                             goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         }
@@ -7322,6 +7353,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::PauseGoal {
                         generation: request_generation,
+                        control_id,
                         done,
                     }) => {
                         if !native_protocol || request_generation != generation || !agent_available {
@@ -7332,6 +7364,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if control_id.is_some_and(|id| id != state.control_id || !state.active) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("The active goal has changed".into())));
+                            continue;
+                        }
                         state.pause("paused by user; continue the conversation to resume");
                         let _ = runtime_event_tx
                             .send(CodingRuntimeEvent::GoalChanged(state.progress()));
@@ -9994,19 +10030,29 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StopGoal { generation: request_generation, done }) => {
-                        if request_generation == generation { background_jobs.reset(generation); follow_up = None; }
-                        if request_generation == generation {
-                            goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
-                        }
+                    Some(CodingRuntimeControl::StopGoal { generation: request_generation, control_id, done }) => {
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         }
+                        if control_id.is_some_and(|id| goal.as_ref().is_none_or(|goal| goal.control_id != id)) {
+                            let _ = done.send(Err(RuntimeError::CommandRefused("The goal has changed".into())));
+                            continue;
+                        }
+                        let clear_only = control_id.is_some() && goal.as_ref().is_some_and(|goal| !goal.active);
+                        if !clear_only {
+                            background_jobs.reset(generation);
+                            follow_up = None;
+                        }
+                        goal_questions.close(resources.as_ref(), &mut pending_requests, &runtime_event_tx);
                         if let Some(mut current) = goal.take() {
                             current.cancel.cancel();
                             current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
+                        }
+                        if clear_only {
+                            let _ = done.send(goal_checkpoints.commit(&runtime_event_tx));
+                            continue;
                         }
                         if let Some((turn_id, _, snapshot, stats)) =
                             held_turn.take_if(|_| !kernel_turn_open)
@@ -10223,7 +10269,7 @@ fn spawn_runtime_owner_with_optional_agent(
                 },
                 command = kernel_command_rx.recv() => match command {
                     Some(command) => {
-                        if matches!(command.clone().untagged(), AgentCommand::Cancel | AgentCommand::Shutdown) {
+                        if matches!(command.clone().untagged(), AgentCommand::Shutdown) {
                             background_jobs.reset(generation);
                         }
                         let _ = send_agent_command(&agent, command);
@@ -10937,7 +10983,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::ToolResult { result } => {
-                                if !cancel_pending { background_jobs.result(&result); }
+                                background_jobs.result(&result);
                                 // A driver's own shorter timeout, or a withdrawn
                                 // dialog, may finish the tool before our deadline.
                                 // Never resurrect that closed wait as pending.
@@ -11053,8 +11099,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         break;
                     },
                 },
-                completion = background_jobs.next(), if background_jobs.pending() && !kernel_turn_open && pending_requests.is_empty() => {
-                    if cancel_pending || controls.stop_now().is_cancelled() || persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
+                // Not while a stop settles: the completion stays queued until
+                // the stopped turn has ended, then starts the next one.
+                completion = background_jobs.next(), if background_jobs.pending() && !kernel_turn_open && !cancel_pending && !controls.stop_now().is_cancelled() && pending_requests.is_empty() => {
+                    if persistence_failure.is_some() || pending_policy_intervention.is_some() || !agent_available {
                         continue;
                     }
                     let goal_waiting = held_turn.is_some() && goal.as_ref().is_some_and(|state| state.active);
@@ -12702,6 +12750,7 @@ struct SubagentRowPatch {
 struct TeamRowPatch<'a> {
     project_root: &'a std::path::Path,
     max_members: usize,
+    role_request_budgets: std::collections::BTreeMap<String, u32>,
     max_rounds: u32,
     headless_wait: bool,
 }
@@ -12808,6 +12857,11 @@ fn harness_option_rows(
                 TeamRowPatch {
                     project_root: wd,
                     max_members,
+                    role_request_budgets: config
+                        .subagent_config
+                        .as_ref()
+                        .map(|cfg| cfg.team.role_request_budgets.clone())
+                        .unwrap_or_default(),
                     max_rounds,
                     headless_wait: !config.is_attended(),
                 },
@@ -16736,6 +16790,92 @@ mod tests {
             Some(AgentCommand::PeerNote { from, text })
                 if from == "bg-7" && text == "the review came back"
         ));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn scoped_goal_controls_reject_stale_ids_and_clear_only_the_paused_goal() {
+        let (handle, mut kernel_commands, kernel_events, mut events, _wakeup, _active, _adapter) =
+            controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_goal("finish the task").await.unwrap();
+        let Some(CodingRuntimeEvent::GoalChanged(progress)) = events.recv().await else {
+            panic!("expected initial goal progress");
+        };
+        let generation = handle.status().generation;
+        let goal_id = Some(progress.control_id);
+        let stale_id = Some(uuid::Uuid::nil());
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        assert!(handle
+            .pause_goal_at_generation(generation, stale_id)
+            .await
+            .is_err());
+        assert!(handle
+            .stop_goal_at_generation(generation, stale_id)
+            .await
+            .is_err());
+        assert!(kernel_commands.try_recv().is_err());
+
+        handle
+            .pause_goal_at_generation(generation, goal_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Paused,
+                ..
+            }))
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::user("finish the task")]),
+            })
+            .unwrap();
+        while !matches!(
+            events.recv().await.unwrap(),
+            CodingRuntimeEvent::TurnFinished(_)
+        ) {}
+
+        handle
+            .note("bg-7".into(), "independent result".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::PeerNote { .. })
+        ));
+        handle
+            .stop_goal_at_generation(generation, goal_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(CodingRuntimeEvent::GoalChanged(GoalProgress {
+                phase: GoalPhase::Ended,
+                ..
+            }))
+        ));
+        assert!(handle
+            .stop_goal_at_generation(generation, goal_id)
+            .await
+            .is_err());
+        assert!(
+            kernel_commands.try_recv().is_err(),
+            "an unrelated turn was cancelled"
+        );
         handle.shutdown().await.unwrap();
     }
 
@@ -25149,9 +25289,59 @@ type = "openai"
         adapter.shutdown().await.unwrap();
     }
 
+    /// Esc while the model waits on a job (in `bash_poll`, or still
+    /// answering) stops the turn and leaves the job running: its completion
+    /// still starts the next turn instead of waiting for the person to type.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cancelled_turn_still_wakes_for_the_job_it_left_running() {
+        let (handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
+            waking_test_runtime().await;
+        let (call, result, finish) = crate::background_jobs::tests::job(true).await;
+        events.send(AgentEvent::TurnStarted { turn: None }).unwrap();
+        events.send(AgentEvent::ToolStarted { call }).unwrap();
+        events.send(AgentEvent::ToolResult { result }).unwrap();
+        while !matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::ToolResult { .. }))
+        ) {}
+        handle.cancel().await.unwrap();
+        assert!(matches!(commands.recv().await, Some(AgentCommand::Cancel)));
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        // The job ends while the stop is still settling: held, not dropped.
+        finish.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), commands.recv())
+                .await
+                .is_err(),
+            "nothing wakes the agent before the cancelled turn has ended"
+        );
+        events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Cancelled,
+                provider_failure: None,
+            })
+            .unwrap();
+        events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![]),
+            })
+            .unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
+        assert!(
+            matches!(next, Ok(Some(AgentCommand::SendSyntheticMessage { ref text })) if text.contains("Background job")),
+            "{next:?}"
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
     /// The hint reads the runtime's own decision, not a copy of its rules: a
     /// job the runtime observes is published to the mounted assembly's table,
-    /// and a cancelled turn takes the claim back.
+    /// and a cancelled turn leaves the claim standing — the stop ended the
+    /// turn, not the job.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn the_jobs_a_completion_will_wake_for_reach_the_assembly() {
         let (handle, _commands, events, mut runtime_events, _wake, _active, adapter) =
@@ -25189,8 +25379,8 @@ type = "openai"
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(
-            !waits.wakes_on(&id),
-            "cancellation retires the notification"
+            waits.wakes_on(&id),
+            "a cancelled turn leaves the job, and its notification, running"
         );
         finish.cancel();
         adapter.shutdown().await.unwrap();
@@ -25271,7 +25461,7 @@ type = "openai"
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn an_explicit_background_job_notifies_once_and_cancel_forgets_it() {
+    async fn an_explicit_background_job_notifies_once_even_after_a_cancel() {
         for action in 0..4 {
             let (_handle, mut commands, events, mut runtime_events, _wake, _active, adapter) =
                 waking_test_runtime().await;
@@ -25313,10 +25503,10 @@ type = "openai"
             finish.cancel();
             let next =
                 tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv()).await;
-            if action != 0 {
+            if action > 1 {
                 assert!(
                     next.is_err(),
-                    "cancelled, replaced or policy-blocked wait must not wake the agent"
+                    "a replaced or policy-blocked wait must not wake the agent"
                 );
             } else {
                 assert!(

@@ -30,6 +30,8 @@ try {
   await page.route('**/workbench/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const body = path.endsWith('/files') ? [{name:'test.txt', directory:false}, {name:'image.png', directory:false}]
+      : path.endsWith('/git/branches') ? {current:'main', branches:[{name:'main', current:true}], detached:false}
+      : path.endsWith('/git/log') ? [{hash:'1a2b3c4d5e6f', short:'1a2b3c4', author:'Fixture', at:1700000000, subject:'fixture commit'}]
       : path.endsWith('/git') ? [{path:'test.txt', index:' ', worktree:'M'}]
       : path.endsWith('/text') ? {content:'draft original', revision:'fixture'}
       : path.endsWith('/diff') ? {diff:'@@ fixture\n+added\n-removed'} : null;
@@ -59,12 +61,12 @@ try {
   await page.keyboard.press('Escape');
   assert.equal(await editor.inputValue(), 'unsaved draft');
   await page.getByRole('button', {name:/^Git$/}).click();
-  await page.locator('.workbench-changes button').first().click();
+  await page.locator('.git-row-main').first().click();
   await page.getByRole('button', {name:/^最大化差异$|^Maximize diff$/}).click();
-  assert.equal(await page.locator('.workbench-changes').isVisible(), false);
+  assert.equal(await page.locator('.workbench-git-list').isVisible(), false);
   await page.screenshot({path:'/tmp/atomcode-workbench-content-maximize.png'});
   await page.keyboard.press('Escape');
-  assert.equal(await page.locator('.workbench-changes').isVisible(), true);
+  assert.equal(await page.locator('.workbench-git-list').isVisible(), true);
   await page.getByRole('button', {name:/^工作区全屏$|^Fullscreen workspace$/}).click();
   await page.getByRole('button', {name:/^最大化差异$|^Maximize diff$/}).click();
   await page.keyboard.press('Escape');

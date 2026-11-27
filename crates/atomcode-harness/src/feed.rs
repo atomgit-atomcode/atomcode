@@ -183,6 +183,7 @@ impl Feed {
             description: Box::new(atomcode_kernel::agent::AgentDescription {
                 session: session.to_string(),
                 parent: header.parent.clone(),
+                working_dir: header.cwd,
                 member: header
                     .member
                     .as_ref()
@@ -342,16 +343,16 @@ impl Feed {
     /// a log it was never shown (a front end's undo refused as stale).
     fn catch_up(&self, subscription: &mut Subscription, agent: &Agent) {
         let session = agent.session_id().to_string();
-        for logged in agent.session().events() {
-            if logged.seq > subscription.high {
-                subscription.high = logged.seq;
-                let _ = self.events.send(AgentEvent::Fact(Box::new(Committed {
-                    session: session.clone(),
-                    seq: logged.seq,
-                    at: logged.at,
-                    event: logged.event,
-                })));
-            }
+        // Only what is past the subscriber's mark: copying the whole log to skip
+        // most of it costs a conversation per catch-up.
+        for logged in agent.session().since(subscription.high) {
+            subscription.high = logged.seq;
+            let _ = self.events.send(AgentEvent::Fact(Box::new(Committed {
+                session: session.clone(),
+                seq: logged.seq,
+                at: logged.at,
+                event: logged.event,
+            })));
         }
     }
 

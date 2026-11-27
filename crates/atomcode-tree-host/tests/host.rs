@@ -265,7 +265,7 @@ async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     // Listed once it is on disk, in the directory it was made in.
     let mut listed = Vec::new();
     for _ in 0..100 {
-        if let Ok(HostReply::Sessions { sessions }) = connection
+        if let Ok(HostReply::Sessions { sessions, .. }) = connection
             .control
             .call(HostCommand::ListSessions { working_dir: None })
             .await

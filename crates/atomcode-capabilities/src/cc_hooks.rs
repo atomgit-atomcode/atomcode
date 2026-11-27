@@ -816,9 +816,14 @@ fn deliberate_block_reason(stdout: &str, stderr: &str) -> Option<String> {
     Some(reason.to_string())
 }
 
-/// The last non-empty line of stdout parsed as JSON (CC emits its decision as the
-/// final line; earlier lines may be diagnostics).
-fn last_json_line(stdout: &str) -> Option<Value> {
+/// The JSON decision a hook printed: the whole of stdout when it is one JSON object
+/// (hooks such as superpowers' SessionStart pretty-print it across several lines),
+/// otherwise the last non-empty line (CC emits its decision as the final line; earlier
+/// lines may be diagnostics).
+fn stdout_json(stdout: &str) -> Option<Value> {
+    if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) {
+        return Some(value);
+    }
     let line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
     serde_json::from_str(line.trim()).ok()
 }
@@ -834,14 +839,14 @@ fn last_json_line(stdout: &str) -> Option<Value> {
 enum StdoutShape {
     /// Nothing on stdout: the exit-code contract alone decides.
     Silent,
-    /// JSON on the last non-empty line — a decision, usable or not.
+    /// JSON (see [`stdout_json`]) — a decision, usable or not.
     Json,
     /// Text that is not JSON: only actionable as "the hook did not speak".
     NotJson,
 }
 
 fn stdout_shape(stdout: &str) -> StdoutShape {
-    if last_json_line(stdout).is_some() {
+    if stdout_json(stdout).is_some() {
         return StdoutShape::Json;
     }
     if stdout.trim().is_empty() {
@@ -854,11 +859,11 @@ fn stdout_shape(stdout: &str) -> StdoutShape {
 /// The decision this hook's stdout carries, naming the silent case in the log.
 ///
 /// Sites where plain stdout is a *feature* — SessionStart context, UserPromptSubmit
-/// injection — keep calling [`last_json_line`] directly: there the same bytes reach the
+/// injection — keep calling [`stdout_json`] directly: there the same bytes reach the
 /// model, so nothing is lost and a warning would be noise. Here they reach nobody, and
 /// a hook that expected to decide quietly did not.
 fn decision_from_stdout(stdout: &str, event: HookEvent) -> Option<Decision> {
-    if let Some(value) = last_json_line(stdout) {
+    if let Some(value) = stdout_json(stdout) {
         return serde_json::from_value::<Decision>(value).ok();
     }
     if stdout_shape(stdout) == StdoutShape::NotJson {
@@ -1084,7 +1089,7 @@ impl LifecycleHooks for CCExternalHooks {
         for (_code, stdout, _stderr) in outs.into_iter().flatten() {
             // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
             // is injected as context. CC cannot block here.
-            let ctx = last_json_line(&stdout)
+            let ctx = stdout_json(&stdout)
                 .as_ref()
                 .and_then(|v| serde_json::from_value::<Decision>(v.clone()).ok())
                 .and_then(|d| d.additional_context().map(str::to_owned))
@@ -1125,7 +1130,7 @@ impl LifecycleHooks for CCExternalHooks {
                 continue; // timeout / spawn failure → silent continue.
             };
             let decided =
-                last_json_line(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
+                stdout_json(&stdout).and_then(|v| serde_json::from_value::<Decision>(v).ok());
             if let Some(d) = &decided {
                 let blocks =
                     d.decision.as_deref() == Some("block") || d.action.as_deref() == Some("block");
@@ -1502,7 +1507,7 @@ async fn required_pre_tool_approval(hook: &HookConfig, cwd: &str, payload: &str)
         return deny("Required approval hook could not complete");
     };
     let Some(decision) =
-        last_json_line(&stdout).and_then(|value| serde_json::from_value::<Decision>(value).ok())
+        stdout_json(&stdout).and_then(|value| serde_json::from_value::<Decision>(value).ok())
     else {
         return deny("Required approval hook did not return an explicit allow");
     };
@@ -1680,6 +1685,26 @@ mod tests {
             HookEvent::PreToolUse
         )
         .is_some());
+    }
+
+    /// superpowers' SessionStart hook pretty-prints its JSON over several lines, so
+    /// its last line is a lone `}`. Read line by line, the decision was lost and the
+    /// escaped JSON text itself reached the model; a pretty-printed `deny` was ignored.
+    #[test]
+    fn a_decision_printed_over_several_lines_is_still_a_decision() {
+        let pretty =
+            "{\n  \"hookSpecificOutput\": {\n    \"permissionDecision\": \"deny\"\n  }\n}\n";
+        assert_eq!(stdout_shape(pretty), StdoutShape::Json);
+        let decision = decision_from_stdout(pretty, HookEvent::PreToolUse).expect("decision");
+        assert_eq!(
+            decision
+                .hook_specific
+                .and_then(|h| h.permission_decision)
+                .as_deref(),
+            Some("deny")
+        );
+        // Diagnostics ahead of a one-line decision keep working.
+        assert!(stdout_json("checking…\n{\"decision\":\"block\"}\n").is_some());
     }
 
     #[test]
@@ -2628,6 +2653,30 @@ mod tests {
         );
         assert!(injected.text.contains("WSL setup hint"));
         assert!(injected.text.starts_with("<system-reminder>"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pretty_printed_session_context_reaches_the_model_unescaped() {
+        let hook = HookConfig {
+            event: HookEvent::SessionStart,
+            matcher: None,
+            command: r#"printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "line one\\nline two"\n  }\n}\n'"#
+                .into(),
+            timeout_ms: 5_000,
+            args: Vec::new(),
+            plugin_root: None,
+            plugin_content_hash: None,
+            required_approval: false,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let mut convo = Conversation::new();
+
+        cc.session_start(&mut convo, false).await;
+
+        let injected = &convo.messages.last().expect("context injected").text;
+        assert!(injected.contains("line one\nline two"), "{injected}");
+        assert!(!injected.contains("hookSpecificOutput"), "{injected}");
     }
 
     #[test]

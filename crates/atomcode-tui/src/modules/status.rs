@@ -201,13 +201,6 @@ impl View for Status {
             // gold that makes "it is still going" read at a glance.
             Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
             // The live line already says the turn is stopping.
-            Activity::Idle if vp.moment.working_members() > 0 => Some((
-                t(Msg::LiveWaitingForMember {
-                    n: vp.moment.working_members(),
-                })
-                .into_owned(),
-                theme::fg(Role::Warning),
-            )),
             Activity::Stopping | Activity::Idle => None,
         };
         if let Some((text, _)) = &activity {
@@ -331,13 +324,10 @@ impl View for Status {
         if let Some(level) = vp.moment.effort {
             model_str.push_str(&format!(" [{}]", level.as_str()));
         }
-        // Home collapsed to `~` for display — the same optimisation the welcome
-        // banner and `/cd`/`/resume` apply at their own display sites. `Moment.cwd`
-        // itself stays absolute (the `@`-path completion in `plugin.rs` reads it as
-        // a real filesystem path), so the collapse happens here, not at the source.
-        let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
+        let cwd = vp.moment.member_cwd.as_deref().unwrap_or(&vp.moment.cwd);
+        let cwd_full = crate::text::collapse_home(cwd);
         let cwd_base = path_basename(&cwd_full).to_string();
-        let branch = crate::git_branch::current(&vp.moment.cwd);
+        let branch = crate::git_branch::current(cwd);
         let branch_suffix = branch.map(|name| format!(" [{name}]")).unwrap_or_default();
         let cwd_full = format!("{cwd_full}{branch_suffix}");
         let cwd_base = format!("{cwd_base}{branch_suffix}");

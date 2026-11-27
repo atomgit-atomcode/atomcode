@@ -163,6 +163,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
+  private _windowFocused = vscode.window.state?.focused ?? true;
+  private _windowBlurredAt = 0;
+  private _chatInputRestore?: { webview: vscode.Webview; reportedAt: number };
+  private _windowStateWatcher?: vscode.Disposable;
+  private _focusRestoreTimer?: ReturnType<typeof setTimeout>;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _pendingMessages = new Map<string, PendingPanelMessage[]>();
   private _loginId?: string;
@@ -200,6 +205,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ) {
         this._broadcastChromeFont();
       }
+    });
+    this._windowStateWatcher = vscode.window.onDidChangeWindowState(({ focused }) => {
+      if (this._windowFocused === focused) return;
+      this._windowFocused = focused;
+      if (this._focusRestoreTimer !== undefined) {
+        clearTimeout(this._focusRestoreTimer);
+        this._focusRestoreTimer = undefined;
+      }
+      if (!focused) {
+        this._windowBlurredAt = Date.now();
+        // An Alt+Tab report can arrive just before the window-state event.
+        if (this._chatInputRestore && this._windowBlurredAt - this._chatInputRestore.reportedAt > 150) {
+          this._chatInputRestore = undefined;
+        }
+        return;
+      }
+      const target = this._chatInputRestore?.webview;
+      this._chatInputRestore = undefined;
+      if (!target) return;
+
+      const activeEditor = vscode.window.activeTextEditor;
+      // Let the workbench finish window activation before restoring input.
+      this._focusRestoreTimer = setTimeout(() => {
+        this._focusRestoreTimer = undefined;
+        const visible = this._view?.webview === target
+          ? this._view.visible
+          : this._webviewPanels.get(target)?.active;
+        if (this._windowFocused && visible && vscode.window.activeTextEditor === activeEditor) {
+          void target.postMessage({ type: 'restoreChatInput' });
+        }
+      }, 100);
     });
   }
 
@@ -258,6 +294,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._atomCodeConfigWatcher?.dispose();
     this._atomCodeAuthWatcher?.dispose();
     if (this._setupRefreshTimer) clearTimeout(this._setupRefreshTimer);
+    this._windowStateWatcher?.dispose();
+    if (this._focusRestoreTimer) clearTimeout(this._focusRestoreTimer);
   }
 
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
@@ -353,6 +391,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._webviewPanels.delete(webview);
     this._sessionBindingPromises.delete(webview);
     this._panelHistoryLoads.delete(panel);
+    if (this._chatInputRestore?.webview === webview) {
+      this._chatInputRestore = undefined;
+    }
     if (!disposedSid) return;
 
     const rt = this._sessionRuntimes.get(disposedSid);
@@ -782,6 +823,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             targetSessionId,
             mode === 'tab' ? webview : undefined,
           );
+          break;
+        }
+        case 'chatInputFocusState': {
+          const now = Date.now();
+          // This extension can run on a Linux workspace host for a Windows
+          // client. Only the webview knows which desktop delivered the event.
+          if (msg.windowsClient === true && msg.focused === true
+              && (this._windowFocused ? msg.altHeld === true : now - this._windowBlurredAt <= 2000)) {
+            this._chatInputRestore = { webview, reportedAt: now };
+          } else if (this._chatInputRestore?.webview === webview) {
+            this._chatInputRestore = undefined;
+          }
           break;
         }
         case 'getSkills':
@@ -1639,6 +1692,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         id: msg.id,
         ...(msg.approvalId ? { approvalId: msg.approvalId } : {}),
         success: result.success,
+        ...(result.success === false ? { expired: true } : {}),
         message: result.error,
       });
     } catch (e) {

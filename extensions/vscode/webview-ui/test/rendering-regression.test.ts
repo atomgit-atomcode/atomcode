@@ -1363,3 +1363,22 @@ function testLateApprovalResultCannotApproveAReusedProviderCall() {
   assert.equal(state.messages[0].permissionRequest?.status,'allowed');
 }
 testLateApprovalResultCannotApproveAReusedProviderCall();
+
+function testUnanswerablePermissionStaysClosed() {
+  const requested = chatReducer(startAssistantState(), {
+    type: 'PERMISSION_REQUEST', id: 'call', approvalId: 'token', sessionId: 'session',
+    toolName: 'bash', reason: 'Approve', args: '{}', isDestructive: true,
+  });
+  const failure = { type: 'PERMISSION_RESPONSE_RESULT' as const, id: 'call', approvalId: 'token', success: false };
+  assert.equal(chatReducer(requested, failure).messages[0].permissionRequest?.status, 'pending');
+  const delivered = chatReducer(requested, { ...failure, success: true });
+  assert.equal(chatReducer(delivered, failure).messages[0].permissionRequest?.status, 'allowed');
+  for (const settled of [
+    chatReducer(requested, { ...failure, expired: true }),
+    chatReducer(requested, { type: 'TOOL_RESULT', id: 'call', name: 'bash', output: '', success: false, durationMs: 0 }),
+    chatReducer(requested, { type: 'GENERATION_STOPPED' }),
+  ]) {
+    assert.equal(chatReducer(settled, failure).messages[0].permissionRequest?.status, 'expired');
+  }
+}
+testUnanswerablePermissionStaysClosed();

@@ -40,6 +40,7 @@ static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::
 
 #[derive(Serialize)]
 pub(crate) struct LiveGoalSnapshot {
+    control_id: String,
     active: bool,
     round: u32,
     elapsed_secs: u64,
@@ -406,10 +407,10 @@ pub(crate) fn live_runtime_config(
 }
 
 fn send_chat_runtime_error(
-    events: &mpsc::UnboundedSender<CodingRuntimeEvent>,
+    events: &mpsc::UnboundedSender<ChatTurnEvent>,
     message: impl Into<String>,
 ) {
-    let _ = events.send(CodingRuntimeEvent::Agent(
+    let _ = events.send(ChatTurnEvent::Runtime(CodingRuntimeEvent::Agent(
         atomcode_kernel::event::AgentEvent::Error {
             message: message.into(),
             http_status: None,
@@ -418,7 +419,7 @@ fn send_chat_runtime_error(
             retry_after_secs: None,
             ends_turn: false,
         },
-    ));
+    )));
 }
 
 async fn await_chat_user_input_response(
@@ -435,6 +436,74 @@ async fn await_chat_user_input_response(
     }
 }
 
+/// Startup advisories consumed by a `/chat` response.
+///
+/// Every `/chat` request builds its own temporary `CodingRuntime`, and each
+/// runtime re-derives the same startup advisories (instruction-file states such
+/// as a `claude.md` shadowed by `AGENTS.md`, skill notices, resume notes) and
+/// re-emits them as leading `ControllerWarning` events. Left alone the WebUI
+/// repeats them on every input. The SSE stream records the texts as it
+/// consumes them, so dropping an unpolled response leaves its warnings eligible.
+pub(crate) struct StartupAdvisories {
+    inner: std::sync::Mutex<AdvisoryIndex>,
+}
+
+type AdvisorySession = (String, String);
+
+struct AdvisoryIndex {
+    order: std::collections::VecDeque<AdvisorySession>,
+    seen: std::collections::HashMap<AdvisorySession, std::collections::HashSet<String>>,
+}
+
+/// Bound the registry: one entry per chat session, warnings are few per
+/// session, and a long-lived daemon should not accumulate every session id.
+const STARTUP_ADVISORY_SESSIONS: usize = 512;
+
+impl Default for StartupAdvisories {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(AdvisoryIndex {
+                order: Default::default(),
+                seen: Default::default(),
+            }),
+        }
+    }
+}
+
+impl StartupAdvisories {
+    /// Record `message` as shown for `session`; returns `true` when the session
+    /// already saw the exact same advisory text (a duplicate to drop).
+    pub(super) fn already_shown(&self, session: AdvisorySession, message: &str) -> bool {
+        let Ok(mut index) = self.inner.lock() else {
+            // A poisoned lock never hides an advisory — show it.
+            return false;
+        };
+        if !index.seen.contains_key(&session) {
+            index.seen.insert(session.clone(), Default::default());
+            index.order.push_back(session.clone());
+            while index.order.len() > STARTUP_ADVISORY_SESSIONS {
+                if let Some(evicted) = index.order.pop_front() {
+                    index.seen.remove(&evicted);
+                }
+            }
+        }
+        match index.seen.get_mut(&session) {
+            Some(shown) => !shown.insert(message.to_string()),
+            None => false,
+        }
+    }
+}
+
+pub(super) fn chat_startup_advisories() -> &'static StartupAdvisories {
+    static LEDGER: std::sync::OnceLock<StartupAdvisories> = std::sync::OnceLock::new();
+    LEDGER.get_or_init(StartupAdvisories::default)
+}
+
+pub(crate) enum ChatTurnEvent {
+    Runtime(CodingRuntimeEvent),
+    StartupAdvisory(String),
+}
+
 /// Drive a native runtime over `conv` and forward its native events to the shared
 /// `/chat` consumer. `perm_rx` carries interactive approval decisions from `/chat/permission`
 /// (`None` = apply [`fallback_approval_decision`] for the selected mode). The kernel
@@ -442,7 +511,7 @@ async fn await_chat_user_input_response(
 pub(crate) async fn run_chat_turn_v2(
     session_id: String,
     conv: Arc<Mutex<Vec<KernelMessage>>>,
-    runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
+    runtime_event_tx: mpsc::UnboundedSender<ChatTurnEvent>,
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
     mut perm_rx: Option<mpsc::UnboundedReceiver<crate::permission_bridge::ChatPermission>>,
@@ -452,6 +521,10 @@ pub(crate) async fn run_chat_turn_v2(
 ) {
     use atomcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use atomcode_coding::{CodingRuntime, TurnCompletion};
+
+    let emit = |event| {
+        let _ = runtime_event_tx.send(ChatTurnEvent::Runtime(event));
+    };
 
     // Split the just-submitted user input from the persisted prefix before runtime
     // startup. The buffer already holds kernel messages (cold summaries inline as
@@ -529,6 +602,12 @@ pub(crate) async fn run_chat_turn_v2(
     }
 
     let mut cancelled = false;
+    // The runtime's event task sends every startup warning before any other
+    // event (its first act, no awaits between sends), so leading
+    // `ControllerWarning`s in this stream are exactly the startup advisories.
+    // Once anything else arrives the turn is underway and later
+    // `ControllerWarning`s are turn-time facts that always forward.
+    let mut startup_advisories_open = true;
     let final_messages = loop {
         let ev = tokio::select! {
             _ = cancel.cancelled(), if !cancelled => {
@@ -545,9 +624,12 @@ pub(crate) async fn run_chat_turn_v2(
             );
             break None;
         };
+        if !matches!(ev, CodingRuntimeEvent::ControllerWarning(_)) {
+            startup_advisories_open = false;
+        }
         match ev {
-            event @ CodingRuntimeEvent::Agent(_) => {
-                let _ = runtime_event_tx.send(event);
+            CodingRuntimeEvent::ControllerWarning(message) if startup_advisories_open => {
+                let _ = runtime_event_tx.send(ChatTurnEvent::StartupAdvisory(message));
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
                 let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload.clone())
@@ -560,7 +642,7 @@ pub(crate) async fn run_chat_turn_v2(
                 // the route as soon as it sees the projected permission event.
                 let expected_approval_id = permission_routes.approval_id(&session_id, &approval.call_id);
                 let interactive = perm_rx.is_some();
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let mut answer = match &mut perm_rx {
                     None => fallback_approval_decision(approval_mode).into(),
                     Some(rx) => tokio::select! {
@@ -616,7 +698,7 @@ pub(crate) async fn run_chat_turn_v2(
                     == atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND =>
             {
                 let Some(responders) = &user_input_responders else {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                    emit(CodingRuntimeEvent::Request(request.clone()));
                     let _ = handle.respond(request.id, serde_json::Value::Null).await;
                     continue;
                 };
@@ -624,7 +706,7 @@ pub(crate) async fn run_chat_turn_v2(
                 responders.register(session_id.clone(), request.id, tx);
                 // Register before publishing the SSE event so a very fast browser answer
                 // cannot race the response route and be rejected as stale.
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let answer = await_chat_user_input_response(rx, coding_cfg.request_timeout);
                 tokio::pin!(answer);
                 let value = tokio::select! {
@@ -639,7 +721,7 @@ pub(crate) async fn run_chat_turn_v2(
                 let _ = handle.respond(request.id, value).await;
             }
             CodingRuntimeEvent::Request(request) => {
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
+                emit(CodingRuntimeEvent::Request(request.clone()));
                 let _ = handle.respond(request.id, serde_json::Value::Null).await;
             }
             CodingRuntimeEvent::TurnFinished(completion @ TurnCompletion::Completed { .. }) => {
@@ -647,7 +729,7 @@ pub(crate) async fn run_chat_turn_v2(
                     TurnCompletion::Completed { snapshot, .. } => snapshot.clone(),
                     TurnCompletion::SnapshotUnavailable { .. } => unreachable!(),
                 };
-                let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(completion));
+                emit(CodingRuntimeEvent::TurnFinished(completion));
                 break Some(AuthoritativeTerminal {
                     snapshot: snapshot.as_ref().clone(),
                 });
@@ -655,7 +737,7 @@ pub(crate) async fn run_chat_turn_v2(
             event @ CodingRuntimeEvent::TurnFinished(TurnCompletion::SnapshotUnavailable {
                 ..
             }) => {
-                let _ = runtime_event_tx.send(event);
+                emit(event);
                 break None;
             }
             event @ CodingRuntimeEvent::CompactionStarted { .. }
@@ -673,7 +755,7 @@ pub(crate) async fn run_chat_turn_v2(
                     let mut buffer = conv.lock().await;
                     *buffer = snapshot.messages;
                 }
-                let _ = runtime_event_tx.send(event);
+                emit(event);
             }
             CodingRuntimeEvent::SessionNameSuggested { name } => {
                 if let Err(error) = crate::legacy_convert::apply_ai_catalog_name_in_project(
@@ -681,7 +763,7 @@ pub(crate) async fn run_chat_turn_v2(
                     &naming_session_id,
                     &name,
                 ) {
-                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!(
+                    emit(CodingRuntimeEvent::ControllerWarning(format!(
                         "session naming failed: {error}"
                     )));
                 }
@@ -694,7 +776,7 @@ pub(crate) async fn run_chat_turn_v2(
                 break None;
             }
             event => {
-                let _ = runtime_event_tx.send(event);
+                emit(event);
             }
         }
     };
@@ -789,14 +871,8 @@ pub(crate) enum LiveWireEvent {
     /// clients can distinguish completion, failure and user cancellation.
     #[serde(rename = "goal_changed")]
     GoalChanged {
-        active: bool,
-        round: u32,
-        elapsed_secs: u64,
-        condition: String,
-        terminal: Option<String>,
-        phase: String,
-        last_reason: Option<String>,
-        recovery: Option<atomcode_coding::GoalRecoveryProgress>,
+        #[serde(flatten)]
+        progress: LiveGoalSnapshot,
     },
     #[serde(rename = "loop_changed")]
     LoopChanged {
@@ -1237,14 +1313,20 @@ impl NativeLiveWireProjector {
             crate::live_hub::LiveViewEvent::Runtime(Runtime::TurnFinished(completion)) => {
                 self.tools.clear();
                 match completion {
-                    atomcode_coding::TurnCompletion::Completed { reason, stats, .. } => {
-                        LiveWireEvent::State {
-                            running: false,
-                            stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
-                            message: None,
-                            stats: Some(stats.into()),
-                        }
-                    }
+                    atomcode_coding::TurnCompletion::Completed {
+                        turn_id,
+                        reason,
+                        stats,
+                        ..
+                    } => LiveWireEvent::State {
+                        running: false,
+                        stop_reason: Some(crate::stop_reason_wire(reason).to_string()),
+                        message: None,
+                        stats: Some(crate::TurnStatsWire {
+                            turn_id: Some(turn_id),
+                            ..stats.into()
+                        }),
+                    },
                     atomcode_coding::TurnCompletion::SnapshotUnavailable {
                         error, stats, ..
                     } => LiveWireEvent::State {
@@ -1264,31 +1346,8 @@ impl NativeLiveWireProjector {
                 LiveWireEvent::LoopChanged { progress }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::GoalChanged(progress)) => {
-                use atomcode_coding::{GoalPhase, GoalTerminal};
                 LiveWireEvent::GoalChanged {
-                    active: progress.active,
-                    round: progress.round,
-                    elapsed_secs: progress.elapsed_secs,
-                    condition: progress.condition,
-                    terminal: progress.terminal.map(|terminal| {
-                        match terminal {
-                            GoalTerminal::Met => "met",
-                            GoalTerminal::Stopped => "stopped",
-                            GoalTerminal::Failed => "failed",
-                            GoalTerminal::Cancelled => "cancelled",
-                        }
-                        .into()
-                    }),
-                    phase: match progress.phase {
-                        GoalPhase::Pursuing => "pursuing",
-                        GoalPhase::Paused => "paused",
-                        GoalPhase::PausedAtCap => "paused_at_cap",
-                        GoalPhase::Satisfied => "satisfied",
-                        GoalPhase::Ended => "ended",
-                    }
-                    .into(),
-                    last_reason: progress.last_reason,
-                    recovery: progress.recovery,
+                    progress: goal_snapshot(&progress),
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::ProviderChanged {
@@ -1400,6 +1459,7 @@ impl NativeLiveWireProjector {
 fn goal_snapshot(progress: &atomcode_coding::GoalProgress) -> LiveGoalSnapshot {
     use atomcode_coding::{GoalPhase, GoalTerminal};
     LiveGoalSnapshot {
+        control_id: progress.control_id.to_string(),
         active: progress.active,
         round: progress.round,
         elapsed_secs: progress.elapsed_secs,
@@ -3034,6 +3094,31 @@ pub(crate) async fn live_goal_stop(State(_state): State<AppState>) -> impl IntoR
     Json(serde_json::json!({"accepted": accepted}))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct LiveGoalActionReq {
+    session_id: String,
+    control_id: String,
+    action: crate::live_hub::LiveGoalAction,
+}
+
+/// Controls the goal belonging to the displayed live session.
+pub(crate) async fn live_goal_action(Json(req): Json<LiveGoalActionReq>) -> impl IntoResponse {
+    use crate::live_hub::HubError;
+    let Ok(control_id) = uuid::Uuid::parse_str(&req.control_id) else {
+        return Json(serde_json::json!({ "accepted": false, "error": "Invalid goal ID" }));
+    };
+    let error =
+        match crate::native_live::control_goal(&req.session_id, control_id, req.action).await {
+            Ok(()) => return Json(serde_json::json!({ "accepted": true })),
+            Err(HubError::RuntimeRejected(message)) => message,
+            Err(HubError::StaleBinding | HubError::RuntimeGenerationChanged { .. }) => {
+                "The live session has changed".into()
+            }
+            Err(_) => "The live runtime is unavailable".into(),
+        };
+    Json(serde_json::json!({ "accepted": false, "error": error }))
+}
+
 /// POST /live/goal/arm — synchronize the mobile composer's pre-send Goal mode
 /// with an attached TUI. No condition is known until either side submits text.
 pub(crate) async fn live_goal_arm(State(_state): State<AppState>) -> impl IntoResponse {
@@ -3484,6 +3569,7 @@ mod tests {
             source: McpConfigSource::Project,
             trust: false,
             auto_approve: vec![],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };

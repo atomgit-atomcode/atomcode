@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.2.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-5.2.9-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS%20PC%20%7C%20Windows-lightgrey" alt="platform">
@@ -72,7 +72,7 @@ Think of it as an open-source alternative to Claude Code / Cursor Agent, but run
 File & shell:
 
 - `read_file`, `write_file`, `edit_file`, `search_replace`
-- `bash`, `grep`, `glob`, `list_directory`, `change_dir`
+- `bash`, `grep`, `glob`, `list_directory`
 - `web_search`, `web_fetch`
 
 Code graph (language-aware code intelligence):
@@ -83,7 +83,7 @@ Code graph (language-aware code intelligence):
 
 Automation:
 
-- `auto_fix` — automatic lint/typecheck fix loop
+- `list_skills` — list available skills
 - `use_skill` — invoke a user-defined skill
 
 ### Grape Remote Workflows

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -242,7 +242,19 @@ impl fmt::Display for SessionStoreError {
                 limit,
                 actual,
             } => {
-                write!(f, "{kind} exceeds {limit} bytes/items (actual {actual})")
+                let over = actual.saturating_sub(*limit);
+                // No "the {kind} is" phrasing: many kinds are plural
+                // collections. The overflow sentinels report actual == limit,
+                // where "(over by 0)" would contradict "over budget".
+                if over > 0 {
+                    // No unit: some kinds count bytes, others items or lines.
+                    write!(
+                        f,
+                        "{kind} over budget: limit {limit}, got {actual} (over by {over})"
+                    )
+                } else {
+                    write!(f, "{kind} size exceeds the addressable range: got {actual}")
+                }
             }
             Self::FutureSchema {
                 kind,
@@ -324,6 +336,22 @@ pub struct CatalogEntry {
     pub needs_newer_version: bool,
     /// How the session was created. Legacy-only sessions read as `Manual`.
     pub origin: SessionOrigin,
+}
+
+/// A preview of a native event session and the delegated sessions it owns.
+#[derive(Debug)]
+pub struct SessionGcCandidate {
+    root: PathBuf,
+    members: Vec<GcMember>,
+    pub bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GcMember {
+    id: String,
+    updated_at: i64,
+    log_bytes: u64,
+    log_modified: Option<std::time::SystemTime>,
 }
 
 impl CatalogEntry {
@@ -2933,7 +2961,7 @@ impl SessionManager {
     ) -> SessionResult<(LoadedSession, Vec<LoggedEvent>)> {
         self.with_meta_lock(id, || {
             let meta = self.read_native_meta(id)?;
-            let (_, events) = self.read_event_log_bounded(id, false, usize::MAX)?;
+            let (_, events) = self.read_event_log_bounded(id, usize::MAX)?;
             let snapshot = super::events::snapshot_of(&events);
             let presentation = match self.read_presentation_bounded(id, usize::MAX) {
                 // An event session has display-only entries only if something
@@ -4170,7 +4198,15 @@ impl SessionManager {
                 self.delete(&child_lease)?;
             }
         }
-        let targets = [
+        self.delete_session_files(lease)?;
+        if let Some(rewind) = super::rewind_retention::rewind_root_for(&self.root) {
+            super::rewind_retention::remove_session_stores(&rewind, id);
+        }
+        Ok(())
+    }
+
+    fn delete_file_targets(&self, id: &str) -> SessionResult<[PathBuf; 16]> {
+        Ok([
             self.path_for(id, "snapshot")?,
             self.inflight_path(id)?,
             self.path_for(id, "rewind.json")?,
@@ -4190,7 +4226,13 @@ impl SessionManager {
             self.path_for(id, "replay")?,
             self.path_for(id, "controller")?,
             self.path_for(id, "index")?,
-        ];
+        ])
+    }
+
+    fn delete_session_files(&self, lease: &SessionLease) -> SessionResult<()> {
+        let id = lease.id();
+        self.validate_lease(lease)?;
+        let targets = self.delete_file_targets(id)?;
         for path in &targets {
             validate_delete_target(path)?;
         }
@@ -4210,14 +4252,171 @@ impl SessionManager {
         if let Ok(dir) = self.artifacts_dir(id) {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
-        // Its Code Rewind store only served `/rewind` for this session; nothing
-        // else reads it. Best-effort, like the artifacts: the session is gone.
-        // Named by the leased id, never by what a file says its id is; a
-        // delegated session (`<lead>~<name>`) has no store of its own.
-        if let Some(rewind) = super::rewind_retention::rewind_root_for(&self.root) {
-            super::rewind_retention::remove_session_stores(&rewind, id);
-        }
         Ok(())
+    }
+
+    fn gc_children(&self) -> BTreeMap<String, Vec<String>> {
+        let mut children = BTreeMap::<_, Vec<_>>::new();
+        for meta in self.every_meta() {
+            if let Some(parent) = meta.parent {
+                children.entry(parent).or_default().push(meta.id);
+            }
+        }
+        for ids in children.values_mut() {
+            ids.sort_unstable();
+        }
+        children
+    }
+
+    // Read only the index and log headers while walking the tree. The header
+    // keeps the original agent ID, which can differ from its storage ID.
+    fn gc_tree(
+        &self,
+        id: &str,
+        children: &BTreeMap<String, Vec<String>>,
+    ) -> SessionResult<Option<Vec<GcMember>>> {
+        let mut ids = vec![id.to_owned()];
+        let mut seen = BTreeSet::from([id.to_owned()]);
+        let mut members = Vec::new();
+        let mut index = 0;
+        while let Some(id) = ids.get(index) {
+            if !self.is_event_session(id) {
+                return Ok(None);
+            }
+            let meta = self.read_meta(id)?;
+            if meta.owner != StorageOwner::Native
+                || meta.needs_newer_version()
+                || (index == 0 && (meta.parent.is_some() || meta.origin != SessionOrigin::Manual))
+            {
+                return Ok(None);
+            }
+            let legacy = self.legacy_path(id)?;
+            match fs::symlink_metadata(&legacy) {
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_at(&legacy, error)),
+            }
+            let path = self.events_path(id)?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| io_at(&path, error))?;
+            let header = self.read_event_header(id)?;
+            members.push(GcMember {
+                id: id.clone(),
+                updated_at: meta.updated_at,
+                log_bytes: metadata.len(),
+                log_modified: metadata.modified().ok(),
+            });
+            for child in children.get(&header.id).into_iter().flatten() {
+                if !seen.insert(child.clone()) {
+                    return Ok(None);
+                }
+                ids.push(child.clone());
+            }
+            index += 1;
+        }
+        Ok(Some(members))
+    }
+
+    /// Preview one project's candidates with a shared child index and without
+    /// creating lease files. Results follow input order. A `None` result means
+    /// the session tree is busy or no longer eligible.
+    pub fn preview_gc(
+        &self,
+        sessions: &[(String, i64)],
+        cutoff: std::time::SystemTime,
+    ) -> Vec<SessionResult<Option<SessionGcCandidate>>> {
+        let children = self.gc_children();
+        sessions
+            .iter()
+            .map(|(id, updated_at)| self.preview_gc_tree(id, *updated_at, cutoff, &children))
+            .collect()
+    }
+
+    fn preview_gc_tree(
+        &self,
+        id: &str,
+        updated_at: i64,
+        cutoff: std::time::SystemTime,
+        children: &BTreeMap<String, Vec<String>>,
+    ) -> SessionResult<Option<SessionGcCandidate>> {
+        if self.lease_is_held(id)? {
+            return Ok(None);
+        }
+        let Some(members) = self.gc_tree(id, children)? else {
+            return Ok(None);
+        };
+        if members[0].updated_at != updated_at
+            || members
+                .iter()
+                .any(|member| member.log_modified.is_none_or(|time| time > cutoff))
+        {
+            return Ok(None);
+        }
+        let mut bytes = 0u64;
+        for member in &members {
+            if self.lease_is_held(&member.id)? {
+                return Ok(None);
+            }
+            bytes = bytes.saturating_add(self.gc_size(&member.id)?);
+        }
+        Ok(Some(SessionGcCandidate {
+            root: self.root.clone(),
+            members,
+            bytes,
+        }))
+    }
+
+    fn gc_size(&self, id: &str) -> SessionResult<u64> {
+        let paths = self.delete_file_targets(id)?.into_iter().chain([
+            self.path_for(id, "display-images")?,
+            self.artifacts_dir(id)?,
+        ]);
+        Ok(paths.map(directory_bytes).fold(0, u64::saturating_add))
+    }
+
+    /// Apply an exact preview. Hold every lease before deleting anything so
+    /// a busy descendant cannot be left behind by bulk cleanup.
+    pub fn apply_gc(&self, candidate: &SessionGcCandidate) -> SessionResult<Option<u64>> {
+        if self.root != candidate.root
+            || !fs::symlink_metadata(&self.root).is_ok_and(|meta| meta.is_dir())
+        {
+            return Ok(None);
+        }
+        let mut leases = Vec::with_capacity(candidate.members.len());
+        for member in &candidate.members {
+            match self.acquire_lease(&member.id) {
+                Ok(lease) => leases.push(lease),
+                Err(
+                    SessionStoreError::SessionInUse { .. } | SessionStoreError::NotFound { .. },
+                ) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let id = leases[0].id();
+        if self.gc_tree(id, &self.gc_children())?.as_ref() != Some(&candidate.members) {
+            return Ok(None);
+        }
+        for lease in &leases {
+            for path in self.delete_file_targets(lease.id())? {
+                validate_delete_target(&path)?;
+            }
+        }
+        let mut removed = 0u64;
+        for lease in leases.iter().rev() {
+            let before = self.gc_size(lease.id())?;
+            // Rewind repositories are keyed by worktree bucket and session ID,
+            // which are insufficient to prove ownership from this session lease.
+            // Their separate retention sweep handles them.
+            self.delete_session_files(lease)?;
+            removed = removed.saturating_add(before.saturating_sub(self.gc_size(lease.id())?));
+        }
+        Ok(Some(removed))
+    }
+
+    /// Best-effort logical file bytes under the product's session directory.
+    pub fn history_bytes(sessions_root: &Path) -> u64 {
+        directory_bytes(sessions_root.to_path_buf())
     }
 
     /// Load only `(turn_id, timestamp_ms)` from this session's bounded transcript.
@@ -4849,6 +5048,24 @@ fn finalize_catalog_scan(partials: Vec<BucketPartial>, mut scan: CatalogScan) ->
     scan
 }
 
+fn directory_bytes(path: PathBuf) -> u64 {
+    let mut pending = vec![path];
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        }
+    }
+    bytes
+}
+
 fn valid_project_bucket(bucket: &str) -> bool {
     bucket.len() == 16 && bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -5379,16 +5596,14 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
     // transcript append below would fail with ERROR_ACCESS_DENIED (os error 5).
     // Note: `write(true)` is IGNORED when `append(true)` is set (Rust std), so
-    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
-    // semantics are unchanged.
+    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here.
     options.create(true).append(true).read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
         // the end of the file but cannot truncate it; cutting off a torn tail
-        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
-        // by the append flag, so writes keep landing at the end of the file.
+        // (`set_len`) needs write access as well.
         options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
     }
     set_private_create_mode(&mut options);
@@ -5396,6 +5611,16 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
+    let mut file = file;
+    // Windows: `access_mode` above replaces the `FILE_APPEND_DATA` that
+    // `append(true)` maps to, so the handle's cursor starts at 0 and a plain
+    // write overwrites the head of the log instead of appending. Seek to the
+    // end so the name and the semantics agree on every caller — including
+    // test constructors of torn tails. (Writes that need a different position
+    // seek first, and Unix `O_APPEND` ignores the cursor for writes anyway.)
+    #[cfg(windows)]
+    file.seek(SeekFrom::End(0))
+        .map_err(|error| io_at(path, error))?;
     Ok(file)
 }
 
@@ -6356,6 +6581,43 @@ mod tests {
                 actual: 9
             })
         ));
+    }
+
+    #[test]
+    fn too_large_display_says_what_over_by_how_much() {
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "reference projection",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "reference projection over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // Plural kinds must not read as a singular subject–verb pair.
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session events",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "session events over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // The overflow sentinels report actual == limit: "over by 0" would
+        // contradict "over budget".
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session file",
+                limit: usize::MAX,
+                actual: usize::MAX,
+            }
+            .to_string(),
+            format!(
+                "session file size exceeds the addressable range: got {}",
+                usize::MAX
+            )
+        );
     }
 
     #[test]
@@ -9247,6 +9509,129 @@ mod tests {
 
         mgr.delete(&lease).unwrap();
         assert!(!mgr.snapshot_path("s1").unwrap().exists());
+    }
+
+    #[test]
+    fn gc_requires_an_unchanged_session_tree_with_every_member_idle() {
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        for (id, header_id, parent) in [
+            ("lead", "lead", None),
+            ("lead~scout", "lead/scout", Some("lead".to_owned())),
+        ] {
+            let lease = mgr.acquire_lease(id).unwrap();
+            let mut meta = SessionMeta::new(id, "/workspace", 1);
+            meta.owner = StorageOwner::Native;
+            meta.parent = parent;
+            mgr.create_event_session(&lease, &SessionHeader::new(header_id), &meta)
+                .unwrap();
+        }
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let preview = || {
+            mgr.preview_gc(&[("lead".to_owned(), 1)], cutoff)
+                .remove(0)
+                .unwrap()
+        };
+        let candidate = preview().unwrap();
+        assert!(candidate.bytes > 0);
+        assert!(mgr.is_event_session("lead"));
+        let child = mgr.acquire_lease("lead~scout").unwrap();
+        assert!(preview().is_none());
+        assert!(mgr.apply_gc(&candidate).unwrap().is_none());
+        // A valid append after the preview invalidates the plan even if the
+        // index has not recorded another turn yet.
+        mgr.append_events(
+            &child,
+            &[LoggedEvent {
+                seq: 1,
+                at: 1,
+                event: SessionEvent::Stopped { turn: 0 },
+            }],
+        )
+        .unwrap();
+        drop(child);
+        assert!(mgr.apply_gc(&candidate).unwrap().is_none());
+        assert!(mgr.is_event_session("lead"));
+        assert!(mgr.is_event_session("lead~scout"));
+        let candidate = preview().unwrap();
+        assert_eq!(mgr.apply_gc(&candidate).unwrap(), Some(candidate.bytes));
+        assert!(!mgr.is_event_session("lead"));
+        assert!(!mgr.is_event_session("lead~scout"));
+    }
+
+    #[test]
+    fn gc_preserves_duplicate_ids_rewind_stores_and_migration_backups() {
+        use atomcode_kernel::session::SessionHeader;
+
+        let user = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::sessions_root(user.path());
+        let first = SessionManager::with_root(sessions.join("0123456789abcdef"));
+        let second = SessionManager::with_root(sessions.join("fedcba9876543210"));
+        let create = |manager: &SessionManager| {
+            let lease = manager.acquire_lease("same-id").unwrap();
+            let mut meta = SessionMeta::new("same-id", "/workspace", 1);
+            meta.owner = StorageOwner::Native;
+            manager
+                .create_event_session(&lease, &SessionHeader::new("same-id"), &meta)
+                .unwrap();
+            lease
+        };
+        drop(create(&first));
+        let active = create(&second);
+        let rewind = user
+            .path()
+            .join("rewind")
+            .join("fedcba9876543210")
+            .join("same-id");
+        fs::create_dir_all(&rewind).unwrap();
+        let marker = rewind.join("atomcode-rewind-version");
+        fs::write(&marker, "atomcode-rewind-v1").unwrap();
+        let migrated = first.root().join("same-id.snapshot.migrated");
+        fs::write(&migrated, "original backup").unwrap();
+
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let candidate = first
+            .preview_gc(&[("same-id".into(), 1)], cutoff)
+            .remove(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.apply_gc(&candidate).unwrap(), Some(candidate.bytes));
+        assert!(!first.is_event_session("same-id"));
+        assert!(second.is_event_session(active.id()));
+        assert!(marker.is_file());
+        assert_eq!(fs::read_to_string(migrated).unwrap(), "original backup");
+    }
+
+    #[test]
+    fn gc_preview_reads_only_the_event_header_of_large_logs() {
+        use atomcode_kernel::session::SessionHeader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let lease = manager.acquire_lease("large").unwrap();
+        let mut meta = SessionMeta::new("large", "/workspace", 1);
+        meta.owner = StorageOwner::Native;
+        manager
+            .create_event_session(&lease, &SessionHeader::new("large"), &meta)
+            .unwrap();
+        drop(lease);
+        let bytes = MAX_JSONL_BYTES + 1;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(manager.events_path("large").unwrap())
+            .unwrap()
+            .set_len(bytes as u64)
+            .unwrap();
+
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let mut candidates = manager.preview_gc(&[("large".into(), 1)], cutoff);
+        assert!(candidates.remove(0).unwrap().unwrap().bytes > bytes as u64);
+        assert!(matches!(
+            manager.load_events("large"),
+            Err(SessionStoreError::TooLarge { .. })
+        ));
     }
 
     #[test]

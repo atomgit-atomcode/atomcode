@@ -81,3 +81,6 @@ pub mod provider_headers;
 
 pub mod mode_models;
 pub mod vision_preprocessor;
+
+#[cfg(windows)]
+pub mod windows_private_file;

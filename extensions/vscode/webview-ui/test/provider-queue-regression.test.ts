@@ -40,7 +40,7 @@ const vscodeMock = {
       };
     },
   },
-  window: {},
+  window: { onDidChangeWindowState: () => ({ dispose() {} }) },
   env: { language: 'en' },
   commands: {},
   l10n: { t: (value: string) => value },

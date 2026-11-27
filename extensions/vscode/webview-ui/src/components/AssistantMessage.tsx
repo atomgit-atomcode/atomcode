@@ -77,6 +77,7 @@ function AssistantBlock({ block, streaming, searchQuery }: { block: MessageBlock
         ? <ArtifactBlock artifact={block.artifact} />
         : <ArtifactCodeView artifact={block.artifact} />;
     case 'permission':
+      if (block.request.status === 'expired') return <ExpiredPermission />;
       return block.request.status === 'pending' || block.request.status === 'submitting'
         ? <PermissionRequest request={block.request} />
         : null;
@@ -85,6 +86,11 @@ function AssistantBlock({ block, streaming, searchQuery }: { block: MessageBlock
     default:
       return null;
   }
+}
+
+function ExpiredPermission() {
+  const t = useT();
+  return <span className="tool-name-secondary">{t('permission.expired')}</span>;
 }
 
 function getDotClass(isStreaming: boolean, hasError: boolean): string {

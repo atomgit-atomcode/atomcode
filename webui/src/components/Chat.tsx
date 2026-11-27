@@ -5,10 +5,11 @@ import { MessageImages } from './MessageImages';
 import { displayHistoryUser, displayImageMarkers } from '../lib/historyMessages';
 import { preservedHistoryPrefix } from '../lib/historyPaging';
 import { GoalRecoveryStatus } from './GoalRecoveryStatus';
+import { LiveGoalBar } from './LiveGoalBar';
 import { GitBranch } from './GitBranch';
 import { HooksDialog } from './HooksDialog';
 import { TaskSpecifications } from './TaskSpecifications';
-import { ApiCallError, importPatchFile, taskSpecs } from '../api';
+import { ApiCallError, getTurnRecap, importPatchFile, taskSpecs } from '../api';
 import { createPortal } from 'preact/compat';
 import { Fragment, type ComponentChildren } from 'preact';
 import { hasChatErrorNotice, processSummary, turnProcesses, type TurnProcess } from '../lib/turnProcess';
@@ -55,7 +56,7 @@ import { rankSessionReferences, sessionReferenceToken, sessionReferenceTokens } 
 import { sessionReferenceCandidates } from '../api';
 import { VNode } from 'preact';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { SseEventTooLargeError, streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSessionPage, type DisplayHistoryCursor, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, postModeSelection, getModeModels, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, listDir, searchFiles, changeDir, postConfigReload, postCommand, getLivePersona, followUp, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -146,6 +147,8 @@ import { artifactsByAssistantIndex, type TurnArtifact } from '../lib/turnArtifac
 interface Message {
   retryDiagnostics?: string[];
   turnStop?: string;
+  recapKey?: string;
+  recap?: string;
   sourceSeq?: number;
   specPinned?: boolean;
   contextSummary?: boolean;
@@ -166,6 +169,8 @@ interface Message {
   ts?: number;
   /** Browser-local correlation for an optimistic /live submission. Never persisted. */
   pendingSteerId?: string;
+  /** Correlates the optimistic messages for a /chat request through timeline archiving. */
+  chatRequestId?: string;
   /** Local viewport anchor; never part of session persistence. */
   turnAnchorId?: string;
 }
@@ -245,7 +250,7 @@ function messageHasTools(m: Message): boolean {
 
 /** Max attached images per message and per-image byte cap (raw file size). */
 const MAX_IMAGES = 6;
-const MAX_IMAGE_MB = 2;
+const MAX_IMAGE_MB = 5;
 const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
 
 /** Read a File into an ImageData (base64, no data-URL prefix). */
@@ -557,6 +562,42 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   // 只有当前 tab 实际提交过回合，或从 /live 观察到 running=true，终态才有
   // 通知资格。初始/重连时重放的 idle state 不能伪装成一次新完成事件。
   const notificationTurnActiveRef = useRef(false);
+  const recapTurn = useRef({ away: false, autonomous: false });
+  const recapAutonomy = useRef({ goal: false, loop: false });
+
+  function observeTurnStart(autonomous = false) {
+    notificationTurnActiveRef.current = true;
+    turnStartedAtRef.current = Date.now();
+    recapTurn.current = { away: document.hidden, autonomous };
+  }
+
+  function finishAssistantTurn(
+    session: string | null,
+    stopReason: string | undefined,
+    stats: TurnStats | undefined,
+    autonomous = false,
+  ) {
+    const ts = Date.now();
+    const elapsed = stats?.duration_ms ?? ts - (turnStartedAtRef.current ?? ts);
+    const turnId = stats?.turn_id;
+    const recapKey = session && turnId && stopReason === 'stopped' && !autonomous
+      && !recapTurn.current.autonomous && notificationTurnActiveRef.current
+      // The last placeholder can belong to a steer that is about to become
+      // the next turn. Wait for a terminal with an unambiguous assistant row.
+      && (!syncRef.current || pendingSteersRef.current.length === 0)
+      && (elapsed >= 120_000 || recapTurn.current.away || document.hidden)
+      ? `${session}/${turnId}` : undefined;
+    stampLastAssistantCompletion(ts, stopReason, session, recapKey);
+    if (!recapKey || !session || !turnId) return;
+    const generation = sessionGenerationRef.current;
+    void getTurnRecap(session, turnId).then(text => {
+      if (!text || activeIdRef.current !== session || generation !== sessionGenerationRef.current) return;
+      setMessages(current => current.map(message =>
+        message.recapKey === recapKey ? { ...message, recap: text } : message));
+    }).catch(() => {
+      // An unavailable auxiliary result leaves the completed turn usable.
+    });
+  }
   function finishTurnNotification(info: {
     stopReason?: string;
     sessionId?: string;
@@ -1358,8 +1399,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     });
     scrollRestorationRef.current = restore;
     const visibility = () => {
-      if (document.visibilityState === 'hidden') restore.suspend();
-      else restore.resume();
+      if (document.hidden) {
+        if (notificationTurnActiveRef.current) recapTurn.current.away = true;
+        restore.suspend();
+      } else restore.resume();
     };
     const pagehide = () => restore.suspend();
     const pageshow = () => restore.resume();
@@ -1578,7 +1621,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // events. Backoff caps the retry rate; after a run of failures (daemon
     // genuinely gone) we fall back to non-sync so the user isn't stuck.
     let attempt = 0;
-    const scheduleReconnect = (startedAt: number) => {
+    const scheduleReconnect = (startedAt: number, error?: unknown) => {
       // Superseded by a newer stream (session switch / manual toggle / watchdog)
       // — that one owns reconnection now.
       if (controller.signal.aborted) return;
@@ -1590,7 +1633,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // first byte would pin backoff at 1s forever.
       if (Date.now() - startedAt >= 30000) attempt = 0;
       attempt += 1;
-      if (attempt > 6) {
+      // A snapshot beyond the event limit can replay on every reconnect.
+      if (error instanceof SseEventTooLargeError || attempt > 6) {
         stopLiveStream();
         liveLifecycleRef.current = createLiveLifecycleState();
         restorePendingSteers();
@@ -1599,8 +1643,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         setQueued([]);
         setLivePending(null);
         setUserInputReq(null);
-        setHistoryHint(t('sync.reconnectFailed'));
-        pushNoticeToLastAssistant(t('sync.reconnectFailed'));
+        const message = t('sync.reconnectFailed');
+        setHistoryHint(message);
+        pushNoticeToLastAssistant(error instanceof SseEventTooLargeError ? message + ' ' + error.message : message);
         return;
       }
       const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
@@ -1627,7 +1672,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         },
       )
         .then(() => scheduleReconnect(startedAt)) // clean server close → reconnect
-        .catch(() => scheduleReconnect(startedAt)); // error → reconnect
+        .catch(error => scheduleReconnect(startedAt, error)); // error → reconnect
     };
     run();
   }
@@ -1814,17 +1859,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   // ── Live event handler ──
   function onLiveEvent(e: LiveWireEvent) {
     if (e.type === 'loop_changed') {
+      recapAutonomy.current.loop = e.active;
       setLoopSampledAt(Date.now());
       setLoopProgress(e.active ? e : null);
       return;
     }
     if (e.type === 'goal_changed') {
+      recapAutonomy.current.goal = e.active;
       setGoalSampledAt(Date.now());
       setGoalProgress(e);
       return;
     }
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
+      recapAutonomy.current = { goal: !!e.goal?.active, loop: !!e.loop_progress?.active };
       promptHistoryRef.current.reset();
       promptHistoryRevision.current++;
       liveSessionObservationRef.current++;
@@ -1974,6 +2022,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // 重启 SSE 连接以取得新会话的 authoritative snapshot 和 replay window。
     if (e.type === 'session_switched') {
       liveSessionObservationRef.current++;
+      if (liveSessionIdRef.current !== e.session_id) setGoalProgress(null);
       if (noticeAfterSwitchRef.current?.text === t('browse.switchBusy')) {
         noticeAfterSwitchRef.current = null;
       }
@@ -1988,6 +2037,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       const alreadyViewing = activeIdRef.current === e.session_id;
       activeIdRef.current = e.session_id;
       if (!alreadyViewing) {
+        recapAutonomy.current = { goal: false, loop: false };
+        notificationTurnActiveRef.current = false;
+        turnStartedAtRef.current = null;
         sessionGenerationRef.current += 1;
         onSessionId(e.session_id);
         todoTitlesRef.current.clear();
@@ -2062,8 +2114,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
 
       case 'state': {
         if (e.running && !notificationTurnActiveRef.current) {
-          notificationTurnActiveRef.current = true;
-          turnStartedAtRef.current = Date.now();
+          observeTurnStart(recapAutonomy.current.goal || recapAutonomy.current.loop);
         }
         const lifecycle = reduceLiveLifecycle(liveLifecycleRef.current, {
           type: 'state',
@@ -2086,7 +2137,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (e.running) setTurnStats(null);
         else if (terminal) setTurnStats(completedTurnStats(e.stats, e.stop_reason));
         if (terminal) {
-          stampLastAssistantCompletion(Date.now(), e.stop_reason);
+          finishAssistantTurn(liveSessionIdRef.current, e.stop_reason, e.stats,
+            recapAutonomy.current.goal || recapAutonomy.current.loop);
           finishTodoTurn();
           if (terminal.discardQueued) {
             // Abnormal terminal (cancel / error): the kernel CLEARS its steer
@@ -2270,7 +2322,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   /** Stamp the assistant when the turn actually finishes. The optimistic
    *  placeholder intentionally has no clock, keeping reply completion distinct
    *  from the user's submission time. */
-  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current) {
+  function stampLastAssistantCompletion(ts = Date.now(), stopReason?: string, scope = activeIdRef.current, recapKey?: string) {
     const viewport = scrollRef.current;
     const readingProcess = processReadIntent.current && viewport
       && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > BOTTOM_SLACK;
@@ -2285,6 +2337,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (prev[index].role !== 'assistant') continue;
         const next = prev.slice();
         next[index] = { ...next[index], ts: next[index].ts ?? ts, turnStop: stopReason ?? next[index].turnStop, parts: settlePendingToolParts(next[index].parts) };
+        if (recapKey) next[index].recapKey = recapKey;
         return next;
       }
       return prev;
@@ -2300,6 +2353,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   function reportFailure(text: string) {
     setHistoryHint(text);
     pushCommandNotice(text);
+  }
+
+  function restoreDraft(text: string, images: ImageData[]) {
+    setInput((current) => [text, current].filter(Boolean).join('\n'));
+    setPendingImages((current) => [...images, ...current]);
+  }
+
+  function showOversizedDraft(text: string, images: ImageData[]) {
+    restoreDraft(text, images);
+    setAttachError(t(images.length ? 'attach.requestTooLarge' : 'chat.requestTooLarge'));
   }
 
   function pushCommandNotice(text: string, contextSummary = false) {
@@ -2870,7 +2933,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       case 'done': {
         setCompacting(false);
         // Every terminal keeps successful todo changes and drops unresolved previews.
-        stampLastAssistantCompletion(Date.now(), event.stop_reason, event.session_id);
+        finishAssistantTurn(event.session_id, event.stop_reason, event.stats);
         finishTodoTurn();
         // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空，
         // 并标记其历史「已就位」（就是当前画布），防止 project_hash 回填后重新加载覆盖。
@@ -3091,8 +3154,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       setBusy(true);
       // 回合起点只记录一次（steer 不重置）：供终态通知计算 durationMs。
       if (!steering) {
-        notificationTurnActiveRef.current = true;
-        turnStartedAtRef.current = Date.now();
+        observeTurnStart(recapAutonomy.current.goal || recapAutonomy.current.loop);
       }
       const now = Date.now();
       const pendingSteer: PendingLiveSteer = {
@@ -3117,6 +3179,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
+      const requestGeneration = sessionGenerationRef.current;
       try {
         const submittedProvider = provider;
         const receipt = await postLiveMessage(
@@ -3157,6 +3220,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
           setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
         }
       } catch (error) {
+        if (requestGeneration !== sessionGenerationRef.current) return false;
         // Roll back the optimistic append — the send never reached the server.
         const echoIndex = pendingSelfEchoRef.current.findIndex(
           (pending) => pending.id === pendingSteer.id,
@@ -3164,14 +3228,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         if (echoIndex >= 0) pendingSelfEchoRef.current.splice(echoIndex, 1);
         setMessages((prev) => prev.filter((message) => message.pendingSteerId !== pendingSteer.id));
         setPendingSteers((pending) => pending.filter((item) => item.id !== pendingSteer.id));
-        if (steering) {
-          setInput((current) => [text, current].filter(Boolean).join('\n'));
-          setPendingImages((current) => [...images, ...current]);
-        } else {
+        if (!steering) {
           setBusy(false);
           notificationTurnActiveRef.current = false;
           turnStartedAtRef.current = null;
         }
+        if (error instanceof ApiCallError && error.status === 413) {
+          showOversizedDraft(text, images);
+          return false;
+        }
+        if (steering) restoreDraft(text, images);
         setQueued([]);
         reportFailure(t('chat.connError', { msg: String(error) }));
         return false;
@@ -3185,23 +3251,24 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // ── Normal path ──
     setBusy(true);
     // 回合起点只记录一次：供终态通知计算 durationMs。
-    notificationTurnActiveRef.current = true;
-    turnStartedAtRef.current = Date.now();
+    observeTurnStart();
     // 消息发出后延迟刷新侧栏列表，给后端落盘时间；
     // done 事件中 onSessionId 会再刷一次确保更新。
     setTimeout(() => onLiveTurnDone?.(), 200);
 
     // Push user message + empty assistant placeholder
-    const now = Date.now();
+    const requestId = randomId();
     setMessages((prev) => [
       ...prev,
-      { role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined, ts: now, turnAnchorId },
-      { role: 'assistant', parts: [] },
+      {
+        role: 'user', parts: [{ kind: 'text', text }], images: images.length ? images : undefined,
+        ts: Date.now(), turnAnchorId, chatRequestId: requestId,
+      },
+      { role: 'assistant', parts: [], chatRequestId: requestId },
     ]);
 
     const controller = new AbortController();
     abortRef.current = controller;
-    const requestId = randomId();
     requestIdRef.current = requestId;
     const requestGeneration = sessionGenerationRef.current;
     let keepStopAlias = false;
@@ -3244,6 +3311,14 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         controller.signal.aborted,
       );
       const aborted = err instanceof Error && err.name === 'AbortError';
+      if (stillCurrent && err instanceof ApiCallError && err.status === 413) {
+        setMessages((prev) => prev.filter((message) => message.chatRequestId !== requestId));
+        setBusy(false);
+        notificationTurnActiveRef.current = false;
+        turnStartedAtRef.current = null;
+        showOversizedDraft(text, images);
+        return false;
+      }
       if (!aborted && stillCurrent) {
         // Transport loss is not a turn terminal. Keep the request alias so the
         // user can retry the existing stop protocol, but release the visual
@@ -3314,6 +3389,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     // 清空输入框（无论立即发送还是排队）。
     setInput('');
     setPendingImages([]);
+    setAttachError(null);
     // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
@@ -3693,7 +3769,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   async function addImageFiles(files: File[] | FileList) {
     const arr = Array.from(files).filter((f) => f.type.startsWith('image/'));
     if (arr.length === 0) return;
-    // 严格拦截超过 2M 的图片，并提示用户（其余正常入列）。
+    // 提示超限图片，其余正常入列。
     const oversized = arr.filter((f) => f.size > MAX_IMAGE_BYTES);
     if (oversized.length > 0) {
       setAttachError(t('attach.tooLarge', { mb: String(MAX_IMAGE_MB) }));
@@ -4100,6 +4176,10 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
 
   // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
   const canStop = busy || recoveryPolicy.allowStop || Boolean(goalProgress?.recovery) || Boolean(loopProgress?.recovery);
+  const goalBarSession = sync && sessionId === liveSessionIdRef.current ? sessionId : null;
+  const goalControlId = goalProgress?.control_id;
+  const showGoalBar = goalBarSession && goalControlId !== undefined && goalProgress?.condition?.trim()
+    && (goalProgress.active || goalProgress.phase === 'paused' || goalProgress.phase === 'paused_at_cap');
   const inputBox = (
     <div class={'input-box' + (messages.length > 0 ? ' can-collapse' : '') + (canStop ? ' is-running' : '') + (pendingImages.length || attachError || currentTurnModel || (!sync && busy && provider !== runtimeModel?.provider) ? ' has-input-detail' : '')}>
       {specPicker!==null&&sessionId&&createPortal(<TaskSpecifications key={sessionId} sessionId={sessionId} running={busy} initial={specPicker} onChanged={updateSpecState} onClose={()=>setSpecPicker(null)}/>,document.body)}
@@ -4369,7 +4449,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       key={`live:${livePending.approval_id}`}
       req={{ session_id: '', tool_name: livePending.tool_name, reason: livePending.reason, call_id: livePending.call_id, arguments: livePending.arguments, allow_all_bash: livePending.allow_all_bash, project_rule: livePending.project_rule }}
       onDone={() => setLivePending((cur) => resolvePendingAfterDecision(cur, livePending.call_id, livePending.approval_id))}
-      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); if (!result.accepted) throw new Error(t('perm.requestExpired')); }}
+      onDecide={async (decision, toolName) => { const result = await postLivePermission(decision, toolName, livePending.call_id, livePending.approval_id); return result.accepted; }}
     />
   );
 
@@ -4855,6 +4935,15 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
         </div>
       )}
       <div class="input-container">
+        {showGoalBar && goalProgress && (
+          <LiveGoalBar
+            key={`${goalBarSession}:${goalControlId}`}
+            goal={goalProgress}
+            controlId={goalControlId}
+            sampledAt={goalSampledAt}
+            sessionId={goalBarSession}
+          />
+        )}
         {goalProgress?.recovery && (
           <GoalRecoveryStatus recovery={goalProgress.recovery} sampledAt={goalSampledAt} />
         )}
@@ -5194,7 +5283,8 @@ function AssistantMessageView({
   const groups = pollGroups ?? groupEmptyPolls(search.trim() ? [] : [msg]);
   const onlyHiddenPolls = msg.parts.every(part => part.kind === 'tool'
     ? groups.hidden.has(part.tool.id) : part.kind === 'text' && !part.text.trim());
-  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length) return null;
+  const recap = isLastInTurn && !streaming ? msg.recap : undefined;
+  if (onlyHiddenPolls && !streaming && !copyBtn && !showTimestamp && artifacts.length === 0 && !msg.retryDiagnostics?.length && !recap) return null;
 
   return (
     <div class={cls} ref={searchRef}>
@@ -5240,6 +5330,11 @@ function AssistantMessageView({
           {/* One timestamp per user turn: intermediate assistant/tool rounds share
               the turn's persisted timestamp but must not repeat it in the timeline. */}
           {showTimestamp && <div class="msg-time">{timeLabel}</div>}
+        </div>
+      )}
+      {recap && (
+        <div class="turn-recap" role="status">
+          <span class="turn-recap-label">{t('chat.turnRecap')}</span>{' · '}{recap}
         </div>
       )}
     </div>

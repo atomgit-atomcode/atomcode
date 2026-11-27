@@ -228,6 +228,7 @@ impl Presentation {
             // recognition is the model's crutch for a picture it cannot see, not
             // the conversation, so it stays out of the way until a click asks.
             ("vl_caption", Showing::Folded),
+            ("review_assignment", Showing::Folded),
             ("provider_diagnostic", Showing::Folded),
             // A slash invocation is the visible request; its expanded SKILL.md
             // remains available under a compact `⎿ Skill: name` lid.
@@ -611,11 +612,12 @@ impl Presentation {
 /// by default to `● 后台「…」的结果回来了  点击展开`, with the conversation that
 /// started the job answering under it — and, left out of this list, a row that
 /// promised a click and answered none.
-const CLICKABLE: [&str; 8] = [
+const CLICKABLE: [&str; 9] = [
     "provider_diagnostic",
     "tool_call",
     "reasoning",
     "vl_caption",
+    "review_assignment",
     "skill",
     "injected:background",
     "injected:peer",
@@ -1525,6 +1527,21 @@ pub struct Host {
     /// `crate::providers::key` for one press and emptied whenever a form is
     /// left — see [`Host::providers_key`].
     providers_secret: Mutex<String>,
+    /// How many times each provider account's connection has been changed or
+    /// deleted while this screen ran.
+    ///
+    /// On the host rather than on the panel: an add written after the panel
+    /// closed is still checked against it, so an add aimed at a connection that
+    /// has since been replaced — or an account since deleted, which the port
+    /// would quietly re-create — is dropped instead of written.
+    provider_generations: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// How many times the providers panel has been opened: each opening gets
+    /// its own number (`Panel::instance`).
+    provider_openings: std::sync::atomic::AtomicU64,
+    /// Server rows whose add is in flight, by (account, model) — kept here
+    /// rather than only on the panel, so a panel closed and opened again while
+    /// a write is on its way still says 添加中… and does not send it twice.
+    provider_adding: Mutex<std::collections::BTreeSet<(String, String)>>,
     /// The next token a pick out of the bottom sheet is stamped with
     /// ([`Host::sheet_key`], [`Host::settle_sheet_pick`]).
     sheet_picks: std::sync::atomic::AtomicU64,
@@ -1812,6 +1829,9 @@ impl Host {
             asks: crate::ask::Asks::new(),
             secrets: crate::secret::Secrets::new(),
             providers_secret: Mutex::new(String::new()),
+            provider_generations: Mutex::new(std::collections::BTreeMap::new()),
+            provider_openings: std::sync::atomic::AtomicU64::new(0),
+            provider_adding: Mutex::new(std::collections::BTreeSet::new()),
             sheet_picks: std::sync::atomic::AtomicU64::new(1),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
@@ -1871,6 +1891,7 @@ impl Host {
         self.asks.refuse_all();
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
+        m.member_cwd = None;
         m.team_return = None;
         m.team_cursor = None;
         // The keyboard went with the panel: the new session's team is not up
@@ -1998,12 +2019,27 @@ impl Host {
             .is_some_and(|rect| rect.h == 1 && rect.contains(x, y))
     }
 
+    /// A press on the task list. Folded, any of its rows opens it — the
+    /// header that says `点击展开`, an item, and the `+N 更多` row, which is the
+    /// one that most says there is more to see and was the one that did
+    /// nothing. Open, only the header folds it again: the rows under it are
+    /// what the wheel scrolls, and a press while reading one should not take
+    /// the list away. The margin above the header is not the panel.
     pub fn toggle_todo_at(&self, x: u16, y: u16) -> bool {
-        let rect = self.hits.lock().expect("hits poisoned").todo;
-        if !rect.is_some_and(|rect| rect.contains(x, y) && y == rect.y + u16::from(rect.h >= 2)) {
+        let Some(rect) = self.hits.lock().expect("hits poisoned").todo else {
+            return false;
+        };
+        let header = rect.y + u16::from(rect.h >= 2);
+        let mut moment = self.moment.write().expect("moment poisoned");
+        let hit = rect.contains(x, y)
+            && if moment.todo_expanded {
+                y == header
+            } else {
+                y >= header
+            };
+        if !hit {
             return false;
         }
-        let mut moment = self.moment.write().expect("moment poisoned");
         moment.todo_expanded = !moment.todo_expanded;
         moment.todo_offset = 0;
         true
@@ -2136,7 +2172,10 @@ impl Host {
             .expect("presentation poisoned")
             .set_undone(turns.clone(), rewound);
         if changed {
-            self.moment.write().expect("moment poisoned").undone = turns;
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.undone = turns;
+            // Both a model prediction and a todo suggestion refer to the old history.
+            m.suggestion = None;
         }
         changed
     }
@@ -2327,11 +2366,6 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
-        self.absorb_logged_with_members(logged, 0);
-    }
-
-    /// Live-only context, captured before immutable transcript blocks are emitted.
-    pub fn absorb_logged_with_members(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         {
             let mut m = self.moment.write().expect("moment poisoned");
@@ -2409,7 +2443,7 @@ impl Host {
         // result landing on that lid can still change how many rows the lid
         // draws, since it carries the result (`summary_lines`).
         self.pinned(true, || {
-            self.fold(logged, members_working);
+            self.fold(logged);
         });
     }
 
@@ -2418,7 +2452,7 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, logged: &LoggedEvent, members_working: usize) {
+    fn fold(&self, logged: &LoggedEvent) {
         let fact = &logged.event;
         // What this fold appended, as the blocks themselves: a fact may open
         // several at once (one per tool call in a message), and each of them is a
@@ -2430,10 +2464,7 @@ impl Host {
             let before = stream.len();
             let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream
-                    .writer(p.id())
-                    .in_dir(dir.clone())
-                    .with_members_working(members_working);
+                let mut w = stream.writer(p.id()).in_dir(dir.clone());
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -2458,6 +2489,9 @@ impl Host {
         // here because this is where facts land, and consecutive repeats are
         // dropped the way every shell drops them.
         if let SessionEvent::UserMessage { text, .. } = fact {
+            if crate::content::review_assignment_title(text).is_some() {
+                return;
+            }
             // Recall the WORDS, not the picture. For a text-only model the runtime
             // folds a VL recognition into the message so the model can read it;
             // that is not what the person typed, and an up-arrow must not drop a
@@ -3472,7 +3506,12 @@ impl Host {
                 m.mcp_panel = None;
                 m.bg_panel = None;
                 m.sheet = None;
-                m.providers_panel = Some(crate::providers::Panel::new());
+                let mut panel = crate::providers::Panel::new();
+                panel.instance = self
+                    .provider_openings
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                m.providers_panel = Some(panel);
                 true
             }
         }
@@ -3489,7 +3528,19 @@ impl Host {
         if !self.providers_open() && !self.toggle_providers() {
             return false;
         }
-        self.show_providers_tab(crate::providers::Tab::Models);
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        if let Some(panel) = m.providers_panel.as_mut() {
+            if panel.form.take().is_some() {
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+            }
+            panel.from_models = false;
+            panel.show(crate::providers::Screen::Models);
+            view.settle_cursor(panel);
+        }
         true
     }
 
@@ -3512,7 +3563,7 @@ impl Host {
         // 页签先落到模型页:`show` 会顺手清掉挑强度那一层,所以它必须在
         // `efforts` 之前跑 —— 否则手打 `/model <id>` 进来时页签停在账号页,
         // Esc 退一层会落到账号列表上。
-        panel.show(crate::providers::Tab::Models);
+        panel.show(crate::providers::Screen::Models);
         panel.efforts = Some(crate::providers::EffortPick { model, levels });
         panel.query.clear();
         panel.cursor = 0;
@@ -3558,39 +3609,20 @@ impl Host {
         true
     }
 
-    /// Start model selection immediately after saving a new connection.
-    pub fn connect_provider_models(&self, account: &str) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        let view = m.providers.clone();
-        if !view
-            .account(account)
-            .is_some_and(|row| row.configured && !row.managed)
-        {
-            return false;
-        }
-        let Some(panel) = m.providers_panel.as_mut() else {
-            return false;
-        };
-        let Some(mut form) = crate::providers::ModelForm::add(&view, Some(account)) else {
-            return false;
-        };
-        form.connecting = true;
-        form.advanced = false;
-        form.focus = crate::providers::ModelField::Model;
-        form.start_discovery();
-        panel.form = Some(crate::providers::Form::Model(form));
-        true
-    }
-
+    /// The request an unsaved Ollama connection's listing has to answer.
     pub fn provider_discovery_id(&self) -> Option<u64> {
         let m = self.moment.read().expect("moment poisoned");
         match m.providers_panel.as_ref()?.form.as_ref()? {
             crate::providers::Form::Account(form) => form.discovery.as_ref().map(|d| d.id),
-            crate::providers::Form::Model(form) if form.picking.is_some() => {
-                Some(form.discovery_id)
-            }
-            _ => None,
+            crate::providers::Form::Model(_) => None,
         }
+    }
+
+    /// The request `account`'s listing has to answer, while the panel waits
+    /// for one.
+    pub fn provider_listing_request(&self, account: &str) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        m.providers_panel.as_ref()?.discovery_request(account)
     }
 
     pub fn provider_draft_discovered(
@@ -3609,21 +3641,259 @@ impl Host {
         }
     }
 
-    /// A cancelled request cannot fill a replacement picker, even for the same account.
+    /// A listing for `account` came back. Taken only when it answers the
+    /// request the panel is waiting on: one asked for a connection since
+    /// replaced must not fill the page of the new one. True when taken.
     pub fn providers_discovered(
         &self,
         account: &str,
         request: u64,
         listed: Result<Vec<crate::providers::Discovered>, String>,
-    ) -> Option<String> {
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        panel.discovered(&view, account, request, listed)
+    }
+
+    /// Walk into a just-added account's page. The listing the connect form
+    /// already fetched fills it when there is one; else the page asks, and the
+    /// step to send for that is returned.
+    pub fn enter_provider_detail(
+        &self,
+        account: &str,
+        listed: Option<Vec<crate::providers::Discovered>>,
+    ) -> Option<crate::providers::Step> {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.providers.clone();
         let panel = m.providers_panel.as_mut()?;
-        if !matches!(&panel.form, Some(crate::providers::Form::Model(form)) if form.discovery_id == request)
+        panel.show(crate::providers::Screen::Detail(account.to_string()));
+        let step = panel.start_discovery(account);
+        let request = panel.discovery_request(account)?;
+        let step = match listed {
+            Some(listed) => {
+                panel.discovered(&view, account, request, Ok(listed));
+                None
+            }
+            None => Some(step),
+        };
+        view.settle_cursor(panel);
+        // On a fresh page the first model to add is the row to be on.
+        let listed = view.listed(panel);
+        if let Some(at) = listed
+            .iter()
+            .position(|row| matches!(row, crate::providers::Listed::Available(_)))
         {
+            panel.cursor = at;
+        }
+        step
+    }
+
+    /// The account's connection was saved (`deleted: false`) or it was deleted.
+    /// Either way what was listed for it and every add in flight against it
+    /// belong to the old connection: the generation moves, so a late add is
+    /// dropped. A page left on a deleted account goes back to the list; a page
+    /// on an edited one asks its endpoint again, and that step is returned.
+    pub fn provider_account_changed(
+        &self,
+        account: &str,
+        deleted: bool,
+    ) -> Option<crate::providers::Step> {
+        *self
+            .provider_generations
+            .lock()
+            .expect("provider generations poisoned")
+            .entry(account.to_string())
+            .or_insert(0) += 1;
+        // Adds in flight against the old connection are dropped when they land
+        // (the generation moved): nothing of them is still on its way.
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .retain(|(a, _)| a != account);
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let panel = m.providers_panel.as_mut()?;
+        panel.forget_account(account);
+        if panel.screen != crate::providers::Screen::Detail(account.to_string()) {
             return None;
         }
-        crate::providers::discovered(&view, panel, account, listed)
+        if deleted {
+            panel.show(crate::providers::Screen::Providers);
+            view.settle_cursor(panel);
+            return None;
+        }
+        Some(panel.start_discovery(account))
+    }
+
+    /// How many times `account`'s connection has changed: an add records it
+    /// when it is sent and is dropped if it moved before the write.
+    pub fn provider_generation(&self, account: &str) -> u64 {
+        self.provider_generations
+            .lock()
+            .expect("provider generations poisoned")
+            .get(account)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// An add from a server row came back: clear its in-flight mark and, on a
+    /// failure, leave why on the row. True when the panel had marked it.
+    pub fn provider_add_settled(
+        &self,
+        account: &str,
+        model: &str,
+        outcome: Result<(), String>,
+    ) -> bool {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .remove(&(account.to_string(), model.to_string()));
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        panel.add_settled(account, model, outcome)
+    }
+
+    /// Keep the panel's 「添加并使用」 in step: the person has no model to talk
+    /// to — first run, or the one they had stopped answering after a sign-out —
+    /// and no add holds the claim (`claim_free`). The host decides both; the
+    /// panel only draws and keys by the answer.
+    ///
+    /// The adds in flight are put back on it too: a panel opened again while
+    /// one is still being written has to say so, and refuse it a second time.
+    pub fn sync_provider_auto_use(&self, claim_free: bool) -> bool {
+        let adding = self
+            .provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .clone();
+        let mut m = self.moment.write().expect("moment poisoned");
+        let recovering = m.model_setup_required || m.unready.is_some();
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let want = recovering && claim_free;
+        let moved = panel.auto_use != want || panel.adding != adding;
+        panel.auto_use = want;
+        panel.adding = adding;
+        moved
+    }
+
+    /// Whether the person has no model to talk to: first run, or the one they
+    /// had stopped answering (signed out, say).
+    pub fn provider_recovering(&self) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.model_setup_required || m.unready.is_some()
+    }
+
+    /// A server row's add was sent.
+    pub fn provider_add_started(&self, account: &str, model: &str) {
+        self.provider_adding
+            .lock()
+            .expect("provider adding poisoned")
+            .insert((account.to_string(), model.to_string()));
+    }
+
+    /// The panel's opening number, while it is up.
+    pub fn provider_instance(&self) -> Option<u64> {
+        let m = self.moment.read().expect("moment poisoned");
+        m.providers_panel.as_ref().map(|panel| panel.instance)
+    }
+
+    /// The panel is now waiting on this add-and-use.
+    pub fn await_provider_switch(&self, request: u64, account: &str, model: &str) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            panel.awaiting_switch = Some((request, account.to_string(), model.to_string()));
+            panel.switch_error = None;
+        }
+    }
+
+    /// The add-and-use `request` ended without a switch to wait for.
+    pub fn clear_provider_switch(&self, request: u64) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if let Some(panel) = m.providers_panel.as_mut() {
+            if panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request) {
+                panel.awaiting_switch = None;
+            }
+        }
+    }
+
+    /// The answer to add-and-use `request` came back. It may close the panel
+    /// (switched) or put the cursor on the added row with why (refused) only
+    /// when the panel up is the very opening that sent it, still on that
+    /// account's page and still waiting on it — any other panel, form or
+    /// draft is left exactly as it is, and the answer is only said. True when
+    /// the panel was the one.
+    pub fn provider_switch_answer(
+        &self,
+        request: u64,
+        instance: u64,
+        account: &str,
+        id: &str,
+        refused: Option<&str>,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let waiting = m.providers_panel.as_ref().is_some_and(|panel| {
+            panel.instance == instance
+                && panel.screen == crate::providers::Screen::Detail(account.to_string())
+                && panel.awaiting_switch.as_ref().map(|a| a.0) == Some(request)
+        });
+        if !waiting {
+            return false;
+        }
+        // Something opened on the page while it waited is the person at work —
+        // a form, the reasoning levels of another model, a model card: the
+        // answer stops being waited on and is only said, and what they are in
+        // the middle of (half-typed fields and key included) stays as it is.
+        let busy = |p: &crate::providers::Panel| {
+            p.form.is_some() || p.efforts.is_some() || p.card.is_some()
+        };
+        if let Some(panel) = m.providers_panel.as_mut().filter(|p| busy(p)) {
+            panel.awaiting_switch = None;
+            if let Some(why) = refused {
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+            }
+            return false;
+        }
+        match refused {
+            None => {
+                m.providers_panel = None;
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+            }
+            Some(why) => {
+                let Some(panel) = m.providers_panel.as_mut() else {
+                    return false;
+                };
+                panel.awaiting_switch = None;
+                panel.switch_error = Some((id.to_string(), why.to_string()));
+                if let Some(at) = view.listed(panel).iter().position(|row| {
+                    matches!(row, crate::providers::Listed::Configured(i)
+                        if view.models().get(*i).is_some_and(|m| m.id == id))
+                }) {
+                    panel.cursor = at;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a form is up over the providers panel.
+    pub fn provider_form_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .providers_panel
+            .as_ref()
+            .is_some_and(|panel| panel.form.is_some())
     }
 
     /// Restore an unsuccessful write without asking the person to type again.
@@ -3631,8 +3901,7 @@ impl Host {
         let count = key.as_deref().unwrap_or_default().chars().count();
         match panel.form.as_mut() {
             Some(crate::providers::Form::Account(form)) => form.key_len = count,
-            Some(crate::providers::Form::Model(form)) => form.key_len = count,
-            None => {}
+            Some(crate::providers::Form::Model(_)) | None => {}
         }
         let mut m = self.moment.write().expect("moment poisoned");
         if m.providers_panel.is_some() {
@@ -3736,27 +4005,6 @@ impl Host {
             return true;
         }
 
-        if let Some(crate::providers::Form::Model(form)) = m
-            .providers_panel
-            .as_mut()
-            .and_then(|panel| panel.form.as_mut())
-        {
-            if let Some(crate::providers::Picking::Ready {
-                items,
-                query,
-                cursor,
-            }) = form.picking.as_mut()
-            {
-                let rows = crate::providers::picked_rows(items, query).len();
-                *cursor = if by < 0 {
-                    cursor.saturating_sub(by.unsigned_abs() as usize)
-                } else {
-                    cursor.saturating_add(by as usize)
-                }
-                .min(rows.saturating_sub(1));
-                return true;
-            }
-        }
         let rows = match m.providers_panel.as_ref() {
             // A form has no list to walk, and a wheel over it must not scroll
             // the conversation behind it either — it is still the panel's.
@@ -3775,23 +4023,6 @@ impl Host {
         true
     }
 
-    /// Show one account's models, as walking into it from the account list does.
-    ///
-    /// Used after an account is added: an account with no model under it cannot
-    /// be talked to, so the panel answers "what now" by standing where the one
-    /// thing left to do is.
-    pub fn walk_into_provider(&self, account: &str) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        let view = m.providers.clone();
-        let Some(panel) = m.providers_panel.as_mut() else {
-            return false;
-        };
-        panel.show(crate::providers::Tab::Models);
-        panel.drill = Some(account.to_string());
-        view.settle_cursor(panel);
-        true
-    }
-
     /// Put a paste into whatever the providers panel has the keyboard on.
     ///
     /// The composer is not on screen while the panel is up, so a paste that fell
@@ -3807,53 +4038,6 @@ impl Host {
             return false;
         };
         crate::providers::paste(panel, &mut secret, text)
-    }
-
-    /// Show a list, by index. True when it moved.
-    pub fn show_providers_tab(&self, tab: crate::providers::Tab) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        // The view first: the models list opens on an account's heading, which
-        // is not a row the cursor may rest on.
-        let view = m.providers.clone();
-        match m.providers_panel.as_mut() {
-            Some(panel) => {
-                let closed_form = panel.form.take().is_some();
-                if closed_form {
-                    self.providers_secret
-                        .lock()
-                        .expect("provider secret poisoned")
-                        .clear();
-                }
-                let moved = panel.show(tab) || closed_form;
-                view.settle_cursor(panel);
-                moved
-            }
-            None => false,
-        }
-    }
-
-    /// Which list is under the pointer, when it is on the header row.
-    pub fn providers_tab_at(&self, x: u16, y: u16) -> Option<crate::providers::Tab> {
-        let rect = *self
-            .hits
-            .lock()
-            .expect("hits poisoned")
-            .providers
-            .as_ref()?;
-        if !rect.contains(x, y) {
-            return None;
-        }
-        // Which row the tabs are on is a fact about the layout that was drawn.
-        // This panel opens with a rule, so they are **not** on its first row —
-        // the assumption that they were is why a click on a tab did nothing at
-        // all until the first real run of the panel found it.
-        let m = self.moment.read().expect("moment poisoned");
-        let vp = crate::moment::Viewport::new(rect, &m);
-        let header = crate::modules::providers::geometry(&m, &vp).header_row()?;
-        if (y - rect.y) as usize != header {
-            return None;
-        }
-        crate::modules::providers::tab_at((x - rect.x) as usize)
     }
 
     /// Action buttons share the panel's rendered geometry and keyboard dispatch.
@@ -3888,48 +4072,18 @@ impl Host {
         crate::modules::providers::geometry(&m, &vp).listed_at((y - rect.y) as usize)
     }
 
-    /// Clicking a discovered model checks it; list rows keep their Enter action.
-    pub(crate) fn provider_row_key(&self) -> crate::surface::KeyPress {
+    /// The listed row the panel's cursor is on, while no form is up.
+    pub fn providers_cursor(&self) -> Option<usize> {
         let m = self.moment.read().expect("moment poisoned");
-        let select = matches!(m.providers_panel.as_ref().and_then(|panel| panel.form.as_ref()),
-            Some(crate::providers::Form::Model(form)) if form.is_batch() || matches!(form.picking, Some(crate::providers::Picking::Ready { .. })));
-        crate::surface::KeyPress::plain(if select {
-            crate::surface::Key::Char(' ')
-        } else {
-            crate::surface::Key::Enter
-        })
+        m.providers_panel
+            .as_ref()
+            .filter(|panel| panel.form.is_none())
+            .map(|panel| panel.cursor)
     }
 
     /// Point the panel at a listed row. True when it moved.
     pub fn point_providers_at(&self, row: usize) -> bool {
-        let mut m = self.moment.write().expect("moment poisoned");
-        if let Some(crate::providers::Form::Model(form)) = m
-            .providers_panel
-            .as_mut()
-            .and_then(|panel| panel.form.as_mut())
-        {
-            if form.is_batch() {
-                let want = row.min(form.selected.len() - 1);
-                let changed = form.batch_cursor != want;
-                form.batch_cursor = want;
-                return changed;
-            }
-            if let Some(crate::providers::Picking::Ready {
-                items,
-                query,
-                cursor,
-            }) = form.picking.as_mut()
-            {
-                let want = row.min(
-                    crate::providers::picked_rows(items, query)
-                        .len()
-                        .saturating_sub(1),
-                );
-                let changed = *cursor != want;
-                *cursor = want;
-                return changed;
-            }
-        }
+        let m = &mut *self.moment.write().expect("moment poisoned");
         let rows = match m.providers_panel.as_ref() {
             Some(panel) => m.providers.listed(panel).len(),
             None => return false,
@@ -4636,18 +4790,16 @@ impl Host {
         m.mcp_panel = None;
         m.bg_panel = None;
         m.sheet = None;
+        m.resume_preview = None;
         m.resume_panel = Some(crate::resume::Panel::new());
         true
     }
 
     /// Put the resume panel away. True when it was up.
     pub fn close_resume(&self) -> bool {
-        self.moment
-            .write()
-            .expect("moment poisoned")
-            .resume_panel
-            .take()
-            .is_some()
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.resume_preview = None;
+        m.resume_panel.take().is_some()
     }
 
     /// Put the sessions the host answered into the moment, and rest the cursor at
@@ -4657,6 +4809,7 @@ impl Host {
         let mut changed = false;
         if m.resume != view {
             m.resume = view;
+            m.resume_preview = None;
             changed = true;
         }
         if let Some(panel) = m.resume_panel.as_mut() {
@@ -4671,43 +4824,66 @@ impl Host {
     /// The session the arrows are on, if the panel is up.
     pub fn resume_selected(&self) -> Option<String> {
         let m = self.moment.read().expect("moment poisoned");
-        let panel = m.resume_panel.as_ref()?;
-        let listed = m.resume.listed(panel);
-        let at = listed.get(panel.cursor)?;
-        m.resume.sessions().get(*at).map(|s| s.id.clone())
+        m.resume
+            .selected(m.resume_panel.as_ref()?)
+            .map(|s| s.id.clone())
     }
 
     /// Which session still needs its last words fetched, and mark it as being
     /// fetched.
     ///
-    /// Answered once per session: walking the list with the arrow held down
-    /// would otherwise ask for the same one on every repeat, and each answer
-    /// would arrive to overwrite the last.
-    pub fn resume_preview_wanted(&self) -> Option<String> {
-        let selected = self.resume_selected()?;
+    /// While the same row stays selected, key repeats reuse its pending
+    /// request or answer.
+    pub(crate) fn resume_preview_wanted(&self) -> Option<(String, u64)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         let mut m = self.moment.write().expect("moment poisoned");
+        let Some(selected) = m
+            .resume_panel
+            .as_ref()
+            .and_then(|panel| m.resume.selected(panel))
+        else {
+            m.resume_preview = None;
+            return None;
+        };
         if m.resume_preview
             .as_ref()
-            .is_some_and(|(shown, _)| shown == &selected)
+            .is_some_and(|preview| preview.session == selected.id)
         {
             return None;
         }
-        m.resume_preview = Some((selected.clone(), None));
-        Some(selected)
+        let id = selected.id.clone();
+        let request = NEXT.fetch_add(1, Ordering::Relaxed);
+        m.resume_preview = Some(crate::resume::Preview {
+            session: id.clone(),
+            request,
+            lines: None,
+        });
+        Some((id, request))
     }
 
-    /// The words came back. Kept only while the arrows are still on that
-    /// session — an answer for a row a person has already walked past is an
-    /// answer to a question they are no longer asking.
-    pub fn show_resume_preview(&self, id: &str, lines: Vec<String>) -> bool {
+    fn current_resume_preview(m: &Moment, id: &str, request: u64) -> bool {
+        m.resume_preview
+            .as_ref()
+            .is_some_and(|preview| preview.request == request && preview.session == id)
+            && m.resume_panel
+                .as_ref()
+                .and_then(|panel| m.resume.selected(panel))
+                .is_some_and(|selected| selected.id == id)
+    }
+
+    pub(crate) fn resume_preview_is_current(&self, id: &str, request: u64) -> bool {
+        Self::current_resume_preview(&self.moment.read().expect("moment poisoned"), id, request)
+    }
+
+    /// An older request for the same row is stale too after leaving and returning.
+    pub(crate) fn show_resume_preview(&self, id: &str, request: u64, lines: Vec<String>) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        match m.resume_preview.as_mut() {
-            Some((shown, slot)) if shown == id => {
-                *slot = Some(lines);
-                true
-            }
-            _ => false,
+        if !Self::current_resume_preview(&m, id, request) {
+            return false;
         }
+        m.resume_preview.as_mut().expect("current preview").lines = Some(lines);
+        true
     }
 
     /// Take a session out of the list the panel is showing.
@@ -4719,19 +4895,14 @@ impl Host {
     /// at the row that moved up — which is why arming is cleared here too.
     pub fn forget_resume(&self, id: &str) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        let left: Vec<crate::resume::Session> = m
-            .resume
-            .sessions()
-            .iter()
-            .filter(|session| session.id != id)
-            .cloned()
-            .collect();
-        if left.len() == m.resume.sessions().len() {
-            return false;
-        }
-        m.resume = crate::resume::ResumeView::new(left);
+        m.resume.remove(id);
         m.resume_preview = None;
+        let rows = m.resume_panel.as_ref().map_or(0, |p| m.resume.rows(p));
         if let Some(panel) = m.resume_panel.as_mut() {
+            if let Some(other) = panel.other_scope.as_mut() {
+                other.remove(id);
+            }
+            panel.cursor = panel.cursor.min(rows.saturating_sub(1));
             panel.armed = None;
         }
         true
@@ -4752,6 +4923,25 @@ impl Host {
         let step = crate::resume::key(&view, panel, press);
         let changed = *panel != before;
         match step {
+            crate::resume::Step::ToggleScope => {
+                let mut panel = m.resume_panel.take().expect("open picker");
+                let needs_load = !panel.all_projects && panel.other_scope.is_none();
+                let old =
+                    std::mem::replace(&mut m.resume, panel.other_scope.take().unwrap_or_default());
+                let cacheable = panel.loading.take().is_none() && panel.load_error.take().is_none();
+                panel.other_scope = cacheable.then_some(old);
+                panel.all_projects = !panel.all_projects;
+                panel.cursor = 0;
+                let request = needs_load.then(|| {
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                });
+                panel.loading = request;
+                m.resume_panel = Some(panel);
+                m.resume_preview = None;
+                (true, request.map(crate::resume::Step::LoadAll))
+            }
             crate::resume::Step::Stay => (changed, None),
             crate::resume::Step::Close => {
                 m.resume_panel = None;
@@ -4760,6 +4950,28 @@ impl Host {
             }
             step => (true, Some(step)),
         }
+    }
+
+    pub fn finish_resume_list(
+        &self,
+        request: u64,
+        result: Result<crate::resume::ResumeView, String>,
+    ) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.resume_panel.as_mut() else {
+            return false;
+        };
+        if panel.loading != Some(request) {
+            return false;
+        }
+        panel.loading = None;
+        match result {
+            Ok(view) => {
+                m.resume = view;
+            }
+            Err(error) => panel.load_error = Some(error),
+        }
+        true
     }
 
     /// The wheel over the resume panel walks its list.
@@ -8610,6 +8822,42 @@ mod tests {
     }
 
     #[test]
+    fn resume_scope_load_retries_and_discards_late_results() {
+        use crate::resume::{Panel, ResumeView, Session, Step};
+        let h = host();
+        h.moment.write().unwrap().resume_panel = Some(Panel::new());
+        let tab = || {
+            h.resume_key(crate::surface::KeyPress::plain(crate::surface::Key::Tab))
+                .1
+        };
+        let Some(Step::LoadAll(first)) = tab() else {
+            panic!("first request")
+        };
+        assert_eq!(tab(), None);
+        let Some(Step::LoadAll(second)) = tab() else {
+            panic!("second request")
+        };
+        assert!(!h.finish_resume_list(first, Ok(ResumeView::default())));
+        assert!(h.finish_resume_list(second, Err("read failed".into())));
+        assert_eq!(tab(), None);
+        let Some(Step::LoadAll(third)) = tab() else {
+            panic!("retry")
+        };
+        assert!(h.finish_resume_list(
+            third,
+            Ok(ResumeView::new(vec![Session {
+                id: "remote".into(),
+                ..Default::default()
+            }]))
+        ));
+        assert_eq!(h.resume_selected().as_deref(), Some("remote"));
+        assert_eq!(tab(), None);
+        assert_eq!(h.resume_selected(), None);
+        assert_eq!(tab(), None);
+        assert_eq!(h.resume_selected().as_deref(), Some("remote"));
+    }
+
+    #[test]
     fn late_ollama_discovery_cannot_fill_a_draft_after_its_address_changed() {
         use crate::providers::{AccountDiscovery, AccountForm, Form, Panel, ProvidersView};
         let h = host();
@@ -11185,6 +11433,23 @@ mod tests {
         assert_eq!(h.moment.read().unwrap().todo_offset, 0);
         assert!(h.toggle_todo_at(3, 4));
         assert!(!h.todo_wheel(3, 6, 1));
+    }
+
+    /// Folded, the `+N 更多` row (and any item) opens the list; open, a press on
+    /// an item is not a fold — only the header folds it.
+    #[test]
+    fn the_more_row_opens_the_folded_todo_list() {
+        let h = host_with_real_todo();
+        h.hits.lock().unwrap().todo = Some(Rect::new(2, 3, 60, 6));
+        // Margin at 3, header at 4, three items at 5..=7, `+N 更多` at 8.
+        assert!(h.toggle_todo_at(3, 8), "the more row opens it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(!h.toggle_todo_at(3, 6), "an item does not fold it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 4), "the header does");
+        assert!(!h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 6), "folded, an item opens it too");
+        assert!(!h.toggle_todo_at(3, 3), "the margin is not the panel");
     }
 
     fn host_with_real_todo() -> Host {
@@ -13927,22 +14192,38 @@ mod tests {
     }
 
     #[test]
-    fn live_turn_end_captures_member_work_without_rewriting_history() {
+    fn a_clean_turn_ends_normally_while_the_live_line_waits_for_members() {
         use crate::block::RenderCtx;
         use crate::i18n::{t, Msg};
+        use crate::modules::live;
         let h = host();
-        h.absorb(&SessionEvent::TurnStart { turn: 1 });
-        let end = LoggedEvent {
-            seq: 2,
-            at: 0,
-            event: SessionEvent::TurnEnd {
-                turn: 1,
-                stop: atomcode_harness::seams::StopReason::Stopped,
-                error: None,
-            },
+        h.modules
+            .add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        {
+            let mut moment = h.moment.write().unwrap();
+            moment.lead = "lead".into();
+            moment.viewing = "lead".into();
+            moment.model = "test-model".into();
+            moment.members = vec![crate::moment::MemberNow {
+                activity: crate::moment::Activity::Working,
+                session: "lead/member".into(),
+                ..Default::default()
+            }];
+        }
+        let finish = |h: &Host| {
+            h.absorb(&SessionEvent::TurnStart { turn: 1 });
+            h.absorb_logged(&LoggedEvent {
+                seq: 2,
+                at: 0,
+                event: SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: atomcode_harness::seams::StopReason::Stopped,
+                    error: None,
+                },
+            });
         };
-        h.absorb_logged_with_members(&end, 2);
-        let endings = |h: &Host| -> Vec<String> {
+        let endings = |h: &Host| {
             h.stream
                 .read()
                 .unwrap()
@@ -13950,35 +14231,29 @@ mod tests {
                 .iter()
                 .filter(|slot| slot.block().kind() == "turn_end")
                 .flat_map(|slot| slot.block().content.lines(&RenderCtx::bare(160)))
-                .map(|line| line.plain())
-                .collect()
+                .collect::<Vec<_>>()
         };
-        let captured = endings(&h);
-        let expected = t(Msg::StopWithMembersRunning { n: 2 }).into_owned();
-        assert!(
-            captured.iter().any(|line| line.contains(&expected)),
-            "{captured:?}"
-        );
-        h.moment.write().unwrap().members.clear();
-        assert_eq!(endings(&h), captured, "settled history retains its meaning");
+        finish(&h);
         let replay = host();
-        replay.absorb(&SessionEvent::TurnStart { turn: 1 });
-        replay.absorb_logged(&end);
-        assert!(!endings(&replay).iter().any(|line| line.contains(&expected)));
-        let failed = host();
-        failed.absorb(&SessionEvent::TurnStart { turn: 1 });
-        failed.absorb_logged_with_members(
-            &LoggedEvent {
-                event: SessionEvent::TurnEnd {
-                    turn: 1,
-                    stop: atomcode_harness::seams::StopReason::ProviderError,
-                    error: Some("failure".into()),
-                },
-                ..end
-            },
-            2,
+        finish(&replay);
+        let ending = endings(&h);
+        assert_eq!(
+            ending,
+            endings(&replay),
+            "same text and style as an ordinary turn"
         );
-        assert!(!endings(&failed).iter().any(|line| line.contains(&expected)));
+        assert!(ending.iter().any(|line| line.plain().contains("✻ Done")));
+
+        let frame = h.compose((160, 24));
+        let waiting = t(Msg::LiveWaitingForMember { n: 1 });
+        let shows_waiting = |line: &Line| line.plain().contains(waiting.as_ref());
+        assert!(frame.part("live").unwrap().lines.iter().any(shows_waiting));
+        assert!(!frame
+            .part("status")
+            .unwrap()
+            .lines
+            .iter()
+            .any(shows_waiting));
     }
 
     #[test]
@@ -16006,6 +16281,29 @@ mod tests {
     }
 
     #[test]
+    fn a_system_proxy_failure_shows_recovery_before_expanding_details() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::ProviderError,
+            error: Some("could not refresh system proxy settings: ProxyServer: settings are incomplete or changing (OS error 2).".into()),
+        });
+        let size = (160, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("/proxy no_proxy"), "{folded}");
+        assert!(!folded.contains("OS error 2"), "{folded}");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "provider_diagnostic")
+            .expect("the proxy failure has expandable diagnostics");
+        h.toggle_block(id, kind);
+        assert!(h.compose(size).rows().join("\n").contains("OS error 2"));
+    }
+
+    #[test]
     fn clicking_a_vl_caption_opens_the_recognition() {
         let h = host();
         let caption = "一层是登录界面\n二层是报错弹窗\n三层是网络面板";
@@ -16110,6 +16408,7 @@ mod tests {
             origin: atomcode_kernel::session::InjectionOrigin::Peer {
                 from: "elsewhere".into(),
                 outside: true,
+                source_turn: None,
             },
         });
 

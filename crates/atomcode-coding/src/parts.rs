@@ -1283,7 +1283,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     crate::runtime::record_startup_phase("session_binding", session_started.elapsed(), None);
 
     if let Some(b) = &session {
-        registry.register(Arc::new(RecallTool::new(b.manager.root())));
+        registry.register(Arc::new(
+            RecallTool::new(b.manager.root()).with_current_session(&b.id),
+        ));
         names.push("recall".into());
         host_only_tools.push("recall".into());
         registry.register(Arc::new(ListSessionsTool::new(b.manager.root())));

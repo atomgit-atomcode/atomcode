@@ -164,6 +164,11 @@ fn trim_reference_payload(value: &mut serde_json::Value, clipped: &mut bool, que
     }
 }
 
+/// The `TooLarge` kind the reference projector reports when the retained text
+/// does not fit the attachment budget. Shared so the projector and the
+/// reference resolver cannot drift apart over a label.
+pub(super) const REFERENCE_PROJECTION_KIND: &str = "reference projection";
+
 impl SessionManager {
     /// Whether `id` is stored as an event log. The index is the commit point of
     /// such a session, so it is what decides.
@@ -911,16 +916,41 @@ impl SessionManager {
 
     /// The header an event session was created with.
     pub fn read_event_header(&self, id: &str) -> SessionResult<SessionHeader> {
-        let (header, _) = self.read_event_log(id, true)?;
-        header.ok_or_else(|| SessionStoreError::Corrupt {
+        let path = self.events_path(id)?;
+        let file = open_read_file(&path)?;
+        let mut reader = BufReader::new(file.take(MAX_JSONL_LINE_BYTES as u64 + 1));
+        let mut bytes = Vec::new();
+        reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| io_at(&path, error))?;
+        if bytes.len() > MAX_JSONL_LINE_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "session event header",
+                limit: MAX_JSONL_LINE_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        let missing = || SessionStoreError::Corrupt {
             kind: "session events",
             message: format!("{id}: no header"),
-        })
+        };
+        if bytes.last() != Some(&b'\n') {
+            return Err(missing());
+        }
+        let record: Line = super::manager::deserialize(&bytes, "session event header")?;
+        let header = record.header.ok_or_else(missing)?;
+        validate_header_version(&header)?;
+        Ok(header)
     }
 
     /// Every stored fact of an event session, in file order.
     pub fn load_events(&self, id: &str) -> SessionResult<Vec<LoggedEvent>> {
-        Ok(self.read_event_log(id, false)?.1)
+        self.load_events_bounded(id, MAX_JSONL_BYTES)
+    }
+
+    /// Read the log with a caller-specific byte ceiling, including growth while reading.
+    pub fn load_events_bounded(&self, id: &str, limit: usize) -> SessionResult<Vec<LoggedEvent>> {
+        Ok(self.read_event_log_bounded(id, limit)?.1)
     }
 
     /// A short display label from the first prompt recorded for an unnamed
@@ -995,9 +1025,7 @@ impl SessionManager {
         id: &str,
         limit: usize,
     ) -> SessionResult<SessionSnapshot> {
-        Ok(snapshot_of(
-            &self.read_event_log_bounded(id, false, limit)?.1,
-        ))
+        Ok(snapshot_of(&self.read_event_log_bounded(id, limit)?.1))
     }
 
     /// Read-only reference projection. Scan with the store's line/file guards,
@@ -1115,7 +1143,7 @@ impl SessionManager {
                 .saturating_add(64);
             if retained > retained_limit {
                 return Err(SessionStoreError::TooLarge {
-                    kind: "reference projection",
+                    kind: REFERENCE_PROJECTION_KIND,
                     limit: retained_limit,
                     actual: retained,
                 });
@@ -1161,18 +1189,9 @@ impl SessionManager {
         Ok((meta, messages, clipped, captured_through_seq))
     }
 
-    fn read_event_log(
-        &self,
-        id: &str,
-        header_only: bool,
-    ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
-        self.read_event_log_bounded(id, header_only, MAX_JSONL_BYTES)
-    }
-
     pub(super) fn read_event_log_bounded(
         &self,
         id: &str,
-        header_only: bool,
         limit: usize,
     ) -> SessionResult<(Option<SessionHeader>, Vec<LoggedEvent>)> {
         let path = self.events_path(id)?;
@@ -1202,17 +1221,8 @@ impl SessionManager {
                     message: format!("{}:{}: {error}", path.display(), index + 1),
                 })?;
             if let Some(found) = line.header {
-                if found.version > SESSION_FORMAT_VERSION {
-                    return Err(SessionStoreError::FutureSchema {
-                        kind: "session events",
-                        found: found.version,
-                        supported: SESSION_FORMAT_VERSION,
-                    });
-                }
+                validate_header_version(&found)?;
                 header = Some(found);
-                if header_only {
-                    break;
-                }
                 continue;
             }
             match (line.seq, line.event) {
@@ -1843,6 +1853,17 @@ const SIDECARS: [(&str, &str); 4] = [
     ("todos.json", "todos"),
 ];
 
+fn validate_header_version(header: &SessionHeader) -> SessionResult<()> {
+    if header.version > SESSION_FORMAT_VERSION {
+        return Err(SessionStoreError::FutureSchema {
+            kind: "session events",
+            found: header.version,
+            supported: SESSION_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Every file a snapshot-format session keeps that a build from before the
 /// event format reads.
 const SNAPSHOT_FILES: [&str; 8] = [
@@ -2461,15 +2482,20 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
     use super::transcript::{ToolRecord, UsageRecord, RECORD_VERSION};
 
     let undone = atomcode_kernel::session::undone_turns(events);
-    let results: std::collections::HashMap<&str, (&str, bool)> = events
+    let results: std::collections::HashMap<_, _> = events
         .iter()
         .filter_map(|logged| match &logged.event {
             SessionEvent::ToolResultLogged {
+                turn,
+                round,
                 call_id,
                 content,
                 is_error,
                 ..
-            } => Some((call_id.as_str(), (content.as_str(), *is_error))),
+            } => Some((
+                (*turn, *round, call_id.as_str()),
+                (content.as_str(), *is_error),
+            )),
             _ => None,
         })
         .collect();
@@ -2500,6 +2526,8 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
                 }
             }
             SessionEvent::AssistantMessage {
+                turn,
+                round,
                 text,
                 reasoning,
                 tool_calls,
@@ -2513,7 +2541,7 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
                 record.reasoning.push_str(reasoning);
                 for call in tool_calls {
                     let (result, is_error) = results
-                        .get(call.id.as_str())
+                        .get(&(*turn, *round, call.id.as_str()))
                         .map(|(content, is_error)| (content.to_string(), *is_error))
                         .unwrap_or_default();
                     record.tools.push(ToolRecord {
@@ -2559,6 +2587,126 @@ pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord>
         }
     }
     records
+}
+
+/// What the session picker and input history need from a completed turn.
+pub struct HistoryTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// Text from completed, non-withdrawn turns, ordered oldest first.
+pub struct HistoryText {
+    pub model: Option<String>,
+    pub turns: Vec<HistoryTurn>,
+}
+
+impl SessionManager {
+    /// Validate all committed facts, without keeping tool payloads, images, or
+    /// reasoning from the full log. Use the same turn and rewind rules as the
+    /// transcript projection.
+    pub fn read_history_text(&self, id: &str) -> SessionResult<HistoryText> {
+        let path = self.events_path(id)?;
+        let size = regular_file_len(&path)?;
+        let too_large = |actual| SessionStoreError::TooLarge {
+            kind: "session events",
+            limit: MAX_JSONL_BYTES,
+            actual,
+        };
+        if size > MAX_JSONL_BYTES {
+            return Err(too_large(size));
+        }
+        let file = open_read_file(&path)?;
+        let mut reader = BufReader::new(file.take(MAX_JSONL_BYTES as u64 + 1));
+        let mut line = Vec::new();
+        let mut total = 0;
+        let mut header = None;
+        let mut model = None;
+        let mut events = Vec::new();
+        for index in 0.. {
+            line.clear();
+            total += reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| io_at(&path, error))?;
+            if total > MAX_JSONL_BYTES {
+                return Err(too_large(total));
+            }
+            // As in the full reader, a failed append without a newline is not
+            // a committed fact.
+            if line.pop() != Some(b'\n') {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let record: Line =
+                serde_json::from_slice(&line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{}: {error}", path.display(), index + 1),
+                })?;
+            if let Some(found) = record.header {
+                if found.version > SESSION_FORMAT_VERSION {
+                    return Err(SessionStoreError::FutureSchema {
+                        kind: "session events",
+                        found: found.version,
+                        supported: SESSION_FORMAT_VERSION,
+                    });
+                }
+                header = Some(found);
+                continue;
+            }
+            let (Some(seq), Some(value)) = (record.seq, record.event) else {
+                return Err(SessionStoreError::Corrupt {
+                    kind: "session events",
+                    message: format!("{}:{}: not a record", path.display(), index + 1),
+                });
+            };
+            let mut event = event_of(value, &path, index, header.as_ref())?;
+            match &mut event {
+                SessionEvent::TurnStart { .. }
+                | SessionEvent::TurnEnd { .. }
+                | SessionEvent::Rewound { .. }
+                | SessionEvent::Interrupted { .. } => {}
+                SessionEvent::UserMessage { images, .. } => *images = Vec::new(),
+                SessionEvent::AssistantMessage {
+                    reasoning,
+                    tool_calls,
+                    reasoning_blocks,
+                    meta,
+                    ..
+                } => {
+                    *reasoning = String::new();
+                    *reasoning_blocks = Vec::new();
+                    *meta = None;
+                    // Only the presence of a call matters for a text preview.
+                    tool_calls.truncate(1);
+                    if let Some(call) = tool_calls.first_mut() {
+                        call.arguments = String::new();
+                    }
+                }
+                SessionEvent::PartialReply { reasoning, .. } => *reasoning = String::new(),
+                SessionEvent::RequestHeader { model: name, .. } => {
+                    model = Some(std::mem::take(name));
+                    continue;
+                }
+                _ => continue,
+            }
+            events.push(LoggedEvent {
+                seq,
+                at: record.at,
+                event,
+            });
+        }
+        let turns = turn_records(id, &events)
+            .into_iter()
+            .filter(|record| !record.undone)
+            .map(|record| HistoryTurn {
+                user: record.user,
+                assistant: record.assistant,
+            })
+            .collect();
+        Ok(HistoryText { model, turns })
+    }
 }
 
 /// A snapshot of what `events` project to.
@@ -3115,6 +3263,101 @@ mod tests {
     }
 
     #[test]
+    fn text_history_matches_full_projection_on_older_rewound_logs_with_a_torn_tail() {
+        let (_dir, manager) = store();
+        let id = "history";
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut header = SessionHeader::new(id);
+        header.version = SESSION_FORMAT_VERSION - 1;
+        manager
+            .create_event_session(&lease, &header, &meta(id))
+            .unwrap();
+        let mut facts = Vec::new();
+        for turn in 1..=4 {
+            for mut fact in a_turn() {
+                match &mut fact.event {
+                    SessionEvent::TurnStart { turn: slot }
+                    | SessionEvent::AssistantChunk { turn: slot, .. }
+                    | SessionEvent::TurnEnd { turn: slot, .. } => *slot = turn,
+                    SessionEvent::UserMessage {
+                        turn: slot, text, ..
+                    } => {
+                        *slot = turn;
+                        *text = format!("question {turn}");
+                    }
+                    SessionEvent::AssistantMessage {
+                        turn: slot,
+                        text,
+                        tool_calls,
+                        ..
+                    } => {
+                        *slot = turn;
+                        if turn == 1 {
+                            text.clear();
+                            tool_calls.push(atomcode_kernel::tool::ToolCall {
+                                id: "call".into(),
+                                name: "read".into(),
+                                arguments: "large".repeat(30_000),
+                            });
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                fact.seq += (turn - 1) * 5;
+                facts.push(fact);
+            }
+        }
+        facts.extend([
+            logged(
+                21,
+                20,
+                SessionEvent::Rewound {
+                    turn: 4,
+                    to: 16,
+                    scope: RewindScope::Conversation,
+                },
+            ),
+            logged(
+                22,
+                21,
+                SessionEvent::Interrupted {
+                    turn: 3,
+                    undone: true,
+                },
+            ),
+            logged(
+                23,
+                22,
+                SessionEvent::RequestHeader {
+                    turn: 5,
+                    round: 1,
+                    model: "latest-model".into(),
+                    reason: atomcode_kernel::session::HeaderReason::Series,
+                },
+            ),
+        ]);
+        manager.append_events(&lease, &facts).unwrap();
+        let mut file = open_append_file(&manager.events_path(id).unwrap()).unwrap();
+        file.write_all(b"{\"event\":{\"kind\":\"rewound\"").unwrap();
+
+        let full = turn_records(id, &manager.load_events(id).unwrap());
+        let history = manager.read_history_text(id).unwrap();
+        assert_eq!(history.model.as_deref(), Some("latest-model"));
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(
+            history
+                .turns
+                .iter()
+                .map(|turn| (&turn.user, &turn.assistant))
+                .collect::<Vec<_>>(),
+            full.iter()
+                .filter(|turn| !turn.undone)
+                .map(|turn| (&turn.user, &turn.assistant))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn a_running_turn_has_no_completion_timestamp_until_turn_end() {
         let (_dir, manager) = store();
         let lease = created(&manager, "s1");
@@ -3382,6 +3625,162 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recall_expands_the_original_review_after_two_compactions_and_reopen() {
+        use atomcode_kernel::tool::{Tool, ToolCall, ToolContext};
+
+        let (_dir, manager) = store();
+        let lease = created(&manager, "review-session");
+        let other = created(&manager, "other-session");
+        let reply = format!("{}\nC4: escape_html 单趟化", "界".repeat(3_000));
+        let review = "P5: MAX_CHAIN_DEPTH 提升\nP7: json write_char";
+        let facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: reply.clone(),
+                reasoning: "private reasoning".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "review".into(),
+                        name: "code_review".into(),
+                        arguments: "private arguments".into(),
+                    },
+                    ToolCall {
+                        id: "bash".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: "review".into(),
+                content: review.into(),
+                is_error: false,
+                images: vec![],
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: "bash".into(),
+                content: "unrelated tool output".into(),
+                is_error: false,
+                images: vec![],
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+            SessionEvent::Compacted {
+                turn: 2,
+                through: 5,
+                summary: "Reviewed code.".into(),
+                from: 0,
+            },
+            SessionEvent::Compacted {
+                turn: 3,
+                through: 6,
+                summary: "Worked on code.".into(),
+                from: 0,
+            },
+            SessionEvent::TurnStart { turn: 4 },
+            SessionEvent::AssistantMessage {
+                turn: 4,
+                round: 1,
+                text: "unfinished review".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: vec![],
+                meta: None,
+            },
+        ];
+        let facts: Vec<_> = facts
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| logged(index as u64 + 1, 1000, event))
+            .collect();
+        manager.append_events(&lease, &facts).unwrap();
+        manager.append_events(&other, &facts).unwrap();
+        drop(lease);
+        drop(other);
+
+        let reopened = SessionManager::with_root(manager.root());
+        let recall =
+            crate::session::RecallTool::new(reopened.root()).with_current_session("review-session");
+        assert!(recall.self_bounds_output());
+        let context = ToolContext {
+            working_dir: reopened.root().into(),
+            cancel: Default::default(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let hit = recall
+            .execute(
+                r#"{"current_session":true,"query":"MAX_CHAIN_DEPTH"}"#,
+                &context,
+            )
+            .await;
+        assert!(!hit.is_error, "{}", hit.content);
+        assert_eq!(hit.content.matches("read_turn 1").count(), 1);
+        assert!(!hit.content.contains("other-s"));
+        assert!(!hit.content.contains("P7:"));
+
+        let page = recall.execute(r#"{"read_turn":1}"#, &context).await;
+        assert!(!page.is_error, "{}", page.content);
+        let first: serde_json::Value = serde_json::from_str(&page.content).unwrap();
+        let offset = first["next_offset"].as_u64().unwrap();
+        let next = recall
+            .execute(&format!(r#"{{"read_turn":1,"offset":{offset}}}"#), &context)
+            .await;
+        assert!(!next.is_error, "{}", next.content);
+        let next: serde_json::Value = serde_json::from_str(&next.content).unwrap();
+        assert!(next["next_offset"].is_null());
+        let recovered = format!(
+            "{}{}",
+            first["text"].as_str().unwrap(),
+            next["text"].as_str().unwrap()
+        );
+        assert_eq!(recovered, format!("{reply}\n\n[code_review]\n{review}"));
+        assert_eq!(next["undone"], false);
+        assert!(
+            recall
+                .execute(r#"{"read_turn":4}"#, &context)
+                .await
+                .is_error
+        );
+        assert!(
+            recall
+                .execute(r#"{"read_turn":1,"session":"other-session"}"#, &context)
+                .await
+                .is_error
+        );
+
+        let lease = reopened.acquire_lease("review-session").unwrap();
+        reopened
+            .append_events(
+                &lease,
+                &[logged(
+                    10,
+                    1001,
+                    SessionEvent::Rewound {
+                        turn: 4,
+                        to: 0,
+                        scope: RewindScope::Conversation,
+                    },
+                )],
+            )
+            .unwrap();
+        let withdrawn = recall.execute(r#"{"read_turn":1}"#, &context).await;
+        let withdrawn: serde_json::Value = serde_json::from_str(&withdrawn.content).unwrap();
+        assert_eq!(withdrawn["undone"], true);
+    }
+
     /// A session a newer build last wrote is listed and marked, and opening it is
     /// refused before its log is read; the rest of the project is untouched.
     #[test]
@@ -3552,6 +3951,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             manager.load_events("s1"),
+            Err(SessionStoreError::FutureSchema { .. })
+        ));
+        assert!(matches!(
+            manager.read_history_text("s1"),
             Err(SessionStoreError::FutureSchema { .. })
         ));
     }

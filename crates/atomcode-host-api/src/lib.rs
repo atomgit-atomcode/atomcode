@@ -68,6 +68,8 @@ pub enum HostCommand {
     ForkSession { session: String },
     /// Put the stored session `target` in place of `session`.
     Resume { session: String, target: String },
+    /// Open an explicitly selected global result in its owning project.
+    ResumeAcrossProjects { session: String, target: String },
     /// The thinking level `session`'s requests carry from now on. `None` is no
     /// opinion: the endpoint's own default stands.
     SetReasoningEffort {
@@ -77,6 +79,8 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// List the retained one-shot tasks directly delegated by this live session.
+    ListTaskSessions { session: String },
     /// Read committed display history only; does not restore or mutate the agent.
     DisplayHistory {
         session: String,
@@ -390,9 +394,11 @@ impl HostCommand {
         match self {
             Self::Browser { session, .. }
             | Self::DisplayHistory { session, .. }
+            | Self::ListTaskSessions { session }
             | Self::NewSession { session }
             | Self::ForkSession { session }
             | Self::Resume { session, .. }
+            | Self::ResumeAcrossProjects { session, .. }
             | Self::TaskSpecs { session, .. }
             | Self::FollowUp { session, .. }
             | Self::Hooks { session, .. }
@@ -465,6 +471,26 @@ pub struct PersonaInfo {
     pub text: String,
 }
 
+/// A retained one-shot task in the live session's project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSession {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl TaskSession {
+    pub fn from_header(
+        header: atomcode_kernel::session::SessionHeader,
+        parent: &str,
+    ) -> Option<Self> {
+        (header.parent.as_deref() == Some(parent) && header.member.is_none()).then_some(Self {
+            id: header.id,
+            label: header.label,
+        })
+    }
+}
+
 /// What a command that went through produced.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -510,6 +536,11 @@ pub enum HostReply {
     },
     Sessions {
         sessions: Vec<StoredSession>,
+        #[serde(default, skip_serializing_if = "SessionListHints::is_empty")]
+        hints: SessionListHints,
+    },
+    TaskSessions {
+        sessions: Vec<TaskSession>,
     },
     /// What a stored session last talked about: a few lines, newest last,
     /// already in the order a person reads them.
@@ -1332,6 +1363,21 @@ pub enum McpAction {
     Disable,
 }
 
+/// Context for an empty project picker, computed during the same catalog scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionListHints {
+    pub other_projects_have_history: bool,
+    /// One path from a diagnostic for this bucket or the catalog root.
+    pub scan_issue_path: Option<String>,
+}
+
+impl SessionListHints {
+    fn is_empty(&self) -> bool {
+        !self.other_projects_have_history && self.scan_issue_path.is_none()
+    }
+}
+
 /// One stored session, as a picker shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
@@ -1656,11 +1702,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn session_list_hints_are_optional_on_existing_wire_replies() {
+        let old = serde_json::json!({"Sessions":{"sessions":[]}});
+        let reply: HostReply = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reply).unwrap(), old);
+    }
+
     /// Each command, reply, event and error exactly once. The matches are
     /// exhaustive on purpose: a new variant does not compile until it is
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::ListTaskSessions {
+                session: "a".into(),
+            },
             HostCommand::DisplayHistory {
                 session: "a".into(),
                 turns: 8,
@@ -1726,6 +1782,10 @@ mod tests {
                 session: "a".into(),
             },
             HostCommand::Resume {
+                session: "a".into(),
+                target: "b".into(),
+            },
+            HostCommand::ResumeAcrossProjects {
                 session: "a".into(),
                 target: "b".into(),
             },
@@ -1897,9 +1957,11 @@ mod tests {
             match c {
                 HostCommand::Browser { .. }
                 | HostCommand::DisplayHistory { .. }
+                | HostCommand::ListTaskSessions { .. }
                 | HostCommand::NewSession { .. }
                 | HostCommand::ForkSession { .. }
                 | HostCommand::Resume { .. }
+                | HostCommand::ResumeAcrossProjects { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }
                 | HostCommand::PreviewSession { .. }
@@ -1959,6 +2021,12 @@ mod tests {
 
     fn replies() -> Vec<HostReply> {
         let all = vec![
+            HostReply::TaskSessions {
+                sessions: vec![TaskSession {
+                    id: "sub-a".into(),
+                    label: Some("Check docs".into()),
+                }],
+            },
             HostReply::DisplayHistory {
                 page: atomcode_kernel::session::history::Page {
                     session: "a".into(),
@@ -1988,6 +2056,10 @@ mod tests {
                 session: "b".into(),
             },
             HostReply::Sessions {
+                hints: SessionListHints {
+                    other_projects_have_history: true,
+                    scan_issue_path: Some("/sessions/broken.index".into()),
+                },
                 sessions: vec![StoredSession {
                     id: "b".into(),
                     title: Some("fix the parser".into()),
@@ -2261,6 +2333,7 @@ mod tests {
         for r in &all {
             match r {
                 HostReply::DisplayHistory { .. }
+                | HostReply::TaskSessions { .. }
                 | HostReply::Done
                 | HostReply::TaskSpecs { .. }
                 | HostReply::FollowUp { .. }

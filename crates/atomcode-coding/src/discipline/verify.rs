@@ -30,7 +30,8 @@ before finishing. Do NOT start a long-running process (dev server, watcher, full
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NudgedEdit {
     turn_start: usize,
-    edit_id: String,
+    pub(crate) edit_id: String,
+    pub(crate) path: Option<String>,
 }
 
 /// Extract the `command` string from a bash tool-call's raw JSON `arguments`.
@@ -402,6 +403,7 @@ pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedE
     let owed = match last_edit_id {
         Some(id) if !bash_after_edit => NudgedEdit {
             turn_start: start,
+            path: edit_paths.remove(id.as_str()),
             edit_id: id,
         },
         _ => return None,

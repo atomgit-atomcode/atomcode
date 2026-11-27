@@ -24,7 +24,9 @@ pub(crate) fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/workbench/files", get(files))
+        .route("/workbench/tree", get(tree))
         .route("/workbench/preview", get(preview))
+        .route("/workbench/download", get(download))
         .route(
             "/workbench/text",
             get(editing::text)
@@ -35,6 +37,17 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         )
         .route("/workbench/git", get(editing::git_status))
         .route("/workbench/diff", get(editing::git_diff))
+        .route("/workbench/git/stage", post(editing::git_stage))
+        .route("/workbench/git/unstage", post(editing::git_unstage))
+        .route("/workbench/git/discard", post(editing::git_discard))
+        .route("/workbench/git/commit", post(editing::git_commit))
+        .route("/workbench/git/branches", get(editing::git_branches))
+        .route("/workbench/git/branch", post(editing::git_switch))
+        .route("/workbench/git/log", get(editing::git_log))
+        .route(
+            "/workbench/git/commit-diff",
+            get(editing::git_commit_detail),
+        )
         .route("/workbench/terminals", post(create_terminal))
         .route(
             "/workbench/terminals/:id",
@@ -156,6 +169,158 @@ impl AddPath for String {
             .into_owned()
     }
 }
+
+/// `/workbench/tree` 的递归树形节点：目录带 children，文件带 extension。
+#[derive(Serialize)]
+struct TreeEntry {
+    name: String,
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+    /// 节点的绝对路径，如 `/home/atomcode/workspace/{uuid}/a.txt`。
+    absolute: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extension: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<Vec<TreeEntry>>,
+    /// 仅在 children 因深度/条目预算被截断时输出。
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+}
+
+/// `truncated` 的 `skip_serializing_if` 判定：false 时不输出该字段。
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// 递归时整棵跳过的目录名：版本控制、依赖与缓存。
+const TREE_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".codeartsdoer",
+    ".next",
+    ".cache",
+];
+/// 树的最大递归深度，超过后目录不再展开。
+const TREE_MAX_DEPTH: usize = 32;
+/// 全树条目（文件+目录）总数预算，耗尽后停止展开。
+const TREE_MAX_ENTRIES: usize = 5000;
+
+/// 递归构建以 `rel`（相对会话工作区根）为起点的目录树。
+///
+/// - 排除 [`TREE_SKIP_DIRS`] 中的目录（与 `/fs/list` 跳过 `.git` 的约定一致）；
+/// - 不跟随符号链接（链接条目按文件处理，避免环形链接导致无限递归）；
+/// - 受 [`TREE_MAX_DEPTH`] 与 [`TREE_MAX_ENTRIES`] 约束，截断处在 `truncated` 上标记。
+fn build_tree(root: &std::path::Path, rel: &str, depth: usize, budget: &mut usize) -> TreeEntry {
+    let abs = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    let name = abs
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| rel.to_string());
+    // symlink_metadata 不跟随链接：指向目录的 symlink 一律按文件处理
+    let is_dir = std::fs::symlink_metadata(&abs)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let extension = if is_dir {
+        None
+    } else {
+        abs.extension().map(|e| format!(".{}", e.to_string_lossy()))
+    };
+    let mut truncated = false;
+    let children = if is_dir {
+        if depth >= TREE_MAX_DEPTH {
+            truncated = true;
+            None
+        } else {
+            let mut items = Vec::new();
+            // 单个子目录读取失败（权限、竞态删除）只降级为无 children，不毁掉整棵树
+            if let Ok(rd) = std::fs::read_dir(&abs) {
+                let mut names: Vec<String> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                for name in names {
+                    if TREE_SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if *budget == 0 {
+                        truncated = true;
+                        break;
+                    }
+                    *budget -= 1;
+                    let child_rel = if rel.is_empty() {
+                        name
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    let child = build_tree(root, &child_rel, depth + 1, budget);
+                    truncated |= child.truncated;
+                    items.push(child);
+                }
+            }
+            Some(items)
+        }
+    } else {
+        None
+    };
+    TreeEntry {
+        name,
+        path: rel.to_string(),
+        absolute: abs.to_string_lossy().into_owned(),
+        entry_type: if is_dir {
+            "directory".to_string()
+        } else {
+            "file".to_string()
+        },
+        extension,
+        children,
+        truncated,
+    }
+}
+
+/// GET /workbench/tree - 递归返回会话工作区的完整目录树。
+pub(crate) async fn tree(
+    State(state): State<AppState>,
+    Query(q): Query<WorkspaceQuery>,
+) -> Response {
+    let (_, root) = match workspace(&state, &q.session_id).await {
+        Ok(v) => v,
+        Err(e) => return bad(e),
+    };
+    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        // 子路径定位失败：同样按 not_exits 返回空结果
+        let base = match target(&root, &q.path) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(serde_json::json!({ "status": "not_exits", "result": {} }));
+            }
+        };
+        // 树根 = 会话工作区根，path 相对会话根展示（支持绝对/相对 path）
+        let rel = base
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut budget = TREE_MAX_ENTRIES;
+        let result = build_tree(&root, &rel, 0, &mut budget);
+        Ok(serde_json::json!({
+            "status": "ok",
+            "truncated": result.truncated,
+            "result": result,
+        }))
+    })
+    .await
+    {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => bad(e),
+        Err(e) => bad(e),
+    }
+}
 pub(crate) async fn preview(
     State(state): State<AppState>,
     Query(q): Query<WorkspaceQuery>,
@@ -211,6 +376,98 @@ pub(crate) async fn preview(
             bytes,
         )
             .into_response(),
+        Ok(Err(e)) => bad(e),
+        Err(e) => bad(e),
+    }
+}
+
+/// 下载文件的大小上限，防止大文件一次性读入内存打爆 daemon。
+const DOWNLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// 大小上限判定，独立成函数便于测试。
+fn check_download_size(len: u64) -> Result<(), String> {
+    if len > DOWNLOAD_MAX_BYTES {
+        Err(format!(
+            "File too large to download ({len} bytes, limit {DOWNLOAD_MAX_BYTES})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Content-Disposition 的 ASCII 兜底名：非保留字符统一替换为 `_`。
+fn ascii_safe_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if ascii_safe_char(c) { c } else { '_' })
+        .collect()
+}
+
+/// RFC 5987 `filename*` 编码：按 UTF-8 字节对保留字符以外的内容做百分号编码。
+fn rfc5987_encode(name: &str) -> String {
+    name.bytes()
+        .map(|b| {
+            let c = b as char;
+            if ascii_safe_char(c) {
+                c.to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// `filename*` 中允许原样出现的字符：字母、数字与 `._-`。
+fn ascii_safe_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
+/// 下载会话工作区内的文件：返回原始字节流，Content-Disposition 触发浏览器下载。
+pub(crate) async fn download(
+    State(state): State<AppState>,
+    Query(q): Query<WorkspaceQuery>,
+) -> Response {
+    let (_, root) = match workspace(&state, &q.session_id).await {
+        Ok(v) => v,
+        Err(e) => return bad(e),
+    };
+    match tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
+        let path = target(&root, &q.path).map_err(|e| e.to_string())?;
+        // 与 /workbench/tree 一致不跟随 symlink：链接条目不可下载
+        let is_regular = std::fs::symlink_metadata(&path)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !is_regular {
+            return Err("Only regular files can be downloaded".into());
+        }
+        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        check_download_size(len)?;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download")
+            .to_string();
+        Ok((bytes, name))
+    })
+    .await
+    {
+        Ok(Ok((bytes, name))) => {
+            // 双写：ASCII 兜底名 + RFC 5987 编码原名（中文、空格、引号等都合法）
+            let disposition = format!(
+                "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+                ascii_safe_name(&name),
+                rfc5987_encode(&name),
+            );
+            (
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_DISPOSITION, disposition),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         Ok(Err(e)) => bad(e),
         Err(e) => bad(e),
     }
@@ -570,5 +827,146 @@ mod tests {
         let dimensions = size(Some(0), Some(u16::MAX));
         assert_eq!(dimensions.cols, 10);
         assert_eq!(dimensions.rows, 200);
+    }
+
+    /// 建一个临时目录供 build_tree 测试用。
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomcode-tree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn find<'a>(node: &'a TreeEntry, path: &str) -> Option<&'a TreeEntry> {
+        if node.path == path {
+            return Some(node);
+        }
+        node.children.as_ref()?.iter().find_map(|c| find(c, path))
+    }
+
+    #[test]
+    fn tree_skips_excluded_dirs_and_keeps_normal_entries() {
+        let root = temp_root("skip");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        std::fs::write(root.join("a/b/c.txt"), "x").unwrap();
+        for dir in ["node_modules", ".git", "__pycache__", ".next"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("junk.js"), "x").unwrap();
+        }
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/real.js"), "x").unwrap();
+        let mut budget = TREE_MAX_ENTRIES;
+        let tree = build_tree(&root, "", 0, &mut budget);
+        assert!(find(&tree, "a.txt").is_some());
+        assert!(find(&tree, "a/b/c.txt").is_some());
+        // absolute 字段 = 会话根 + 相对路径
+        assert_eq!(
+            find(&tree, "a.txt").map(|n| n.absolute.as_str()),
+            Some(root.join("a.txt").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            find(&tree, "a/b/c.txt").map(|n| n.absolute.as_str()),
+            Some(root.join("a/b/c.txt").to_string_lossy().as_ref())
+        );
+        assert!(find(&tree, "node_modules").is_none());
+        assert!(find(&tree, ".git").is_none());
+        assert!(find(&tree, "dist/real.js").is_some());
+        assert!(!tree.truncated);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_does_not_follow_symlink_loops() {
+        let root = temp_root("loop");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::write(root.join("inner/f.txt"), "x").unwrap();
+        // 环形链接：inner/self -> inner
+        std::os::unix::fs::symlink("inner", root.join("inner/self")).unwrap();
+        let mut budget = TREE_MAX_ENTRIES;
+        let tree = build_tree(&root, "", 0, &mut budget);
+        // 指向目录的 symlink 按“文件”处理：有 extension 检查位、无 children，递归终止
+        let self_node = find(&tree, "inner/self").expect("symlink entry should exist");
+        assert_eq!(self_node.entry_type, "file");
+        assert!(self_node.children.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tree_truncates_when_budget_is_exhausted() {
+        let root = temp_root("budget");
+        for i in 0..5 {
+            std::fs::write(root.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut budget = 2;
+        let tree = build_tree(&root, "", 0, &mut budget);
+        assert!(tree.truncated);
+        assert_eq!(tree.children.as_ref().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tree_depth_is_bounded() {
+        let root = temp_root("depth");
+        let mut deep = root.join("d");
+        for i in 0..(TREE_MAX_DEPTH + 5) {
+            deep = deep.join(format!("{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("leaf.txt"), "x").unwrap();
+        let mut budget = TREE_MAX_ENTRIES;
+        let tree = build_tree(&root, "", 0, &mut budget);
+        // 超过 TREE_MAX_DEPTH 的层级不再展开，某处一定标了 truncated，且没有 leaf.txt
+        assert!(tree.truncated);
+        assert!(find(&tree, "d/0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19/20/21/22/23/24/25/26/27/28/29/30/31/32/leaf.txt").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn download_disposition_encodes_unicode_and_spaces() {
+        let name = "报告 最终版.txt";
+        assert_eq!(
+            rfc5987_encode(name),
+            "%E6%8A%A5%E5%91%8A%20%E6%9C%80%E7%BB%88%E7%89%88.txt"
+        );
+        assert_eq!(ascii_safe_name(name), "______.txt");
+    }
+
+    #[test]
+    fn download_disposition_keeps_plain_ascii_untouched() {
+        let name = "report-final v2.txt";
+        assert_eq!(rfc5987_encode(name), "report-final%20v2.txt");
+        assert_eq!(ascii_safe_name(name), "report-final_v2.txt");
+    }
+
+    #[test]
+    fn download_disposition_is_always_a_valid_header_value() {
+        // 引号、反斜杠、换行、控制字符、emoji——任何输入都不得产生非法 header
+        for name in [
+            "plain.txt",
+            "报告 最终版.txt",
+            "quote\"d.txt",
+            "back\\slash.txt",
+            "new\nline.txt",
+            "emoji🚀.txt",
+            "中文(引号”)与 空格.txt",
+        ] {
+            let value = format!(
+                "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+                ascii_safe_name(name),
+                rfc5987_encode(name)
+            );
+            header::HeaderValue::from_str(&value)
+                .unwrap_or_else(|e| panic!("{name:?} produced invalid header: {e}"));
+        }
+    }
+
+    #[test]
+    fn download_size_limit_rejects_oversized_files() {
+        assert!(check_download_size(0).is_ok());
+        assert!(check_download_size(DOWNLOAD_MAX_BYTES).is_ok());
+        let err = check_download_size(DOWNLOAD_MAX_BYTES + 1).unwrap_err();
+        assert!(err.contains("too large"));
     }
 }

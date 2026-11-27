@@ -244,7 +244,7 @@ fn said_for(event: UpgradeEvent, last_pct: &mut i32) -> (Option<String>, Option<
             ),
             Some(exe),
         ),
-        UpgradeEvent::Failed(message) => (Some(failed(&message)), None),
+        UpgradeEvent::Failed(message) => (Some(message), None),
         UpgradeEvent::RolledBack { exe, backup, .. } => (
             Some(
                 t(Msg::UpgradeRolledBack {
@@ -271,6 +271,15 @@ fn failed(message: &str) -> String {
     } else {
         t(Msg::UpgradeFailed { error: message }).into_owned()
     }
+}
+
+/// Shared by the interactive and command-line upgrade paths.
+pub fn manifest_connection_message(error: &anyhow::Error) -> Option<String> {
+    if !atomcode_updater::is_manifest_connection_failure(error) {
+        return None;
+    }
+    tracing::warn!(error = %format_args!("{error:#}"), "update manifest connection failed");
+    Some(t(Msg::UpgradeManifestConnectionFailed).into_owned())
 }
 
 struct Upgrade {
@@ -334,7 +343,7 @@ impl CommandSet for Upgrade {
                             notes,
                         )
                     }
-                    Err(e) => (UpgradeEvent::Failed(format!("{e:#}")), Vec::new()),
+                    Err(e) => (UpgradeEvent::Failed(failed(&format!("{e:#}"))), Vec::new()),
                 };
                 running.store(false, Ordering::SeqCst);
                 let (said, exe) = said_for(event, &mut -1);
@@ -369,7 +378,9 @@ impl CommandSet for Upgrade {
                     let failures = tx.clone();
                     let driver = tokio::spawn(async move {
                         if let Err(e) = atomcode_updater::run_upgrade(current(), force, tx).await {
-                            let _ = failures.send(UpgradeEvent::Failed(format!("{e:#}")));
+                            let message = manifest_connection_message(&e)
+                                .unwrap_or_else(|| failed(&format!("{e:#}")));
+                            let _ = failures.send(UpgradeEvent::Failed(message));
                         }
                     });
                     let mut last_pct = -1;
@@ -631,7 +642,9 @@ mod tests {
         );
         assert_eq!(restart, Some(exe));
 
-        let (_, restart) = said_for(UpgradeEvent::Failed("boom".into()), &mut last);
+        let message = t(Msg::UpgradeManifestConnectionFailed).into_owned();
+        let (said, restart) = said_for(UpgradeEvent::Failed(message.clone()), &mut last);
+        assert_eq!(said.as_deref(), Some(message.as_str()));
         assert!(restart.is_none());
     }
 

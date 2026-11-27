@@ -14,8 +14,8 @@ The main release script compares artifacts before replacing `latest.json`. macOS
 
 ```sh
 python3 scripts/report-package-size.py \
-  --artifacts dist/v5.2.8 --baseline latest.json \
-  --output dist/v5.2.8/package-size.json
+  --artifacts dist/v5.2.9 --baseline latest.json \
+  --output dist/v5.2.9/package-size.json
 python3 scripts/report-package-size.spec.py
 ```
 

@@ -395,11 +395,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Manage providers: add, edit, delete, or set the global default. Press Esc to cancel.\n".into(),
         Msg::ProviderWizardCancelled =>
             "(cancelled)".into(),
-        Msg::ProviderMenuAdd => "Add".into(),
         Msg::ProviderMenuAddDesc => "Create a provider configuration".into(),
         Msg::ProviderMenuEdit => "Edit".into(),
         Msg::ProviderMenuEditDesc => "Modify an existing provider configuration".into(),
-        Msg::ProviderMenuDelete => "Delete".into(),
         Msg::ProviderMenuDeleteDesc => "Delete an existing provider configuration".into(),
         Msg::ProviderMenuSetDefault => "Set global default".into(),
         Msg::ProviderMenuSetDefaultDesc =>
@@ -645,6 +643,36 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Press Ctrl+D again to delete \"{name}\"").into(),
         Msg::SessionDeleteFailed { error } =>
             format!("Failed to delete session: {error}").into(),
+        Msg::HarnessJournalTooLarge { max_bytes, max_mib } =>
+            format!("Session JSONL exceeds the {max_bytes}-byte limit ({max_mib} MiB)").into(),
+        Msg::HarnessJournalExpectedFile =>
+            "Expected a regular file".into(),
+        Msg::HarnessJournalExpectedDirectory =>
+            "Expected a directory".into(),
+        Msg::HarnessJournalChangedBeforeAppend =>
+            "Session JSONL changed before append".into(),
+        Msg::HarnessJournalRollbackFailed { error, rollback } =>
+            format!("{error}. Failed to roll back the append: {rollback}").into(),
+        Msg::HarnessJournalInUse =>
+            "Session is in use".into(),
+        Msg::HarnessJournalNativeConflict =>
+            "Session ID also belongs to the native store".into(),
+        Msg::HarnessJournalUnknownOwner =>
+            "Cannot identify the harness journal".into(),
+        Msg::HarnessJournalLegacyConflict =>
+            "A legacy journal with the same session ID exists in the storage root".into(),
+        Msg::SessionStoreDeleteUnsupported =>
+            "This session store does not support deletion".into(),
+        Msg::HarnessJournalWriteStopped { error } =>
+            format!("{error}. Subsequent events for this session will not be saved").into(),
+        Msg::HarnessJournalWriterStartFailed { error } =>
+            format!("Failed to start the session journal writer: {error}").into(),
+        Msg::HarnessJournalWriterTerminated =>
+            "The session journal writer terminated unexpectedly".into(),
+        Msg::HarnessJournalNewerFormat { version, supported } =>
+            format!("Session format {version} is newer than this build supports ({supported})").into(),
+        Msg::HarnessJournalInvalidHeader { error } =>
+            format!("Invalid session header: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
@@ -828,6 +856,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::UpgradeFailed { error } =>
             format!("Upgrade failed: {}", error).into(),
+        Msg::UpgradeManifestConnectionFailed =>
+            "Unable to connect to the update server. The upgrade hasn't started. Check your network or proxy settings and try again.".into(),
         Msg::UpgradeRolledBack { exe, backup } =>
             format!("\n✓ Rolled back. Current binary: {}; other version saved at {}\n  Restarting rolled-back version...\n", exe, backup).into(),
         Msg::RollbackUpdatesPaused =>
@@ -1507,7 +1537,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdCatalogSkillDiagnostics => "Skill loading diagnostics".into(),
         Msg::CmdSkillsHistory => "Session skill usage history (not active permissions)".into(),
         Msg::CmdSkillsListOption => "Usage and session history; combine with $a $b task".into(),
-        Msg::CmdSkillsHelp => "List usage/history: /skills --list\nUse multiple skills: /skills <name> [name2 ...] [task]\nTUI shorthand: $<name> $<name2> [task] (¥ is also accepted).\nExplicit $names must all exist. Once task text begins, later $words remain task text.\nRun again to inject again. Usage history does not imply active permissions or retained model context.".into(),
+        Msg::CmdSkillsHelp => "List usage/history: /skills --list\nUse multiple skills: /skills <name> [name2 ...] [task]\nTUI shorthand: $<name> $<name2> [task] (¥ and ￥ are also accepted).\nExplicit $names must all exist. Once task text begins, later $words remain task text.\nRun again to inject again. Usage history does not imply active permissions or retained model context.".into(),
         Msg::CmdSkillUsed { count, turn } => format!("Used in this session: {count} turn(s), latest turn {turn}" ).into(),
         Msg::CmdSkillReload { name, turn } => format!("{name} was used in turn {turn}; this invocation will inject it again.").into(),
         Msg::CmdSkillUnknownExplicit { name } => format!("Unknown or non-invocable skill `{name}`; no skills were submitted. Use /skills to list available names.").into(),
@@ -1767,7 +1797,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::StreamRecoveryPreserved { max_recoveries } => format!("Model response interrupted. Received content was preserved; attempting to continue (up to {max_recoveries} automatic recoveries per turn).").into(),
         Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("Connection interrupted; progress preserved. Continuing in {delay_secs}s ({attempt}/{max_recoveries}); press Esc to cancel.").into(),
         Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "Automatic recovery is disabled. Safely preservable content was kept. Check the connection or model service, then send 'continue'.".into(),
-        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'.").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'. If the conversation is long, running /compact first shrinks the request body, which helps on a weak network.").into(),
         Msg::StreamRecoveryUnsafeTools => "Response interrupted with incomplete or unconfirmed tool output; automatic recovery stopped to avoid duplicate execution. Safely preservable content was kept. Check tool results before continuing.".into(),
         Msg::StreamRecoveryNoProgress => "Response interrupted without enough safe progress to continue; no automatic continuation was attempted. Check the connection or model service and retry.".into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),

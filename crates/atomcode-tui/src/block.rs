@@ -218,6 +218,25 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The raw text a live block is growing, before display trimming.
+    ///
+    /// The live cache trims outer blank lines itself and extends that trim by
+    /// the appended suffix, so it needs the untrimmed text. Defaults to
+    /// [`Self::growing_text`] for content whose growing text needs no trim.
+    fn growing_raw(&self) -> Option<&str> {
+        self.growing_text()
+    }
+
+    /// Append to this block's text without rebuilding it.
+    ///
+    /// The default refuses. A content that only ever grows (a streamed answer
+    /// or reasoning) overrides this to push the delta onto its own text, so a
+    /// producer does not copy the whole reply for every delta. Return `false`
+    /// when the content cannot grow this way; the caller then replaces it.
+    fn append(&mut self, _delta: &str) -> bool {
+        false
+    }
+
     /// Refuse to be folded.
     ///
     /// For the rare block whose whole point is that it happened — a skill being
@@ -304,13 +323,19 @@ pub enum Slot {
 
 /// A live block's last render, so the next frame renders only what is new.
 ///
-/// A live block is re-rendered every frame — it can have changed — and a
-/// streaming answer only ever grows, so re-parsing all of it to add a word is
-/// what makes a frame cost the length of the answer. Everything before the last
-/// settled line boundary is fixed, so it is kept and only the tail is rendered
-/// again. This dies with the block it describes, like [`Settled`]'s row count.
+/// A live block renders every frame. An append keeps the settled line boundary.
+/// The cache reuses those rows and renders only the new tail.
+/// An amend checks the prefix before it reuses the rows.
+/// This cache ends with its block, like [`Settled`]'s row count.
 #[derive(Debug, Default)]
-pub struct LiveCache(RwLock<Option<CachedRender>>);
+pub struct LiveCache(RwLock<LiveCacheState>);
+
+#[derive(Debug, Default)]
+struct LiveCacheState {
+    render: Option<CachedRender>,
+    /// An `amend` can replace the text. Check its prefix before reusing rows.
+    amended: bool,
+}
 
 /// How many times a live re-render resumed from the cache. Test-only: whether a
 /// frame rendered one line or the whole answer cannot be seen in its output,
@@ -327,10 +352,11 @@ struct CachedRender {
     /// answer". **No palette** — colour is not decided here (see [`ShapeCaps`]),
     /// so a theme change does not walk into this branch.
     key: (u16, ShapeCaps),
-    /// The source the lines were rendered from, whole. The prefix check against
-    /// it is what makes reuse safe: text that was extended is text the kept
-    /// lines still describe, and text that was edited is not.
-    source: String,
+    /// The raw text from the last render. A valid extension appends its suffix.
+    /// An edit rebuilds the cache.
+    raw: String,
+    /// The display view within `raw`: outer blank lines trimmed.
+    trim: GrowingTrim,
     /// The rows this render produced, shared with whoever is drawing them.
     ///
     /// A handle rather than a copy: a frame wants a screenful of a block that
@@ -340,10 +366,133 @@ struct CachedRender {
     /// this is the only handle left — which it is once the frame that took the
     /// last one has been painted and dropped — and copies when it is not.
     lines: Arc<Vec<Line>>,
-    /// Byte offset in `source`, and line count in `lines`, up to which nothing
-    /// can change. See [`crate::markdown::render_settled`].
+    /// Byte offset in the display view, and line count in `lines`, up to which
+    /// nothing can change. See [`crate::markdown::render_settled`].
     settled: usize,
     settled_lines: usize,
+}
+
+impl CachedRender {
+    fn new(text: &str, key: (u16, ShapeCaps)) -> Self {
+        let mut render = Self {
+            key,
+            raw: String::with_capacity(text.len()),
+            trim: GrowingTrim::default(),
+            lines: Arc::new(Vec::new()),
+            settled: 0,
+            settled_lines: 0,
+        };
+        render.extend(text);
+        render
+    }
+
+    fn extend(&mut self, delta: &str) {
+        let previous_end = self.trim.end;
+        self.raw.push_str(delta);
+        self.trim.extend(delta);
+        // An unchanged display view can keep its rows even while a caller
+        // still holds them. Trailing blank lines become visible with later text.
+        if self.trim.end == previous_end {
+            return;
+        }
+        let shown = self
+            .raw
+            .get(self.trim.range())
+            .expect("display trim follows UTF-8 character boundaries");
+        let tail = shown
+            .get(self.settled..)
+            .expect("settled boundary remains in the growing display text");
+        let rendered = crate::markdown::render_settled(tail, self.key.0, Style::new());
+        let lines = Arc::make_mut(&mut self.lines);
+        lines.truncate(self.settled_lines);
+        lines.extend(rendered.lines);
+        self.settled += rendered.settled;
+        self.settled_lines += rendered.settled_lines;
+    }
+}
+
+/// The display view of a growing text: outer blank lines trimmed.
+///
+/// The live cache keeps this in step with the text as it is appended. A frame
+/// then reads the new suffix instead of rescanning the whole reply. It mirrors
+/// [`crate::content::ModelSaid`]'s `display_text`, which the settled render
+/// uses.
+#[derive(Clone, Copy, Debug, Default)]
+struct GrowingTrim {
+    /// Length of the text this state describes.
+    len: usize,
+    /// Start of the first non-blank line, once one has arrived.
+    start: Option<usize>,
+    /// End of the last non-blank line, excluding its line ending.
+    end: usize,
+    /// Start of the line the text currently ends in.
+    line_start: usize,
+    /// Whether the current last line's content so far is non-blank.
+    last_line_nonblank: bool,
+    /// Whether the text currently ends with `\n`.
+    ends_with_newline: bool,
+}
+
+impl GrowingTrim {
+    /// Extend the view by `delta`, which the caller has already appended to the
+    /// text this state describes.
+    fn extend(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let old_len = self.len;
+        let mut offset = 0usize;
+        let mut first = true;
+        for raw_line in delta.split_inclusive('\n') {
+            let seg_start = old_len + offset;
+            offset += raw_line.len();
+            let has_newline = raw_line.ends_with('\n');
+            let content = raw_line.trim_end_matches(['\r', '\n']);
+            let continues = first && !self.ends_with_newline;
+            let line_nonblank = if continues {
+                self.last_line_nonblank || !raw_line.trim().is_empty()
+            } else {
+                !raw_line.trim().is_empty()
+            };
+            let line_start = if continues {
+                self.line_start
+            } else {
+                seg_start
+            };
+            if line_nonblank {
+                self.start.get_or_insert(line_start);
+                // A delta that adds only line-ending characters to a line that
+                // was already non-blank does not move its content end. The
+                // combined line's trailing `\r`/`\n` are trimmed, including a
+                // `\r` the previous delta left at the end. This keeps the
+                // incremental view equal to `display_text` when a delta
+                // boundary splits a CRLF.
+                self.end = if content.is_empty() {
+                    self.end
+                } else {
+                    seg_start + content.len()
+                };
+            }
+            if has_newline {
+                self.line_start = seg_start + raw_line.len();
+                self.last_line_nonblank = false;
+            } else {
+                self.line_start = line_start;
+                self.last_line_nonblank = line_nonblank;
+            }
+            self.ends_with_newline = has_newline;
+            first = false;
+        }
+        self.len = old_len + delta.len();
+    }
+
+    /// The display view within the text: outer blank lines trimmed.
+    fn range(&self) -> std::ops::Range<usize> {
+        match self.start {
+            Some(start) => start..self.end.max(start),
+            None => 0..0,
+        }
+    }
 }
 
 /// A settled block, and how many rows it was last measured to draw.
@@ -406,52 +555,34 @@ impl Slot {
     pub fn rows_at(&self, ctx: &RenderCtx) -> (usize, Option<Arc<Vec<Line>>>) {
         match self {
             Slot::Live(b, cache) => {
-                let Some(text) = b.content.growing_text() else {
+                let Some(text) = b.content.growing_raw() else {
                     let lines = b.content.lines(ctx);
                     return (lines.len(), Some(Arc::new(lines)));
                 };
-                let width = ctx.width;
+                let key = (ctx.width, ctx.caps);
                 let mut cached = cache.0.write().expect("live cache poisoned");
-                let base = Style::new();
-                let rendered = match cached.take() {
-                    // Reuse what is settled only when the same width rendered it
-                    // and the text is an extension of what did. Anything else — a
-                    // resize, an edit, a different block — renders the whole
-                    // thing.
-                    Some(mut c) if c.key == (width, ctx.caps) && text.starts_with(&c.source) => {
+                let amended = cached.amended;
+                let rendered = cached
+                    .render
+                    .take()
+                    .filter(|render| render.key == key)
+                    .and_then(|mut render| {
+                        // Only an amend can replace the prefix. Appends already
+                        // preserve it, so they just read the new byte range.
+                        let delta = if amended {
+                            text.strip_prefix(render.raw.as_str())?
+                        } else {
+                            text.get(render.raw.len()..)?
+                        };
                         #[cfg(test)]
                         LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
-                        // Everything before the last settled boundary is fixed;
-                        // render from there, which is the part still in flux.
-                        let lines = Arc::make_mut(&mut c.lines);
-                        lines.truncate(c.settled_lines);
-                        #[allow(
-                            clippy::string_slice,
-                            reason = "`c.settled` is a byte offset this render produced at a line boundary — the byte after a `\\n` — and `text` extends `c.source` byte for byte (the `starts_with` above), so the same offset is a char boundary in `text` too"
-                        )]
-                        let tail = crate::markdown::render_settled(&text[c.settled..], width, base);
-                        lines.extend(tail.lines);
-                        c.settled += tail.settled;
-                        c.settled_lines += tail.settled_lines;
-                        // Kept, not replaced: the same buffer, so a growing
-                        // answer does not re-allocate its own source every frame.
-                        c.source.clear();
-                        c.source.push_str(text);
-                        c
-                    }
-                    _ => {
-                        let r = crate::markdown::render_settled(text, width, base);
-                        CachedRender {
-                            key: (width, ctx.caps),
-                            source: text.to_string(),
-                            lines: Arc::new(r.lines),
-                            settled: r.settled,
-                            settled_lines: r.settled_lines,
-                        }
-                    }
-                };
+                        render.extend(delta);
+                        Some(render)
+                    })
+                    .unwrap_or_else(|| CachedRender::new(text, key));
                 let lines = Arc::clone(&rendered.lines);
-                *cached = Some(rendered);
+                cached.render = Some(rendered);
+                cached.amended = false;
                 let n = lines.len();
                 (n, Some(lines))
             }
@@ -646,7 +777,6 @@ impl Stream {
             stream: self,
             producer,
             dir: None,
-            members_working: 0,
         }
     }
 }
@@ -663,20 +793,9 @@ pub struct StreamWriter<'a> {
     /// The directory the session works in, as the host answered it — `None`
     /// until it has (see [`StreamWriter::dir`]).
     dir: Option<Arc<str>>,
-    members_working: usize,
 }
 
 impl StreamWriter<'_> {
-    /// Live member count supplied by the host; replay defaults to zero.
-    pub fn with_members_working(mut self, n: usize) -> Self {
-        self.members_working = n;
-        self
-    }
-
-    pub fn members_working(&self) -> usize {
-        self.members_working
-    }
-
     /// The same writer, for a session the host says works in `dir`.
     pub fn in_dir(mut self, dir: Option<Arc<str>>) -> Self {
         self.dir = dir;
@@ -721,11 +840,28 @@ impl StreamWriter<'_> {
     /// producer. `false` if it has settled, does not exist, or is someone
     /// else's — never a panic, and never a silent write to a frozen block.
     pub fn amend(&mut self, id: BlockId, content: Arc<dyn Content>) -> bool {
+        let Some(Slot::Live(block, cache)) = self.stream.live_at(id, self.producer) else {
+            return false;
+        };
+        cache.0.write().expect("live cache poisoned").amended = true;
+        block.content = content;
+        true
+    }
+
+    /// Append a delta to a live block's own text, when this writer owns the
+    /// content.
+    ///
+    /// `false` when the block settled or vanished (not ours), when its content
+    /// cannot grow by appending, or when a frame still holds a handle to it.
+    /// The caller then rebuilds the content and calls [`Self::amend`].
+    pub fn append(&mut self, id: BlockId, delta: &str) -> bool {
         let Some(Slot::Live(block, _)) = self.stream.live_at(id, self.producer) else {
             return false;
         };
-        block.content = content;
-        true
+        match Arc::get_mut(&mut block.content) {
+            Some(content) => content.append(delta),
+            None => false,
+        }
     }
 
     /// Freeze a block. Idempotent, and a no-op for someone else's.
@@ -1182,6 +1318,28 @@ mod tests {
     }
 
     #[test]
+    fn two_amends_without_a_render_recheck_the_cached_prefix() {
+        let _alone = live_alone();
+        let ctx = RenderCtx::bare(30);
+        for (first, last) in [("first answer\n", "another answer\n"), ("é\n", "αβ\n")] {
+            let mut stream = Stream::new();
+            let id = stream.writer("model").open(Coord::new(1, 1), grew(first));
+            stream.get(id).unwrap().rows_at(&ctx);
+
+            stream.writer("model").amend(id, grew("intermediate\n"));
+            stream.writer("model").amend(id, grew(last));
+
+            LIVE_RESUMES.store(0, At::Relaxed);
+            let (_, lines) = stream.get(id).unwrap().rows_at(&ctx);
+            assert_eq!(resumes(), 0, "a replacement cannot reuse old rows");
+            assert_eq!(
+                *lines.unwrap(),
+                crate::markdown::render(last.trim_end(), 30, Style::new())
+            );
+        }
+    }
+
+    #[test]
     fn the_rows_a_frame_drew_are_extended_in_place_not_copied_out() {
         // The cost this exists for. A frame wants a screenful of a block that
         // may be hundreds of rows tall, so the cache hands the rows over instead
@@ -1229,6 +1387,62 @@ mod tests {
     }
 
     #[test]
+    fn an_appended_delta_resumes_without_rebuilding_the_raw_text() {
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = s
+            .writer("model")
+            .open(Coord::new(1, 1), grew("first line\n"));
+        let first = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a first render");
+        let home = Arc::as_ptr(&first) as usize;
+        drop(first);
+
+        LIVE_RESUMES.store(0, At::Relaxed);
+        assert!(s.writer("model").append(id, "second line\n"));
+        let second = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a second render");
+        assert_eq!(resumes(), 1, "the append resumed from the cache");
+        assert_eq!(
+            Arc::as_ptr(&second) as usize,
+            home,
+            "the rows were extended in place"
+        );
+    }
+
+    #[test]
+    fn unchanged_display_text_keeps_the_same_rows_until_visible_text_arrives() {
+        let _alone = live_alone();
+        let mut stream = Stream::new();
+        let ctx = RenderCtx::bare(30);
+        let id = stream.writer("model").open(Coord::new(1, 1), grew("前文"));
+        let (_, first) = stream.get(id).unwrap().rows_at(&ctx);
+        let first = first.unwrap();
+
+        for delta in ["", "\r", "\n", "\n"] {
+            assert!(stream.writer("model").append(id, delta));
+            let (_, same) = stream.get(id).unwrap().rows_at(&ctx);
+            assert!(Arc::ptr_eq(&first, &same.unwrap()));
+        }
+
+        assert!(stream.writer("model").append(id, "后文"));
+        let (_, next) = stream.get(id).unwrap().rows_at(&ctx);
+        assert_eq!(
+            *next.unwrap(),
+            crate::markdown::render("前文\r\n\n后文", 30, Style::new())
+        );
+        assert_eq!(*first, crate::markdown::render("前文", 30, Style::new()));
+    }
+
+    #[test]
     fn a_resize_starts_the_render_over() {
         let _alone = live_alone();
         let mut s = Stream::new();
@@ -1254,5 +1468,48 @@ mod tests {
             *lines.unwrap(),
             crate::markdown::render("a line long enough to wrap differently", 12, Style::new())
         );
+    }
+}
+
+#[cfg(test)]
+mod growing_trim_tests {
+    use super::GrowingTrim;
+    use crate::content::ModelSaid;
+
+    fn check(pieces: &[&str]) {
+        let text: String = pieces.concat();
+        let mut trim = GrowingTrim::default();
+        for piece in pieces {
+            trim.extend(piece);
+        }
+        let range = trim.range();
+        let got = text.get(range).expect("valid display trim");
+        let said = ModelSaid(text.clone());
+        let want = said.display_text();
+        assert_eq!(got, want, "pieces={pieces:?} text={text:?}");
+    }
+
+    #[test]
+    fn matches_display_text_when_trimmed_in_pieces() {
+        for pieces in [
+            vec![""],
+            vec!["abc"],
+            vec!["\n \r\nabc\n\n \t\n"],
+            vec!["abc", "def"],
+            vec!["abc\n", "def"],
+            vec!["\n\n", "abc"],
+            vec!["abc\r", "def\n\n"],
+            vec!["line1\n", "\n", "  \n", "line2\n"],
+            vec!["   ", "  x", "\n\n  "],
+            // A delta boundary that splits a CRLF: the incremental trim must
+            // match `display_text`, which trims the whole combined line.
+            vec!["ab\r", "\n"],
+            vec!["a\r\r", "\n"],
+            vec!["ab\r", "\r\n"],
+            vec!["ab\r", "xyz\n"],
+            vec!["ab\r", "\nxyz"],
+        ] {
+            check(&pieces);
+        }
     }
 }

@@ -1,7 +1,7 @@
 {
   "name": "atomcode-webui",
   "private": true,
-  "version": "5.2.8",
+  "version": "5.2.9",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,12 +17,16 @@
     "test:workspace-actions": "node scripts/workspace-actions-e2e.mjs",
     "test:session-fork": "node scripts/session-fork-e2e.mjs",
     "test:session-browse": "node scripts/session-browse-e2e.mjs",
+    "test:team-members": "node scripts/team-members-e2e.mjs",
+    "test:attach-menu": "node scripts/attach-menu-e2e.mjs",
     "test:message-images": "node scripts/message-images-e2e.mjs",
     "test:grouped-history": "node scripts/grouped-history-e2e.mjs",
     "test:turn-process": "node scripts/turn-process-e2e.mjs",
+    "test:turn-recap": "node scripts/turn-recap-e2e.mjs",
     "test:history-pagination": "node scripts/history-pagination-e2e.mjs",
     "test:context": "node scripts/context-summary-e2e.mjs",
     "test:workbench": "node scripts/workbench-e2e.mjs",
+    "test:git-panel": "node scripts/git-panel-e2e.mjs",
     "test:workbench-refresh": "node scripts/workbench-refresh-e2e.mjs",
     "test:scroll-ime": "node scripts/scroll-ime-e2e.mjs",
     "test:turn-anchor": "node scripts/turn-anchor-e2e.mjs",
@@ -32,7 +36,8 @@
     "test:vision-preprocessor": "node scripts/vision-preprocessor-e2e.mjs",
     "test:model-cards": "node scripts/model-cards-e2e.mjs",
     "test:git-branch": "node scripts/git-branch-e2e.mjs",
-    "test:mcp-session": "node scripts/mcp-session-e2e.mjs"
+    "test:mcp-session": "node scripts/mcp-session-e2e.mjs",
+    "test:live-goal": "node scripts/live-goal-e2e.mjs"
   },
   "engines": {
     "node": ">=22.6"

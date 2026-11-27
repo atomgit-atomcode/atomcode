@@ -15,18 +15,16 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+// What is worth remembering is the persona's `## MEMORY` guidance; this says how to call it.
 const MEMORY_DESC: &str = "Persist a durable, non-obvious learning about the user or THIS \
-project so future sessions remember it. Use `action:\"remember\"` when the user states a \
-lasting preference, corrects you in a way that should stick, or you discover a non-obvious \
-project convention/quirk. Use `action:\"forget\"` to drop entries matching a keyword, and \
-`action:\"list\"` to review current memory. DO NOT record: obvious facts, standard \
-tool/language behavior, anything already in AGENTS.md/.atomcode.md, verbose explanations, \
-or session-specific one-offs. Keep each entry to one concise line. \
-Entries have IDs and optional topic/source metadata. Use update with an ID to correct content \
-or metadata, pin with pinned:true|false to change budget priority, and deprecate with an ID \
-to retain an obsolete entry without injecting it. Use list with topic/status to filter. \
-Optional ttl_days on remember/update sets an expiry; clear_expiry removes it on update. Expired entries remain stored but are excluded from new session injection, even when pinned. List with expired or expiring_within_days to review. Unrelated edits never renew expiry. Exact ID mutations affect only the requested scope (project by default). \
-Updating disk memory does not rewrite the current session's injected context.";
+project so future sessions remember it — one concise line per entry. By `action`: `remember` adds an entry, \
+`forget` drops entries matching a keyword, `list` reviews them (filter by topic/status, or \
+`expired` / `expiring_within_days`). Entries have IDs and optional topic/source metadata: \
+`update` corrects content or metadata by ID, `pin` (pinned:true|false) changes budget priority, \
+and `deprecate` keeps an obsolete entry without injecting it. `ttl_days` on remember/update sets \
+an expiry (`clear_expiry` removes it); expired entries stay stored but are no longer injected. \
+ID mutations affect only the requested scope (project by default). Updating memory does not \
+rewrite this session's injected context.";
 
 /// Where each tier lives is the tool's to know, not the store's to look up: the
 /// host hands in its [`ProductDirs`], and may name a different global file on

@@ -85,7 +85,7 @@ fn each_panel_s_own_words_follow_the_language() {
     let (zh, en) = both(|| {
         vec![
             atomcode_tui::settings::Applies::Restart.say(),
-            atomcode_tui::providers::Tab::Accounts.label(),
+            atomcode_tui::i18n::t(atomcode_tui::i18n::Msg::ProviderSectionAdded).into_owned(),
             atomcode_tui::plugins::Scope::User.label(),
             atomcode_tui::plugins::Tab::Installed.label(),
             atomcode_tui::plugins::PluginAction::Uninstall.label(),

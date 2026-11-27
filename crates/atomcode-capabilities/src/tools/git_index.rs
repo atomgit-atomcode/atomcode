@@ -412,6 +412,9 @@ fn classify_inner(source: &str, depth: usize) -> Result<Option<Plan>, String> {
         };
     };
     let mut found = None;
+    let mut plans = 0;
+    // Whether every call besides the planned one is a literal read-only inspection.
+    let mut inspections_only = true;
     for call in &calls {
         let exe = literal(&call.command).unwrap_or_default();
         let raw: Vec<_> = std::iter::once(&call.command)
@@ -442,6 +445,7 @@ fn classify_inner(source: &str, depth: usize) -> Result<Option<Plan>, String> {
             }
         }
         if !matches!(base(&exe), "git" | "git.exe") {
+            inspections_only = false;
             continue;
         }
         let words = match words {
@@ -455,37 +459,102 @@ fn classify_inner(source: &str, depth: usize) -> Result<Option<Plan>, String> {
                 if !matches!(git_plan(&skeleton), Ok(None)) {
                     return Err(SPLIT.into());
                 }
+                inspections_only = false;
                 continue;
             }
         };
         if let Some(plan) = git_plan(&words)? {
             found = Some(plan);
+            plans += 1;
+        } else if !read_only_inspection(&words) {
+            inspections_only = false;
         }
     }
-    if found.is_none() {
+    let Some(plan) = found else {
         return Ok(None);
-    }
+    };
     let tree = parse_bash(source).ok_or(SPLIT)?;
     let root = tree.root_node();
     let nodes: Vec<_> = (0..root.named_child_count() as u32)
         .filter_map(|i| root.named_child(i))
         .filter(|n| n.kind() != "comment")
         .collect();
-    if calls.len() != 1
-        || nodes.len() != 1
-        || nodes[0].kind() != "command"
-        || (0..nodes[0].named_child_count() as u32)
-            .filter_map(|i| nodes[0].named_child(i))
-            .any(|n| {
-                !matches!(
+    let standalone = calls.len() == 1 && nodes.len() == 1 && simple_command(nodes[0]);
+    // `git add <explicit paths> && git diff --cached --stat` is the shape a model reaches
+    // for after staging. The inspections cannot move the index, so the review of the add
+    // still describes exactly what the chain leaves staged. A commit stays standalone:
+    // its review is of the index at the moment it runs, with nothing around it.
+    let staged_then_inspected = plans == 1
+        && inspections_only
+        && matches!(
+            plan.operation,
+            Operation::Stage {
+                broad: false,
+                force: false,
+                ..
+            }
+        )
+        && nodes.len() == 1
+        && and_chain(nodes[0]);
+    if !standalone && !staged_then_inspected {
+        return Err(SPLIT.into());
+    }
+    Ok(Some(plan))
+}
+
+/// One literal command: a name and plain words, with no redirection, assignment or substitution.
+fn simple_command(node: tree_sitter::Node) -> bool {
+    node.kind() == "command"
+        && (0..node.named_child_count() as u32)
+            .filter_map(|i| node.named_child(i))
+            .all(|n| {
+                matches!(
                     n.kind(),
                     "command_name" | "word" | "raw_string" | "string" | "concatenation" | "number"
                 )
             })
-    {
-        return Err(SPLIT.into());
+}
+
+/// Simple commands joined only by `&&` — no `;`, `||`, pipes, background jobs or subshells.
+fn and_chain(node: tree_sitter::Node) -> bool {
+    match node.kind() {
+        "command" => simple_command(node),
+        "list" => (0..node.child_count() as u32)
+            .filter_map(|i| node.child(i))
+            .all(|n| {
+                if n.is_named() {
+                    and_chain(n)
+                } else {
+                    n.kind() == "&&"
+                }
+            }),
+        _ => false,
     }
-    Ok(found)
+}
+
+/// A literal `git status|diff|log|show` that can write neither the index nor a file.
+fn read_only_inspection(words: &[String]) -> bool {
+    let Some(exe) = words.first() else {
+        return false;
+    };
+    if !is_git(exe) {
+        return false;
+    }
+    let mut at = 1;
+    while let Some(arg) = words.get(at).filter(|a| a.starts_with('-')) {
+        match arg.as_str() {
+            "-C" => at += 2,
+            "--no-pager" | "--literal-pathspecs" | "--no-optional-locks" => at += 1,
+            a if a.starts_with("-C") => at += 1,
+            _ => return false,
+        }
+    }
+    matches!(
+        words.get(at).map(String::as_str),
+        Some("status" | "diff" | "log" | "show")
+    ) && !words[at + 1..]
+        .iter()
+        .any(|w| w.starts_with("--output") || w == "--ext-diff")
 }
 
 /// Pure, argument-aware signal used by the ordinary shell approval path too.
@@ -830,6 +899,53 @@ mod tests {
             "git -c core.hooksPath=/tmp commit -m fix",
             "git add --pathspec-from-file=paths",
             "git add \"$file\"",
+        ] {
+            assert!(classify(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_staging_may_be_followed_by_read_only_inspection() {
+        // Refused before: models stage and check in one call, then spend a round retrying.
+        for command in [
+            "git add src/a.py tests/b.py && git --no-pager diff --cached --stat",
+            "git status --short && git add -- src/a.py && git diff --staged",
+            "git -C repo add src/a && git -C repo status",
+            "git add src/a && git log --oneline -3 && git show --stat HEAD",
+        ] {
+            assert!(
+                matches!(
+                    classify(command),
+                    Ok(Some(Plan {
+                        operation: Operation::Stage { broad: false, .. },
+                        ..
+                    }))
+                ),
+                "{command}"
+            );
+        }
+        for command in [
+            // A commit is reviewed against the index at the moment it runs, alone.
+            "git add src/a && git commit -m fix",
+            "git status && git commit -m fix",
+            // Broad or forced staging keeps its own preview path.
+            "git add . && git diff --cached",
+            "git add -A && git status",
+            "git add --force src/a && git status",
+            // Only `&&` between plain literal commands.
+            "git add src/a; git status",
+            "git add src/a || git status",
+            "git add src/a && git status | cat",
+            "git add src/a && git diff > staged.diff",
+            "git add src/a && (git status)",
+            // The companions must be read-only Git inspections.
+            "git add src/a && git diff --output=/tmp/x",
+            "git add src/a && git diff --ext-diff",
+            "git add src/a && git add src/b",
+            "git add src/a && git stash",
+            "git add src/a && rm -rf build",
+            "cd repo && git add src/a",
+            "git add src/a && git -c core.pager=x diff",
         ] {
             assert!(classify(command).is_err(), "{command}");
         }

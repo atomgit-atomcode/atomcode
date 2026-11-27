@@ -741,6 +741,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             let closing = registry.closing.clone();
             let connection_barrier = registry.connection_barrier.clone();
             let connected_configs = registry.connected_configs.clone();
+            let listed_tools = registry.listed_tools.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
             let failed_servers = registry.failed_servers.clone();
             let status_overrides = registry.status_overrides.clone();
@@ -757,6 +758,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         let closing = closing.clone();
                         let connection_barrier = connection_barrier.clone();
                         let connected_configs = connected_configs.clone();
+                        let listed_tools = listed_tools.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
                         let failed_servers = failed_servers.clone();
                         let status_overrides = status_overrides.clone();
@@ -872,6 +874,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                         }
                                     };
                                     let old = servers.insert(name.clone(), client);
+                                    listed_tools
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .remove(&name);
                                     let retired = RetiringClient {
                                         client: old,
                                         connection: Some(connection),
@@ -1045,6 +1051,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
         let mut servers = self.servers.write().await;
         let (client, connection) = client.publish()?;
         let old = servers.insert(config.name.clone(), client);
+        self.record_listed(&config.name, None);
         let retired = RetiringClient {
             client: old,
             connection: Some(connection),
@@ -1171,12 +1178,20 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .into_iter()
             .map(|(server_name, client)| async move {
                 let result = client.list_tools().await;
-                (server_name, result)
+                (server_name, client, result)
             })
             .collect();
         let mut all_tools = Vec::new();
 
-        while let Some((server_name, result)) = pending.next().await {
+        while let Some((server_name, client, result)) = pending.next().await {
+            // Keep the client current until its discovery result has been published.
+            let servers = self.servers.read().await;
+            if !servers
+                .get(&server_name)
+                .is_some_and(|live| Arc::ptr_eq(live, &client))
+            {
+                continue;
+            }
             match result {
                 Ok(result) => {
                     self.status_overrides
@@ -1274,7 +1289,15 @@ It cannot override system, user, project, safety, permission, or approval rules.
             return Vec::new();
         };
 
-        match client.list_tools().await {
+        let result = client.list_tools().await;
+        let servers = self.servers.read().await;
+        if !servers
+            .get(server_name)
+            .is_some_and(|live| Arc::ptr_eq(live, &client))
+        {
+            return Vec::new();
+        }
+        match result {
             Ok(result) => {
                 self.status_overrides
                     .write()
@@ -1320,7 +1343,72 @@ It cannot override system, user, project, safety, permission, or approval rules.
         tokio::select! {
             biased;
             _ = self.closing.cancelled() => anyhow::bail!("MCP registry is shut down"),
-            result = self.call_open_tool(server_name, tool_name, arguments) => result,
+            result = self.call_open_tool(server_name, tool_name, arguments, None) => result,
+        }
+    }
+
+    /// Resolve the published alias without guessing how a raw MCP name was encoded.
+    pub fn team_query_info(&self, alias: &str, role: &str) -> Option<McpToolInfo> {
+        let (server, tool) = self.tool_aliases.read().ok()?.get(alias)?.clone();
+        self.authorized_team_query(&server, &tool, role)
+    }
+
+    /// Already authorized read-only tools published by the selected servers.
+    pub fn team_query_aliases(&self, role: &str, servers: &[String]) -> Vec<String> {
+        let Ok(aliases) = self.tool_aliases.read() else {
+            return Vec::new();
+        };
+        let candidates: Vec<_> = aliases
+            .iter()
+            .filter(|(_, (server, _))| servers.contains(server))
+            .map(|(alias, (server, tool))| (alias.clone(), server.clone(), tool.clone()))
+            .collect();
+        drop(aliases);
+        let mut names: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|(alias, server, tool)| {
+                self.authorized_team_query(&server, &tool, role)
+                    .map(|_| alias)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn authorized_team_query(&self, server: &str, tool: &str, role: &str) -> Option<McpToolInfo> {
+        use super::config::McpConfigSource;
+        let configs = self.connected_configs.read().ok()?;
+        let config = configs.get(server)?;
+        if config.source == McpConfigSource::Project
+            || !self.tool_allowed(server, tool)
+            || !config
+                .team_read_only_tools
+                .get(role)?
+                .iter()
+                .any(|name| name == tool)
+        {
+            return None;
+        }
+        self.listed_tools
+            .read()
+            .ok()?
+            .get(server)?
+            .iter()
+            .find(|info| info.tool_name == tool && info.read_only)
+            .cloned()
+    }
+
+    pub(super) async fn call_team_query(
+        &self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+        role: &str,
+    ) -> Result<super::types::CallToolResult> {
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => anyhow::bail!("MCP registry is shut down"),
+            result = self.call_open_tool(server, tool, args, Some(role)) => result,
         }
     }
 
@@ -1329,6 +1417,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
         server_name: &str,
         tool_name: &str,
         arguments: serde_json::Value,
+        team_role: Option<&str>,
     ) -> Result<super::types::CallToolResult> {
         if !self.tool_allowed(server_name, tool_name) {
             anyhow::bail!(
@@ -1341,6 +1430,13 @@ It cannot override system, user, project, safety, permission, or approval rules.
         // for an MCP tool execution to finish or time out.
         let client = {
             let servers = self.servers.read().await;
+            // Connection replacement publishes its config while holding this same lock.
+            if team_role.is_some_and(|role| {
+                self.authorized_team_query(server_name, tool_name, role)
+                    .is_none()
+            }) {
+                anyhow::bail!("MCP query is no longer granted for team members");
+            }
             servers
                 .get(server_name)
                 .map(Arc::clone)
@@ -2218,6 +2314,7 @@ mod tests {
             source: super::super::config::McpConfigSource::Driver,
             trust: false,
             auto_approve: vec![],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };
@@ -2274,6 +2371,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec!["query".to_string(), "mcp__docs__search".to_string()],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };
@@ -2311,6 +2409,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![format!("mcp__{server}__{tool}")],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };
@@ -2382,6 +2481,7 @@ mod tests {
             },
             trust: false,
             auto_approve: vec![],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
         };
@@ -2401,6 +2501,43 @@ mod tests {
     }
 
     #[test]
+    fn role_queries_require_current_user_grant_and_read_only_discovery() {
+        use super::super::config::{parse_mcp_servers, McpConfigSource};
+        let registry = McpRegistry::new("/unused");
+        let json = r#"{"mcpServers":{"docs":{"command":"docs","trust":true,"autoApprove":["find"],"teamReadOnlyTools":{"research":["find"]}}}}"#;
+        let alias = "mcp__docs__find";
+        registry.register_tool_alias(alias, "docs", "find").unwrap();
+        let mut info = McpToolInfo {
+            server_name: "docs".into(),
+            tool_name: "find".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type":"object"}),
+            read_only: true,
+        };
+        registry.record_listed("docs", Some(std::slice::from_ref(&info)));
+        for (source, granted) in [
+            (McpConfigSource::User, true),
+            (McpConfigSource::Project, false),
+            (McpConfigSource::Driver, true),
+        ] {
+            let config = parse_mcp_servers(json, source).unwrap().remove(0);
+            registry
+                .connected_configs
+                .write()
+                .unwrap()
+                .insert("docs".into(), config);
+            assert_eq!(
+                registry.team_query_info(alias, "research").is_some(),
+                granted
+            );
+            assert!(registry.team_query_info(alias, "other").is_none());
+        }
+        info.read_only = false;
+        registry.record_listed("docs", Some(&[info]));
+        assert!(registry.team_query_info(alias, "research").is_none());
+    }
+
+    #[test]
     fn retained_connection_requires_the_config_that_really_connected() {
         let registry = McpRegistry::new("/nonexistent/tree");
         let original = McpServerConfig {
@@ -2409,6 +2546,7 @@ mod tests {
             disabled: false,
             trust: false,
             auto_approve: vec![],
+            team_read_only_tools: Default::default(),
             allowed_tools: None,
             required_experimental_capabilities: Default::default(),
             config: super::super::config::McpTransportConfig::Stdio {
@@ -2504,6 +2642,53 @@ mod tests {
             registry.server_statuses().await,
             vec![("slow".into(), ServerStatus::Disconnected)]
         );
+    }
+
+    #[tokio::test]
+    async fn late_discovery_cannot_overwrite_a_replacement_connections_tools() {
+        for list_all in [false, true] {
+            let registry = McpRegistry::new("/unused");
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let client = || {
+                Arc::new(BarrierListClient {
+                    name: "docs".into(),
+                    barrier: barrier.clone(),
+                }) as Arc<dyn McpClient>
+            };
+            registry
+                .servers
+                .write()
+                .await
+                .insert("docs".into(), client());
+            let discovery = async {
+                if list_all {
+                    registry.list_all_tools().await
+                } else {
+                    registry.list_tools_for_server("docs").await
+                }
+            };
+            tokio::pin!(discovery);
+            assert!(futures::poll!(&mut discovery).is_pending());
+            registry
+                .servers
+                .write()
+                .await
+                .insert("docs".into(), client());
+            registry.record_listed(
+                "docs",
+                Some(&[McpToolInfo {
+                    server_name: "docs".into(),
+                    tool_name: "current".into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                    read_only: false,
+                }]),
+            );
+            barrier.wait().await;
+            discovery.await;
+            assert_eq!(registry.listed_tools().len(), 1);
+            assert_eq!(registry.listed_tools()[0].tool_name, "current");
+        }
     }
 
     #[tokio::test]

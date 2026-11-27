@@ -201,6 +201,11 @@ jobs:
           cargo nextest run -p atomcode-capabilities --lib
           -E 'test(windows_encoding_tests) | test(windows_powershell_versions) | test(chinese_workspace_paths) | test(encoded_command_preserves) | test(windows_diagnostics)'
 
+      - name: Check Windows credential ACLs with a restricted reader
+        run: >-
+          cargo nextest run -p atomcode-config --lib
+          -E 'test(windows_private_file_acl)'
+
       # The vendored dependency is outside the workspace, so use its manifest
       # to include its own test dependencies and exercise the native parser.
       - name: Preserve Windows Alt-release Unicode text commits

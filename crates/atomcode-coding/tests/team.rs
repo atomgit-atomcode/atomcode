@@ -1,4 +1,4 @@
-//! A team: members that stay, report to the lead, and only to the lead.
+//! A team: members that stay, report to the lead and hand off work when authorized.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -287,6 +287,119 @@ async fn a_member_that_finishes_silently_is_reported_on() {
     );
 }
 
+/// A progress note is not a report on the task: a member that sends one and
+/// then ends its turn is idle with the work unfinished, and a lead told only
+/// "next I will read the following file" would wait for it forever.
+#[tokio::test]
+async fn a_member_that_stops_after_a_progress_note_is_reported_on() {
+    let dir = scratch("progress");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "", calls = [ { name = "tell_parent", args = { kind = "progress", text = "done 10 of 41; next I read mod.rs" } } ] }, { text = "Progress reported to the lead." }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    // The note and the turn's end are two messages; the second may land after
+    // a lead turn has already claimed the first.
+    let mut heard = Vec::new();
+    for _ in 0..100 {
+        heard = heard_by(&app, &lead).await;
+        if heard.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let texts: Vec<&str> = heard.iter().map(|(_, text)| text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("next I read mod.rs")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("[scout finished turn 1") && t.contains("progress")),
+        "the lead hears that the member stopped after only a progress note: {texts:?}"
+    );
+}
+
+/// A final report reminds the lead to stop the member once it is satisfied, so a
+/// finished member does not sit idle on the team; a progress note does not.
+#[tokio::test]
+async fn a_done_report_reminds_the_lead_to_stop_the_member() {
+    let dir = scratch("done-stop");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "", calls = [ { name = "tell_parent", args = { kind = "progress", text = "halfway" } }, { name = "tell_parent", args = { text = "all 41 written" } } ] }, { text = "Reported." }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    let mut heard = Vec::new();
+    for _ in 0..100 {
+        heard = heard_by(&app, &lead).await;
+        if heard.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let texts: Vec<&str> = heard.iter().map(|(_, text)| text.as_str()).collect();
+    let progress = texts
+        .iter()
+        .find(|t| t.contains("halfway"))
+        .expect("the note");
+    let done = texts
+        .iter()
+        .find(|t| t.contains("all 41 written"))
+        .expect("the report");
+    assert!(!progress.contains("`stop` it"), "{progress}");
+    assert!(done.contains("`stop` it"), "{done}");
+}
+
+/// A lead that hands writing to a read-only role learns it when it delegates,
+/// not from the member's report after the whole task has been read through.
+#[tokio::test]
+async fn delegating_to_a_read_only_role_says_it_cannot_write() {
+    let dir = scratch("read-only");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "nothing to report" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let delegated = lead
+        .session()
+        .events()
+        .into_iter()
+        .find_map(|e| match e.event {
+            SessionEvent::ToolResultLogged { content, .. }
+                if content.starts_with("delegated to `scout`") =>
+            {
+                Some(content)
+            }
+            _ => None,
+        })
+        .expect("the delegation's result");
+    assert!(
+        delegated.contains("read-only") && delegated.contains("cannot create or edit files"),
+        "{delegated}"
+    );
+}
+
 #[tokio::test]
 async fn status_tell_and_stop_are_the_leads_to_call() {
     let dir = scratch("lifecycle");
@@ -425,7 +538,7 @@ async fn headless_team_wait_returns_member_report_without_status_polling() {
 }
 
 #[tokio::test]
-async fn a_member_can_only_address_the_lead() {
+async fn a_member_cannot_address_a_teammate_without_a_grant() {
     let dir = scratch("only-lead");
     let app = start(tree(
         &dir,
@@ -441,6 +554,7 @@ async fn a_member_can_only_address_the_lead() {
         .unwrap();
     let names = scout.ctx().service::<ToolsSvc>().unwrap().names();
     assert!(names.contains(&"tell_parent".to_string()), "{names:?}");
+    assert!(names.contains(&"tell_sibling".to_string()), "{names:?}");
     assert!(
         !names.contains(&"team".to_string()),
         "a member cannot delegate: {names:?}"
@@ -453,6 +567,252 @@ async fn a_member_can_only_address_the_lead() {
         !names.contains(&"write_file".to_string()),
         "an explorer reads: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn authorized_team_peer_messages_leave_notes_or_wake_only_the_recipient() {
+    let dir = scratch("peer-handoff");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "lead must stay idle" }"#,
+        r#"{ text = "first" }, { text = "second" }, { text = "handoff handled" }, { text = "replacement" }, { text = "outside" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let spawn = |name: &str| {
+        serde_json::json!({"action": "delegate", "name": name, "role": "explorer", "task": "inspect"}).to_string()
+    };
+    for name in ["source", "target"] {
+        let created = as_lead(&app, &lead, &spawn(name)).await;
+        assert!(!created.is_error, "{}", created.content);
+        let member = agents
+            .by_session(&format!("{}/{name}", lead.session_id()))
+            .unwrap();
+        settled(&member, 1).await;
+    }
+    let source = agents
+        .by_session(&format!("{}/source", lead.session_id()))
+        .unwrap();
+    let target = agents
+        .by_session(&format!("{}/target", lead.session_id()))
+        .unwrap();
+    // Under test the lead has no pump; clear the reports of the initial assignments.
+    let _ = lead.inbox().withdraw_messages();
+    let send = |member: Arc<Agent>, args: &'static str| async move {
+        let tool = member
+            .ctx()
+            .service::<ToolsSvc>()
+            .unwrap()
+            .get("tell_sibling")
+            .unwrap();
+        atomcode_harness::agent::as_agent(member.ctx().clone(), async move {
+            tool.execute(
+                args,
+                &ToolContext {
+                    working_dir: std::env::current_dir().unwrap(),
+                    cancel: Default::default(),
+                    progress: ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await
+        })
+        .await
+    };
+    const GRANT: &str = r#"{"action":"allow_peer","name":"source","to":"target"}"#;
+    const NOTE: &str = r#"{"to":"target","text":"read next turn"}"#;
+    assert!(send(source.clone(), NOTE).await.is_error);
+    assert!(!as_lead(&app, &lead, GRANT).await.is_error);
+    assert!(
+        send(target.clone(), r#"{"to":"source","text":"reverse"}"#)
+            .await
+            .is_error
+    );
+    assert!(!send(source.clone(), NOTE).await.is_error);
+    assert!(!target.inbox().has_waking_input());
+    assert_eq!(turns_ended(&target), 1);
+    assert!(
+        !send(
+            source.clone(),
+            r#"{"to":"target","text":"take the handoff","wake":true}"#
+        )
+        .await
+        .is_error
+    );
+    settled(&target, 2).await;
+    assert_eq!(
+        peers(&target)
+            .iter()
+            .filter(|(from, text)| from == source.session_id()
+                && (text.contains("read next turn") || text.contains("take the handoff")))
+            .count(),
+        2
+    );
+    assert!(!lead.inbox().has_waking_input());
+    assert_eq!(turns_ended(&lead), 0);
+
+    assert!(
+        !as_lead(
+            &app,
+            &lead,
+            r#"{"action":"revoke_peer","name":"source","to":"target"}"#
+        )
+        .await
+        .is_error
+    );
+    assert!(send(source.clone(), NOTE).await.is_error);
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(
+        !status.content.contains("peer targets"),
+        "{}",
+        status.content
+    );
+    assert!(!as_lead(&app, &lead, GRANT).await.is_error);
+    assert!(
+        !as_lead(&app, &lead, r#"{"action":"stop","name":"target"}"#)
+            .await
+            .is_error
+    );
+    assert!(send(source.clone(), NOTE).await.is_error);
+    assert!(!as_lead(&app, &lead, &spawn("target")).await.is_error);
+    assert!(send(source, NOTE).await.is_error);
+
+    let ctx = app.context();
+    let other_lead = agents
+        .create(
+            &ctx,
+            atomcode_harness::agent::CreateAgent::root(&ctx).id("other-team"),
+        )
+        .await
+        .unwrap();
+    assert!(!as_lead(&app, &other_lead, &spawn("outside")).await.is_error);
+    assert!(agents.by_session("other-team/outside").is_some());
+    assert!(
+        as_lead(
+            &app,
+            &lead,
+            r#"{"action":"allow_peer","name":"target","to":"outside"}"#
+        )
+        .await
+        .is_error
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_first_turn_can_handoff_without_a_lead_request() {
+    fn requests(agent: &Agent) -> usize {
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    SessionEvent::ReplyCheckpoint {
+                        provider_call: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    for direct in [false, true] {
+        let dir = scratch(if direct {
+            "first-handoff"
+        } else {
+            "relayed-handoff"
+        });
+        let relay = r#"{ calls = [{ name = "team", args = { action = "tell", name = "target", text = "handoff evidence" } }] }, { text = "received" }"#;
+        let sender = if direct {
+            r#"{ calls = [{ name = "tell_sibling", args = { to = "target", text = "handoff evidence", wake = true } }] }"#
+        } else {
+            r#"{ calls = [{ name = "tell_parent", args = { text = "handoff evidence" } }] }"#
+        };
+        let app = start(tree(
+            &dir,
+            if direct { r#"{ text = "received" }"# } else { relay },
+            &format!(r#"{{ text = "ready" }}, {sender}, {{ text = "source finished" }}, {{ text = "target handled" }}"#),
+        )).await;
+        let lead = create_agent(&app).await.unwrap();
+        let agents = app.context().service::<AgentsSvc>().unwrap();
+        let source_session = format!("{}/source", lead.session_id());
+        let target_session = format!("{}/target", lead.session_id());
+
+        let args = r#"{"action":"delegate","name":"source","role":"explorer","task":"find evidence","to":"target"}"#;
+        let premature = as_lead(&app, &lead, args).await;
+        assert!(premature.is_error, "{}", premature.content);
+        assert!(agents.by_session(&source_session).is_none());
+
+        let result = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"target","role":"explorer","task":"get ready"}"#,
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let target = agents.by_session(&target_session).unwrap();
+        settled(&target, 1).await;
+        let _ = lead.inbox().withdraw_messages();
+
+        let created = as_lead(
+            &app,
+            &lead,
+            if direct {
+                args
+            } else {
+                r#"{"action":"delegate","name":"source","role":"explorer","task":"find evidence"}"#
+            },
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.content);
+        let source = agents.by_session(&source_session).unwrap();
+        settled(&source, 1).await;
+        if direct {
+            let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+            assert!(
+                status
+                    .content
+                    .lines()
+                    .any(|l| l.starts_with("source ") && l.contains("peer targets [target]")),
+                "{}",
+                status.content
+            );
+            assert!(notes(&source)
+                .iter()
+                .any(|(_, text)| text.contains("`source` to `target` are allowed")));
+            settled(&target, 2).await;
+            assert_eq!(requests(&lead), 0, "handoff arrived before the lead ran");
+        } else {
+            drive(&app, &lead).await.unwrap();
+            settled(&target, 2).await;
+            assert!(
+                requests(&lead) >= 2,
+                "relay requires the lead's tool call and reply"
+            );
+        }
+        let expected_sender = if direct {
+            &source_session
+        } else {
+            lead.session_id()
+        };
+        assert!(peers(&target)
+            .iter()
+            .any(|(from, text)| from == expected_sender && text == "handoff evidence"));
+        if direct {
+            // The initial task still reports completion through the existing path.
+            drive(&app, &lead).await.unwrap();
+            assert_eq!(requests(&lead), 1);
+        }
+        assert_eq!(requests(&source) + requests(&target), 4);
+        println!(
+            "{}: lead requests {}, team requests {}",
+            if direct { "direct" } else { "relayed" },
+            requests(&lead),
+            requests(&lead) + 4
+        );
+    }
 }
 
 // ---- roles are data ------------------------------------------------------
@@ -740,6 +1100,11 @@ async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
         scribe.cwd(),
         Some(&worktree),
         "the member's world is its checkout"
+    );
+    assert_eq!(
+        scribe.describe().working_dir,
+        Some(worktree.display().to_string()),
+        "the member's frontend description reports its checkout"
     );
     assert!(worktree.join("note.txt").exists(), "it wrote there");
     assert!(!dir.join("note.txt").exists(), "and not in the lead's tree");
@@ -1432,6 +1797,56 @@ async fn a_person_cancels_and_compacts_a_member() {
     );
 }
 
+/// A stop can overtake a queued delegation after an earlier turn has finished.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stopping_unclaimed_work_does_not_bill_the_members_previous_turn() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+    let dir = scratch("stop-unclaimed");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "noted" }, { text = "noted stop" }"#,
+        r#"{ text = "old result" }"#,
+    ))
+    .await;
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"first task"}"#,
+    )
+    .await;
+    let scout_id = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .require::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_id)
+        .unwrap();
+    settled(&scout, 1).await;
+    settled(&lead, 1).await;
+    // Queue directly to exercise the interval before the member pump is notified.
+    scout
+        .inbox()
+        .send_from("next task", lead.team_message_origin());
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout_id.clone(),
+            name: "stop".into(),
+            args: String::new(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
+    settled(&lead, 2).await;
+    assert!(lead.session().events().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::Injected { text, origin: InjectionOrigin::Peer { from, source_turn: None, .. }, .. }
+            if from == &scout_id && text.contains("was stopped by the person") && !text.contains("old result")
+    )));
+}
+
 /// A person stopping a member tells the lead in proportion (`docs/adr/0023`
 /// §8): a member with nothing of the lead's outstanding is a note; one still
 /// working on what the lead asked wakes the lead, which is waiting on it.
@@ -1531,8 +1946,8 @@ async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_repor
     assert!(
         lead.session().events().iter().any(|e| matches!(
             &e.event,
-            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { .. }, .. }
-                if text.contains("stopped by the person before it reported back")
+            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { from, source_turn: Some(1), .. }, .. }
+                if from == &scout_session && text.contains("stopped by the person before it reported back")
         )),
         "woken with a message: {:#?}",
         lead.session()
@@ -2548,6 +2963,52 @@ async fn a_full_team_says_which_members_hold_the_places_and_how_to_free_one() {
     );
 }
 
+/// A full team makes room by stopping the member that has been idle on a final
+/// report the longest — a place is taken back when it is needed, not on a
+/// timer — and the lead is told which one.
+#[tokio::test]
+async fn a_full_team_stops_the_longest_finished_member_to_seat_a_new_one() {
+    let dir = scratch("full-team-room");
+    let reported = r#"{ text = "", calls = [ { name = "tell_parent", args = { text = "found it" } } ] }, { text = "reported" }"#;
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        &[reported; 7].join(", "),
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let member = |name: &str| agents.by_session(&format!("{}/{name}", lead.session_id()));
+    run_turn(&app, "go").await.unwrap();
+    until_idle(&member("scout").unwrap()).await;
+    // One at a time, so each finishes before the next starts and `scout` has
+    // been finished longest.
+    for name in ["m1", "m2", "m3", "m4", "m5"] {
+        let made = as_lead(
+            &app,
+            &lead,
+            &format!(r#"{{"action":"delegate","name":"{name}","role":"explorer","task":"look"}}"#),
+        )
+        .await;
+        assert!(!made.is_error, "{}", made.content);
+        until_idle(&member(name).unwrap()).await;
+    }
+    let seated = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"m6","role":"explorer","task":"look"}"#,
+    )
+    .await;
+    assert!(!seated.is_error, "{}", seated.content);
+    assert!(
+        seated.content.contains("`scout`") && seated.content.contains("make room"),
+        "the lead is told which member gave up its place: {}",
+        seated.content
+    );
+    assert!(member("scout").is_none(), "scout was stopped");
+    assert!(member("m1").is_some() && member("m6").is_some());
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_stopping_member_keeps_its_name_until_its_agent_is_removed() {
     let dir = scratch("stop-recreate");
@@ -2584,33 +3045,56 @@ async fn a_stopping_member_keeps_its_name_until_its_agent_is_removed() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_stop_timeout_keeps_the_member_owned_and_does_not_commit_stopped() {
     let dir = scratch("stop-timeout");
-    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let app = start(tree(
+        &dir,
+        r#"{ text = "ok" }"#,
+        r#"{ text = "looked" }, { text = "sender ready" }, { text = "receiver ready" }"#,
+    ))
+    .await;
     let lead = create_agent(&app).await.unwrap();
-    assert!(
-        !as_lead(
-            &app,
-            &lead,
-            r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#
-        )
-        .await
-        .is_error
-    );
     let agents = app.context().service::<AgentsSvc>().unwrap();
+    for name in ["scout", "y_sender", "z_receiver"] {
+        let args = serde_json::json!({
+            "action": "delegate", "name": name, "role": "explorer", "task": "look around"
+        });
+        let created = as_lead(&app, &lead, &args.to_string()).await;
+        assert!(!created.is_error, "{}", created.content);
+        let member = agents
+            .by_session(&format!("{}/{name}", lead.session_id()))
+            .unwrap();
+        settled(&member, 1).await;
+    }
+    let grant = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"allow_peer","name":"y_sender","to":"z_receiver"}"#,
+    )
+    .await;
+    assert!(!grant.is_error, "{}", grant.content);
     let member = agents
         .by_session(&format!("{}/scout", lead.session_id()))
         .unwrap();
-    until_idle(&member).await;
     member.begin_turn();
-    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
-    assert!(stopped.is_error, "{}", stopped.content);
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+    assert!(
+        stopped.is_error && stopped.content.contains("scout"),
+        "{}",
+        stopped.content
+    );
     assert!(agents.get(member.id()).is_some());
     assert!(!member
         .session()
         .events()
         .iter()
         .any(|event| matches!(event.event, SessionEvent::Stopped { .. })));
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(
+        !status.is_error && status.content.contains("peer targets [z_receiver]"),
+        "{}",
+        status.content
+    );
     member.end_turn();
-    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
     assert!(!stopped.is_error, "{}", stopped.content);
 }
 
@@ -2783,4 +3267,418 @@ async fn scope_refusals_on_person_started_member_turns_are_notes_not_lead_wakeup
     )));
     assert!(!dir.join("outside.txt").exists());
     as_lead(&app, &lead, r#"{"action":"stop"}"#).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn member_budget_closes_once_and_a_failed_followup_does_not_report_old_text() {
+    let dir = scratch("request-budget");
+    let app = start(tree_with(&dir, r#"{ text = "noted" }"#,
+        r#"{ calls = [{ name = "read_file", args = {file_path = "missing"} }] }, { text = "only partly done" }, { fail = "offline" }"#,
+        "role_request_budgets = { explorer = 1 }")).await;
+    let lead = create_agent(&app).await.unwrap();
+    let delegated = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"check"}"#,
+    )
+    .await;
+    assert!(!delegated.is_error, "{}", delegated.content);
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    let meter = scout
+        .ctx()
+        .service::<atomcode_harness::seams::TurnRequestsSvc>()
+        .unwrap();
+    assert_eq!(meter.count(1), 2);
+    let first = heard_by(&app, &lead).await;
+    assert!(
+        first
+            .iter()
+            .any(|(_, text)| text.contains("request budget") && text.contains("only partly done")),
+        "{first:?}"
+    );
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"scout","text":"try again"}"#,
+    )
+    .await;
+    assert!(!told.is_error);
+    until_idle(&scout).await;
+    assert_eq!(meter.count(2), 1);
+    let heard = heard_by(&app, &lead).await;
+    let (_, report) = heard.last().unwrap();
+    assert!(
+        report.contains("turn 2") && report.contains("(nothing)"),
+        "{report}"
+    );
+    assert!(!report.contains("partly done"));
+}
+
+#[path = "team_cost/replay.rs"]
+mod cost_replay;
+
+#[tokio::test]
+async fn explicit_inherit_and_tool_lists_resolve_in_the_member_realm() {
+    use atomcode_harness::seams::LlmSvc;
+
+    let dir = scratch("role-options");
+    write_role(&dir, "research",
+        "---\npermission: explore\ndifficulty: simple\nmodel: inherit\nallowed_tools: [read_file, grep]\ndenied_tools: [grep]\nallowed_mcp_servers: []\n---\nRead the code.");
+    write_role(&dir, "empty",
+        "---\npermission: explore\ndifficulty: simple\nmodel: inherit\nallowed_tools: []\n---\nListen.");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "lead" }, { text = "next" }"#,
+        r#"{ text = "utility" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let lead_model = lead.ctx().service::<LlmSvc>().unwrap();
+    for (role, read_allowed) in [("research", true), ("empty", false)] {
+        let args =
+            serde_json::json!({"action":"delegate","name":role,"role":role,"task":"inspect"});
+        let result = as_lead(&app, &lead, &args.to_string()).await;
+        assert!(!result.is_error, "{}", result.content);
+        let member = app
+            .context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/{role}", lead.session_id()))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &lead_model,
+            &member.ctx().service::<LlmSvc>().unwrap()
+        ));
+        let tools = member.ctx().service::<ToolsSvc>().unwrap();
+        assert_eq!(tools.get("read_file").is_some(), read_allowed);
+        assert!(tools.get("grep").is_none());
+        assert!(tools.get("tell_parent").is_some());
+        until_idle(&member).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_shell_less_member_hands_unverified_edits_to_the_lead_in_its_report() {
+    let write = r#"{ calls = [{ name = "write_file", args = {file_path = "main.rs", content = "fn main() {}" } }] }"#;
+    let tell = r#"{ calls = [{name = "tell_parent", args = {text = "status"} }] }"#;
+    for (tag, script, budget, prompt, expected_notes, expected_reports) in [
+        ("automatic", write.to_owned(), 0, "Make the edit", 1, 1),
+        (
+            "explicit",
+            format!("{write}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            1,
+        ),
+        (
+            "early",
+            format!("{tell}, {write}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        (
+            "repeated",
+            format!("{write}, {tell}, {tell}"),
+            0,
+            "Make the edit",
+            1,
+            2,
+        ),
+        ("closing", write.to_owned(), 1, "Make the edit", 1, 1),
+        (
+            "skip",
+            write.to_owned(),
+            0,
+            "Make the edit; do not run tests",
+            0,
+            1,
+        ),
+    ] {
+        let dir = scratch(tag);
+        write_role(
+            &dir,
+            "scribe",
+            "---\npermission: worker\ndifficulty: simple\n---\nWrite code.\n",
+        );
+        let mut layers = layers_with(
+            &dir,
+            r#"{ calls = [{ name = "team", args = {action = "delegate", name = "s", role = "scribe", task = "edit main.rs", scope = ["main.rs"]} }] }, { text = "waiting" }, {text = "ack"}, {text = "ack again"}"#,
+            &format!(r#"{script}, {{text = "done"}}"#),
+            &format!("role_request_budgets = {{ scribe = {budget} }}"),
+        );
+        let cadence = format!(
+            "[[insert]]\nname = 'verify-cadence'\nconfig = {{force = true, working_dir = {root:?}}}",
+            root = dir.to_string_lossy(),
+        );
+        layers.push(Layer::from_toml(&cadence).unwrap());
+        let app = start(ConfigTree::from_layers(layers).unwrap()).await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, prompt).await.unwrap();
+        let member = app
+            .context()
+            .require::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/s", lead.session_id()))
+            .unwrap();
+        until_idle(&member).await;
+        while lead.inbox().has_waking_input() {
+            drive(&app, &lead).await.unwrap();
+        }
+        let reports = peers(&lead);
+        assert_eq!(reports.len(), expected_reports, "{tag}: {reports:?}");
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|(_, s)| s.contains("Run the relevant check") && s.contains("main.rs"))
+                .count(),
+            expected_notes,
+            "{tag}: {reports:?}"
+        );
+        assert!(dir.join("main.rs").exists(), "{tag}");
+        assert_eq!(turns_ended(&member), 1, "{tag}");
+        assert!(!member.session().events().iter().any(|e| matches!(&e.event, SessionEvent::Injected {text, ..} if text == atomcode_coding::discipline::NUDGE)), "{tag}");
+    }
+}
+
+/// Set on the child that [`docs_mcp_server`] runs in.
+const DOCS_MCP_SERVER: &str = "ATOMCODE_TEST_DOCS_MCP_SERVER";
+
+/// A stdio MCP server with one read-only `search_docs` tool, for the tests
+/// that need a real transport. It is this test binary run again with
+/// `--exact docs_mcp_server` and [`DOCS_MCP_SERVER`] set — so it runs on every
+/// platform the suite does, where the `sh` script it replaces left Windows
+/// with no check of the member-query path at all. In an ordinary run the
+/// variable is unset and it returns at once. Lines the test harness prints
+/// around it are not JSON, and the client skips them.
+#[test]
+fn docs_mcp_server() {
+    use std::io::{BufRead, Write};
+    if std::env::var_os(DOCS_MCP_SERVER).is_none() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let result = match request["method"].as_str() {
+            Some("initialize") => serde_json::json!({"protocolVersion":"2025-11-05",
+                "capabilities":{"tools":{}},"serverInfo":{"name":"docs","version":"1"}}),
+            Some("tools/list") => serde_json::json!({"tools":[{"name":"search_docs",
+                "inputSchema":{"type":"object","properties":{"query":{"type":"string"}}},
+                "annotations":{"readOnlyHint":true}}]}),
+            Some("tools/call") => {
+                serde_json::json!({"content":[{"type":"text","text":"contract from docs"}]})
+            }
+            _ => serde_json::json!({}),
+        };
+        let reply = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
+        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+            break;
+        }
+    }
+    // Not back into the harness: its summary would follow on a closed pipe.
+    std::process::exit(0);
+}
+
+/// The `mcpServers` entry that starts [`docs_mcp_server`].
+fn docs_mcp_entry() -> serde_json::Value {
+    let exe = std::env::current_exe().unwrap();
+    serde_json::json!({
+        "command": exe,
+        "args": ["--exact", "docs_mcp_server", "--nocapture", "--test-threads", "1"],
+        "env": {DOCS_MCP_SERVER: "1"},
+    })
+}
+
+/// A real MCP transport and member turn. The lead can reopen an immutable
+/// result from a fresh runtime without sending the original query again.
+#[tokio::test]
+async fn team_query_evidence_survives_resume() {
+    use serde_json::json;
+    let dir = scratch("team-evidence");
+    let home = scratch("team-evidence-user");
+    let sessions = scratch("team-evidence-sessions");
+    let mut docs = docs_mcp_entry();
+    docs["teamReadOnlyTools"] = json!({"research":["search_docs"]});
+    let config = json!({"mcpServers":{"docs":docs}});
+    std::fs::write(home.join("mcp.json"), config.to_string()).unwrap();
+    let role = "---\npermission: explore\ndifficulty: simple\ntools: mcp__docs__search_docs\n---\nLook up the contract.";
+    write_role(&dir, "research",
+        "---\npermission: explore\ndifficulty: simple\nallowed_tools: []\nallowed_mcp_servers: [docs]\n---\nLook up the contract.");
+    write_role(&dir, "other", role);
+    let build = |resume: bool| {
+        let mut layers = layers_with(
+            &dir,
+            r#"{ text = "ok" }"#,
+            r#"{ text = "checking", calls = [{name = "mcp__docs__search_docs", args = {query = "contract"}}]}, { text = "query complete" }"#,
+            "",
+        );
+        let settings = format!(
+            "[[patch]]\nid='product-dirs'\nconfig={{user={home:?}}}\n[[patch]]\nid='mcp'\ndisabled=false\nconfig={{project_root={dir:?}}}\n[[insert]]\nname='tool-output-artifact'\nconfig={{dir={artifacts:?}}}\n[[patch]]\nid='session-persistence-jsonl'\ndisabled=false\nconfig={{root={sessions:?}, project_root={dir:?}}}\n[[patch]]\nid='session'\nconfig={{id='lead', resume={resume}}}",
+            artifacts = dir.join("artifacts")
+        );
+        layers.push(Layer::from_toml(&settings).unwrap());
+        ConfigTree::from_layers(layers).unwrap()
+    };
+    let reference = {
+        let app = start(build(false)).await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, "research").await.unwrap();
+        let denied = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"other","role":"other","task":"query"}"#,
+        )
+        .await;
+        assert!(
+            denied.is_error && denied.content.contains("teamReadOnlyTools"),
+            "{}",
+            denied.content
+        );
+        let delegated = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"scout","role":"research","task":"query"}"#,
+        )
+        .await;
+        assert!(!delegated.is_error, "{}", delegated.content);
+        let member = app
+            .context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session("lead/scout")
+            .unwrap();
+        until_idle(&member).await;
+        let result = member
+            .session()
+            .events()
+            .into_iter()
+            .find_map(|e| match e.event {
+                SessionEvent::ToolResultLogged {
+                    content,
+                    is_error: false,
+                    ..
+                } if content.contains("contract from docs") => Some(content),
+                _ => None,
+            })
+            .expect("member received the real query result");
+        assert!(!peers(&lead)
+            .iter()
+            .any(|(_, text)| text.contains("contract from docs")));
+        let name = "mcp__docs__search_docs";
+        let held = member
+            .ctx()
+            .service::<ToolsSvc>()
+            .unwrap()
+            .get(name)
+            .unwrap();
+        app.context().service::<ToolsSvc>().unwrap().turn_off(name);
+        let denied = held
+            .execute(
+                r#"{"query":"after withdrawal"}"#,
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    cancel: Default::default(),
+                    progress: ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await;
+        assert!(
+            denied.is_error && denied.content.contains("unavailable"),
+            "{}",
+            denied.content
+        );
+        result
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Team evidence ")
+            .unwrap()
+            .to_owned()
+    };
+    let mut revoked = config;
+    revoked["mcpServers"]["docs"]["teamReadOnlyTools"] = json!({});
+    std::fs::write(home.join("mcp.json"), revoked.to_string()).unwrap();
+    let app = start(build(true)).await;
+    let lead = create_agent(&app).await.unwrap();
+    assert!(lead.seed_len() > 0);
+    assert!(lead.session().events().iter().any(|e| matches!(&e.event,
+        SessionEvent::Injected { origin: InjectionOrigin::TeamNote { member }, text, .. }
+            if member == "scout" && text.contains(&reference) && !text.contains("contract from docs"))),
+        "the lead retains a reference without receiving the query result");
+    let evidence =
+        |member: &str| json!({"action":"evidence","name":member,"reference":reference}).to_string();
+    assert!(as_lead(&app, &lead, &evidence("other")).await.is_error);
+    let forged = app
+        .context()
+        .service::<atomcode_harness::seams::OutputArtifactsSvc>()
+        .unwrap()
+        .team_evidence("lead", "scout")
+        .put_input(b"unissued record")
+        .unwrap();
+    assert!(
+        as_lead(
+            &app,
+            &lead,
+            &json!({"action":"evidence","name":"scout","reference":forged}).to_string()
+        )
+        .await
+        .is_error
+    );
+    let result = as_lead(&app, &lead, &evidence("scout")).await;
+    assert!(!result.is_error, "{}", result.content);
+    let record: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(record["arguments"]["query"], "contract");
+    assert_eq!(record["content"], "contract from docs");
+    assert_eq!(record["is_error"], false);
+}
+
+/// What one agent read is not what another knows: a lead that read a file
+/// does not let a member that never opened it replace it.
+#[tokio::test]
+async fn a_member_cannot_overwrite_a_file_only_its_lead_read() {
+    let dir = scratch("member-write-guard");
+    std::fs::write(dir.join("notes.md"), "earlier work\n").unwrap();
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\ntools: read_file, write_file\n---\nYou write notes.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "", calls = [ { name = "read_file", args = { file_path = "notes.md" } } ] }, { text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "scribe", scope = ["notes.md"], task = "write the notes" } } ] }, { text = "delegated" }"#,
+        r#"{ text = "", calls = [ { name = "write_file", args = { file_path = "notes.md", content = "replaced\n" } } ] }, { text = "tried" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scribe = agents
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .expect("the member exists");
+    until_idle(&scribe).await;
+    let refused = scribe.session().events().into_iter().any(|e| {
+        matches!(e.event, SessionEvent::ToolResultLogged { is_error: true, ref content, .. }
+            if content.contains("has not read it"))
+    });
+    assert!(refused, "the member's own log decides");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "earlier work\n"
+    );
 }

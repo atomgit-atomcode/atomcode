@@ -756,8 +756,7 @@ impl Tool for BashStartTool {
          Completion notifications default on in supporting hosts; do independent work or end \
          your response to await completion, then collect output with `bash_poll`. Set \
          notify_on_exit=false for servers/watchers or manual polling. Stop \
-         it early with `bash_kill`. Keep build output streaming: `| tail` hides progress and \
-         may mask a failed build's exit code. Same shell, working directory, and environment as `bash`."
+         it early with `bash_kill`. Same shell, working directory, and environment as `bash`."
         }; }
         if self
             .output_preview

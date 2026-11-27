@@ -29,6 +29,11 @@ pub use render::{render_skill_catalog, CatalogEntry};
 pub use skill::{AutoLoad, Skill};
 pub use use_skill::{ListSkillsTool, UseSkillTool};
 
+/// Strip one explicit skill marker from a leading invocation token.
+pub fn strip_skill_marker(token: &str) -> Option<&str> {
+    token.strip_prefix(['$', '¥', '￥'])
+}
+
 /// Names of the skill tools — pass to [`ToolRegistry::mount`](atomcode_kernel::tool::ToolRegistry::mount).
 pub fn skill_tool_names() -> &'static [&'static str] {
     &["use_skill", "list_skills"]

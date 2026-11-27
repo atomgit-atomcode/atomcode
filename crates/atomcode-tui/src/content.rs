@@ -1151,7 +1151,7 @@ pub struct ModelSaid(pub String);
 
 impl ModelSaid {
     /// Remove only outer blank lines, preserving indentation and Markdown spaces.
-    fn display_text(&self) -> &str {
+    pub(crate) fn display_text(&self) -> &str {
         let mut offset = 0;
         let mut start = None;
         let mut end = 0;
@@ -1162,7 +1162,7 @@ impl ModelSaid {
             }
             offset += line.len();
         }
-        start.map(|start| &self.0[start..end]).unwrap_or("")
+        start.and_then(|start| self.0.get(start..end)).unwrap_or("")
     }
 }
 
@@ -1188,9 +1188,16 @@ impl Content for ModelSaid {
             crate::markdown::render(text, w, Style::new())
         }
     }
+    fn growing_raw(&self) -> Option<&str> {
+        (!self.0.is_empty()).then_some(&self.0)
+    }
     fn growing_text(&self) -> Option<&str> {
         let text = self.display_text();
         (!text.is_empty()).then_some(text)
+    }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
     }
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
@@ -1215,6 +1222,10 @@ impl Content for ModelThought {
     }
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
+    }
+    fn append(&mut self, delta: &str) -> bool {
+        self.0.push_str(delta);
+        true
     }
     /// Open, the lid stays on top: `⎿ thought, N lines  点击收起`, then the
     /// thought. The lid is how the thought was opened and it is still the thing
@@ -2791,6 +2802,28 @@ pub struct InjectedBlock {
     pub result: bool,
 }
 
+/// Recognize the host's review assignment envelope, including stored reviews.
+/// The model still receives the original text from the session log.
+pub fn review_assignment_title(text: &str) -> Option<&str> {
+    let marker = "=== ASSIGNED READ-ONLY REVIEW ===\n";
+    let assignment = if text.starts_with("=== ORIGINATING REQUEST (CONTEXT ONLY) === ") {
+        text.split_once("\n\n=== ASSIGNED READ-ONLY REVIEW ===\n")?
+            .1
+    } else {
+        text.strip_prefix(marker)?
+    };
+    let (title, rest) = assignment.split_once('\n')?;
+    if !title.starts_with("代码审查 · ")
+        || !rest.starts_with("Review the requested changes: call the `code_review` tool with ")
+        || !rest.ends_with(
+            "The originating conversation owns all follow-up work, including work requested above.",
+        )
+    {
+        return None;
+    }
+    Some(title)
+}
+
 impl Content for InjectedBlock {
     fn kind(&self) -> &'static str {
         self.kind
@@ -2822,10 +2855,16 @@ impl Content for InjectedBlock {
             line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
             return line;
         }
-        Line::styled(
+        let mut line = Line::styled(
             width::take_width(&format!("[{}]", self.origin), w as usize),
             muted(),
-        )
+        );
+        if self.kind == "review_assignment" {
+            let hint = format!("  {}", pt(PMsg::LidExpandHint));
+            let room = (w as usize).saturating_sub(line.width());
+            line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
+        }
+        line
     }
 }
 
@@ -3410,8 +3449,6 @@ pub struct TurnEndBlock {
     /// the task was done when it was not (reported against 5.1.0). Ignored for
     /// every other stop, which already says it was cut short.
     pub open_items: usize,
-    /// Members still working when this live turn ended; never inferred on replay.
-    pub members_working: usize,
     /// When the turn ended, as the person's own clock reads it (`21:42`) — see
     /// [`clock_of`]. `None` when the log recorded no time for it.
     pub ended_at: Option<String>,
@@ -3692,26 +3729,21 @@ pub fn byte_size(n: u64) -> String {
 /// vocabulary is the product's rather than new. What is added is the cause,
 /// where a person can do something about it: a turn that ran out of rounds says
 /// so, in words, instead of showing them a variant name or nothing at all.
-fn turn_end_note(
-    stop: StopReason,
-    done_index: usize,
-    open_items: usize,
-    members_working: usize,
-) -> (Glyph, String, Style) {
+fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Glyph, String, Style) {
     use StopReason::*;
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
-        Stopped if members_working > 0 => (
-            Glyph::Interrupted,
-            t(Msg::StopWithMembersRunning { n: members_working }).into_owned(),
-            warn,
-        ),
-        // The model stopped on its own with the list still open: said as a stop,
-        // with the count and what to do about it — never a celebratory verb.
+        // The model stopped on its own with the list still open: the plain word
+        // for a stop under the `—` mark, never a celebratory verb or the finish's
+        // sparkle, and in the quiet ink — it is not a failure. No sentence of its own: the task panel under it already
+        // counts and names what is open, and what to do about it depends on
+        // what is still running — a turn that ended to wait on background work
+        // is woken by its result, not by "继续" — which the composer's offer
+        // judges live (`offer_current_todo`). This line stays in the transcript.
         Stopped if open_items > 0 => (
             Glyph::Interrupted,
-            t(Msg::StopWithOpenItems { count: open_items }).into_owned(),
-            warn,
+            t(Msg::StopAt { at: "" }).trim_end().to_owned(),
+            muted(),
         ),
         // The only clean end: the model answered and asked for nothing. The word
         // rotates through `DONE_LABELS` the way tuix's does, so consecutive turns
@@ -3819,7 +3851,6 @@ impl Content for TurnEndBlock {
                 self.done_index,
             ),
             &self.open_items.to_string(),
-            &self.members_working.to_string(),
             self.ended_at.as_deref().unwrap_or(""),
         ])
     }
@@ -3845,24 +3876,23 @@ impl Content for TurnEndBlock {
         }
         let w = ctx.width;
         let caps = Caps::default();
-        let (mark, said, style) = turn_end_note(
-            self.stop,
-            self.done_index,
-            self.open_items,
-            self.members_working,
-        );
-        let clean = matches!(self.stop, StopReason::Stopped)
-            && self.open_items == 0
-            && self.members_working == 0;
+        let (mark, said, style) = turn_end_note(self.stop, self.done_index, self.open_items);
+        let clean = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
+        let open_items_stop = matches!(self.stop, StopReason::Stopped) && self.open_items > 0;
         // When it ended rides beside the word for a clean finish
         // (`✻ Nailed it 21:42 · 12.5s · …`). Every other outcome's words are a
         // sentence — a cause, what to do next — and a time glued to its end reads
         // as part of it, so there the time leads the figures instead.
-        let short = match (&self.ended_at, clean) {
-            (Some(at), true) => format!("{} {said} {at}", caps.g(mark)),
+        // A stop that left the list open reads the same way, its word `停下`.
+        let short = match &self.ended_at {
+            Some(at) if clean => format!("{} {said} {at}", caps.g(mark)),
+            Some(at) if open_items_stop => format!("{} {}", caps.g(mark), t(Msg::StopAt { at })),
             _ => format!("{} {said}", caps.g(mark)),
         };
-        let lead = self.ended_at.as_ref().filter(|_| !clean);
+        let lead = self
+            .ended_at
+            .as_ref()
+            .filter(|_| !clean && !open_items_stop);
 
         // Under the rule, in the order they are worth reading: the cost first
         // (it is about this turn), then the cause of a failure. The cache ratio
@@ -3871,29 +3901,18 @@ impl Content for TurnEndBlock {
         let mut caption = short;
         // 停下但清单还没做完:它**不是失败**,所以没有理由把缓存命中藏起来 —— 藏它是
         // 给失败那几种留的规矩(命中率挨着一个错误读,像是那个错误的一部分)。
-        let open_items_stop = matches!(self.stop, StopReason::Stopped) && self.open_items > 0;
         let with_cached = clean || open_items_stop;
         let stats = match (lead, self.stats.caption(with_cached)) {
-            // 这种停下的账另起一行,所以那行开头得有个词把钟点接住(`停下 09:37`):
-            // 干净收尾那行是「词 钟点 · 数字」,两处同一个语序。
-            (Some(at), Some(stats)) if open_items_stop => {
-                Some(format!("{} · {stats}", t(Msg::StopAt { at })))
-            }
             (Some(at), Some(stats)) => Some(format!("{at} · {stats}")),
             (Some(at), None) => Some(at.clone()),
             (None, stats) => stats,
         };
         if let Some(stats) = stats {
             let wider = format!("{caption} · {stats}");
-            // 这种停下**不做成一行**:上面那句是"为什么停",下面那行是"花了多少",
-            // 两件事各自一行;账那行带 `✻`,和干净收尾那行的数字同一种读法。
-            if !open_items_stop && crate::el::caption_fits(&wider, w as usize) {
+            if crate::el::caption_fits(&wider, w as usize) {
                 caption = wider;
             } else {
-                under.push(match open_items_stop {
-                    true => format!("{} {stats}", caps.g(Glyph::Sparkle)),
-                    false => stats,
-                });
+                under.push(stats);
             }
         }
 
@@ -4184,7 +4203,6 @@ mod tests {
             },
             done_index: 1,
             open_items,
-            members_working: 0,
             ended_at: Some("21:42".into()),
         }
         .lines(&RenderCtx::bare(200))
@@ -4247,24 +4265,38 @@ mod tests {
         assert!(line.contains(" · 21:42 · 12.5s · "), "{line}");
     }
 
-    /// 清单还有没做完的那种停下:一句"为什么"在上面,**账另起一行**带 `✻`,而且连缓存
-    /// 命中一起 —— 它不是失败,没有理由把命中率藏掉(藏它是给失败那几种留的规矩)。
+    /// 清单还有没做完的那种停下:和干净收尾同一种读法的**一行**,词是「停下」不是庆祝词,
+    /// 连缓存命中一起 —— 它不是失败,没有理由把命中率藏掉(藏它是给失败那几种留的规矩)。
+    /// 没有单独一句"还有 N 项没完成":下面的任务面板已经写着,该不该"继续"交给输入框的提议。
     #[test]
-    fn a_stop_with_open_items_says_why_and_puts_the_cost_on_the_next_line() {
+    fn a_stop_with_open_items_is_one_quiet_line_that_says_stopped() {
         let line = ended(StopReason::Stopped, 2);
-        let rows: Vec<&str> = line.lines().collect();
-        assert!(
-            rows.len() == 2 && rows[0].contains("任务清单还有 2 项没完成"),
-            "上面那句是为什么停:\n{line}"
-        );
-        assert!(
-            !rows[0].contains("tokens") && !rows[0].contains("缓存"),
-            "账不在上面那句里:\n{line}"
-        );
         let word = t(Msg::StopAt { at: "21:42" }).into_owned();
         assert!(
-            rows[1].contains('✻') && rows[1].contains(&word) && rows[1].contains("本轮缓存"),
-            "下面那行是「✻ {word} · …」:钟点有词接着、缓存命中也在:\n{line}"
+            line.lines().count() == 1
+                && line.contains(&format!(" {word} · "))
+                && line.contains("本轮缓存")
+                && !line.contains('✻'),
+            "一行「— {word} · …」,钟点有词接着、缓存命中也在,不戴收尾的 ✻:\n{line}"
+        );
+        assert!(!line.contains("没完成"), "{line}");
+        let block = TurnEndBlock {
+            stop: StopReason::Stopped,
+            error: None,
+            stats: TurnStats::default(),
+            done_index: 1,
+            open_items: 2,
+            ended_at: Some("21:42".into()),
+        };
+        let quiet = block.lines(&RenderCtx::bare(200));
+        let done = TurnEndBlock {
+            open_items: 0,
+            ..block
+        }
+        .lines(&RenderCtx::bare(200));
+        assert_eq!(
+            quiet[0].spans[0].style, done[0].spans[0].style,
+            "the same quiet ink as a clean finish, not the warning colour"
         );
     }
 
@@ -5107,7 +5139,6 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
@@ -5138,7 +5169,6 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
@@ -5170,7 +5200,6 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
-                members_working: 0,
                 ended_at: None,
             }
             .lines(&crate::block::RenderCtx::bare(80))
@@ -5249,11 +5278,11 @@ mod tests {
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
-        let mark = |stop| turn_end_note(stop, 0, 0, 0).0;
+        let mark = |stop| turn_end_note(stop, 0, 0).0;
         assert_eq!(mark(StopReason::Stopped), Glyph::Sparkle);
         // A stop the model chose, with the task list still open, is not a finish.
         assert_ne!(
-            turn_end_note(StopReason::Stopped, 0, 2, 0).0,
+            turn_end_note(StopReason::Stopped, 0, 2).0,
             Glyph::Sparkle,
             "an open list does not wear the finish mark"
         );
@@ -5293,7 +5322,6 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 100);
@@ -5332,7 +5360,6 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let text = drawn(&block, 80);
@@ -5358,7 +5385,6 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
@@ -5388,7 +5414,6 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
@@ -5428,7 +5453,6 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
-            members_working: 0,
             ended_at: None,
         };
         for w in 0..160u16 {
@@ -5499,7 +5523,6 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
-                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5508,7 +5531,6 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
-                members_working: 0,
                 ended_at: None,
             }),
             // With figures, and with figures plus a cause: the caption is
@@ -5526,7 +5548,6 @@ mod tests {
                 },
                 done_index: 1,
                 open_items: 0,
-                members_working: 0,
                 ended_at: None,
             }),
             Box::new(TurnEndBlock {
@@ -5542,7 +5563,6 @@ mod tests {
                 },
                 done_index: 0,
                 open_items: 0,
-                members_working: 0,
                 ended_at: None,
             }),
         ];
@@ -6596,6 +6616,7 @@ mod tests {
             InjectionOrigin::Peer {
                 from: "lead-1/scout".into(),
                 outside: false,
+                source_turn: None,
             },
         ];
         for origin in &every {

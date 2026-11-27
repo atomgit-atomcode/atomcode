@@ -536,14 +536,11 @@ impl Tool for RequestUserInputTool {
     }
 
     fn description(&self) -> &str {
+        // When to ask is the host's system-prompt guidance (`## ASKING THE USER`), shown
+        // with this tool because some models under-weight tool descriptions; this says
+        // only how to call it.
         "Ask the user structured question(s) and wait for their answer before continuing. \
-         Use ONLY for decisions that are genuinely the user's to make — a preference, a \
-         confirmation, a choice between approaches — NOT for anything you can decide, look \
-         up, or verify yourself. When the user explicitly asks you to recommend, compare, or \
-         offer choices for THEM to pick/select from (e.g. \"recommend a few X for me to \
-         choose\", \"let me pick one\"), surface the concrete options HERE (set \
-         `mode`=\"multiple\" when they may want to select several) instead of writing the \
-         list as prose. For ONE question, set `header`, `question`, and `options` \
+         For ONE question, set `header`, `question`, and `options` \
          (non-empty for a choice question); `mode` is optional — omit it and it is inferred \
          (\"single\" when `options` is given, else \"text\"), but set it explicitly to \
          \"multiple\" when the user may pick several (or \"text\" to force free-form). To ask \

@@ -3978,7 +3978,7 @@ async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
     s.quiet().await;
     assert!(
         s.term.last().unwrap().part("resume").is_some()
-            || s.screen().contains("没有别的存下的会话")
+            || s.screen().contains(&t_resume_no_others())
             || s.screen().contains("this host does not do that"),
         "the press did not take the row it landed on:\n{}",
         s.screen()
@@ -5885,6 +5885,26 @@ async fn the_question_panel_rides_the_tail_and_takes_the_composer_s_place() {
         "the conversation kept a row of its own: {stream:?}"
     );
 
+    // And the panel ends on a separator of its own: the legend is read on its own
+    // row, with a blank row between it and the status line hugging the panel's
+    // foot (#1840).
+    let screen = s.screen();
+    let rows: Vec<&str> = screen.lines().collect();
+    let foot = (panel.y + panel.h) as usize;
+    assert!(
+        foot <= rows.len(),
+        "the panel ends past the screen: panel {panel:?}, {} rows",
+        rows.len()
+    );
+    assert!(
+        rows[foot - 1].trim().is_empty(),
+        "the panel ends on the legend, not on a separator:\n{screen}"
+    );
+    assert!(
+        rows[foot - 2].contains("↑↓ 选择"),
+        "the legend does not sit on the separator:\n{screen}"
+    );
+
     task.abort();
     let _ = task.await;
 }
@@ -6100,7 +6120,10 @@ async fn a_question_holds_still_while_the_conversation_is_read_back() {
     let stream = s.term.last().unwrap().part("stream").unwrap().rect;
 
     use atomcode_tui::surface::Click;
-    for _ in 0..3 {
+    // A wheel notch is one line. The panel's own separator costs the
+    // conversation a row of its own (#1840), so reaching the same line takes one
+    // notch more than it did.
+    for _ in 0..4 {
         s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
     }
     until(&s, "LINE-56").await;
@@ -9165,13 +9188,17 @@ impl atomcode_host_api::HostControl for ResumeFixtureControl {
                 .inner
                 .call(HostCommand::ListSessions { working_dir: None })
                 .await?;
-            if let HostReply::Sessions { mut sessions } = reply {
+            if let HostReply::Sessions {
+                mut sessions,
+                hints,
+            } = reply
+            {
                 for session in &mut sessions {
                     session.working_dir = Some(self.here.clone());
                 }
                 sessions
                     .retain(|session| working_dir.is_none() || session.working_dir == working_dir);
-                return Ok(HostReply::Sessions { sessions });
+                return Ok(HostReply::Sessions { sessions, hints });
             }
             return Ok(reply);
         }

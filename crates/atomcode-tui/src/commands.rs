@@ -950,7 +950,7 @@ fn session_catalogue() -> Vec<Command> {
             "[prompt|persona]".into(),
             t(Msg::CmdAboutContext),
         ),
-        Command::said("agents", t(Msg::CmdAboutAgents)),
+        Command::said("agents", t(Msg::CmdAboutAgents)).with_aliases(&["subagents"]),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
         // `/session` is the same fresh start, named the way the reference does,
@@ -1765,21 +1765,53 @@ impl CommandSet for SessionCommands {
                         .about(root.clone()),
                     );
                 }
-                for (name, session, gone) in roster.members() {
+                let members = roster.members();
+                for (name, session, gone) in &members {
                     rows.push(
                         crate::sheet::Row::new(
                             format!("/look {session}"),
                             // Where it stands is part of what the row is: a
                             // stopped member's conversation is still there and
                             // is not something to talk to.
-                            if gone {
-                                t(Msg::AgentsStopped { name: &name }).into_owned()
+                            if *gone {
+                                t(Msg::AgentsStopped { name }).into_owned()
                             } else {
                                 name.clone()
                             },
                         )
                         .about(session.clone()),
                     );
+                }
+                // The host owns the retained logs. The picker takes only
+                // names and ids, and /look replays the selected session.
+                if let Some(control) = control.filter(|_| !root.is_empty()) {
+                    let reply = control
+                        .call(HostCommand::ListTaskSessions {
+                            session: root.clone(),
+                        })
+                        .await;
+                    if client.root() != root {
+                        return Outcome::Quiet;
+                    }
+                    match reply {
+                        Ok(HostReply::TaskSessions { sessions }) => {
+                            for child in sessions {
+                                if members.iter().any(|(_, session, _)| session == &child.id) {
+                                    continue;
+                                }
+                                let label = child.label.as_deref().unwrap_or(&child.id);
+                                rows.push(
+                                    crate::sheet::Row::new(
+                                        format!("/look {}", child.id),
+                                        t(Msg::AgentsTaskChild { label }).into_owned(),
+                                    )
+                                    .about(child.id),
+                                );
+                            }
+                        }
+                        Ok(_) => return Outcome::Refused(t(Msg::NoHost).into_owned()),
+                        Err(error) => return Outcome::Refused(refusal(error)),
+                    }
                 }
                 if rows.is_empty() {
                     return Outcome::Said(t(Msg::AgentsNoneYet).into_owned());
@@ -1828,62 +1860,24 @@ impl CommandSet for SessionCommands {
                         Ok(here) => Some(here),
                         Err(error) => return Outcome::Refused(error),
                     };
-                    return match control
-                        .call(HostCommand::ListSessions { working_dir: here })
-                        .await
-                    {
-                        Ok(HostReply::Sessions { sessions }) => {
-                            // Drop the one on screen — resuming the session you
-                            // are already in is a no-op — and hand the rest to the
-                            // panel, which rises over the composer like `/provider`
-                            // rather than a pop-up. The metadata (`N 轮 · 时间 ·
-                            // 目录`) is drawn by the panel from these fields.
-                            let live = client.session();
-                            let sessions: Vec<crate::resume::Session> = sessions
-                                .into_iter()
-                                .filter(|stored| stored.id != live)
-                                .map(|stored| crate::resume::Session {
-                                    id: stored.id,
-                                    title: stored.title,
-                                    working_dir: stored.working_dir,
-                                    updated_at: stored.updated_at,
-                                    turns: stored.turns,
-                                    needs_newer_version: stored.needs_newer_version,
-                                    scheduled: stored.scheduled,
-                                    held: stored.held.map(|held| match held {
-                                        atomcode_host_api::HeldActivity::Open => {
-                                            crate::resume::Held::Open
-                                        }
-                                        atomcode_host_api::HeldActivity::Running => {
-                                            crate::resume::Held::Running
-                                        }
-                                        atomcode_host_api::HeldActivity::Waiting => {
-                                            crate::resume::Held::Waiting
-                                        }
-                                    }),
-                                })
-                                .collect();
-                            if sessions.is_empty() {
-                                Outcome::Said(t(Msg::ResumeNoOthers).into_owned())
-                            } else {
-                                Outcome::Do(Action::OpenResume(crate::resume::ResumeView::new(
-                                    sessions,
-                                )))
-                            }
-                        }
-                        Ok(other) => Outcome::Refused(format!("{other:?}")),
-                        Err(error) => Outcome::Refused(refusal(error)),
+                    return match load_resume_list(&*control, here, &client.session()).await {
+                        Ok(view) => Outcome::Do(Action::OpenResume(view)),
+                        Err(error) => Outcome::Refused(error),
                     };
                 }
                 // The terminal host can keep the running session in a background
                 // slot. It owns admission, preparation and any refusal.
-                match control
-                    .call(HostCommand::Resume {
+                let command = match target.strip_prefix("--all ") {
+                    Some(id) => HostCommand::ResumeAcrossProjects {
                         session: root.clone(),
-                        target: target.to_string(),
-                    })
-                    .await
-                {
+                        target: id.trim().into(),
+                    },
+                    None => HostCommand::Resume {
+                        session: root.clone(),
+                        target: target.into(),
+                    },
+                };
+                match control.call(command).await {
                     Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
                     Ok(_) => Outcome::Quiet,
                     Err(error) => Outcome::Refused(refusal(error)),
@@ -2166,6 +2160,9 @@ impl CommandSet for SessionCommands {
                         let first = hit.next()?;
                         hit.next().is_none().then(|| first.id.clone())
                     });
+                // An explicit choice: an add still on its way, claimed to take
+                // the session to its model, now only saves.
+                client.revoke_auto_use();
                 client.chose_model(selection);
                 client.refresh_model_selection(&client.root());
                 // 带了档位:走 `/effort` 那一套设过去(只有一份实现),于是
@@ -3312,6 +3309,44 @@ async fn session_path(
     }
 }
 
+pub(crate) async fn load_resume_list(
+    control: &dyn atomcode_host_api::HostControl,
+    working_dir: Option<String>,
+    live: &str,
+) -> Result<crate::resume::ResumeView, String> {
+    let reply = control
+        .call(HostCommand::ListSessions { working_dir })
+        .await
+        .map_err(refusal)?;
+    let HostReply::Sessions { sessions, hints } = reply else {
+        return Err(t(Msg::HostSaidSomethingElse {
+            reply: &format!("{reply:?}"),
+        })
+        .into_owned());
+    };
+    let sessions: Vec<crate::resume::Session> = sessions
+        .into_iter()
+        .filter(|stored| stored.id != live)
+        .map(|stored| crate::resume::Session {
+            id: stored.id,
+            title: stored.title,
+            working_dir: stored.working_dir,
+            updated_at: stored.updated_at,
+            turns: stored.turns,
+            needs_newer_version: stored.needs_newer_version,
+            scheduled: stored.scheduled,
+            held: stored.held.map(|held| match held {
+                atomcode_host_api::HeldActivity::Open => crate::resume::Held::Open,
+                atomcode_host_api::HeldActivity::Running => crate::resume::Held::Running,
+                atomcode_host_api::HeldActivity::Waiting => crate::resume::Held::Waiting,
+            }),
+        })
+        .collect();
+    let mut view = crate::resume::ResumeView::new(sessions);
+    view.hints = hints;
+    Ok(view)
+}
+
 /// 最近干活的那几个目录,最新的在前。
 ///
 /// 从宿主的会话目录折出来,不另存一份:会话本来就记着它是在哪儿跑的,而「最近去过
@@ -3327,7 +3362,7 @@ async fn recent_places(
     let Some(control) = control else {
         return Vec::new();
     };
-    let Ok(HostReply::Sessions { sessions }) = control
+    let Ok(HostReply::Sessions { sessions, .. }) = control
         .call(HostCommand::ListSessions { working_dir: None })
         .await
     else {
@@ -4492,6 +4527,7 @@ mod tests {
             body.contains("HiShell"),
             "HiShell's history-key exception must be discoverable in /keys"
         );
+        assert!(body.contains("browser terminals") || body.contains("网页终端"));
         // 旧散文形态的行内分隔（` · `）不再出现：现在是逐行两列。
         assert!(
             !body.contains(" · "),
@@ -4843,6 +4879,41 @@ mod tests {
             all.dispatch("/fork unexpected", &app.context()).await,
             Outcome::Refused(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_resume_reports_scan_issues_and_history_in_other_projects() {
+        let host = Arc::new(Recording::default());
+        let (app, _, commands) = following(&host);
+        let path = "/store/broken.index";
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Context {
+                window: 0,
+                used: 0,
+                model: String::new(),
+                working_dir: "/here".into(),
+                persona: None,
+                system_prompt: None,
+            }),
+            Ok(HostReply::Sessions {
+                sessions: vec![atomcode_host_api::StoredSession {
+                    id: "lead".into(),
+                    ..Default::default()
+                }],
+                hints: atomcode_host_api::SessionListHints {
+                    other_projects_have_history: true,
+                    scan_issue_path: Some(path.into()),
+                },
+            }),
+        ]);
+        let Outcome::Do(Action::OpenResume(view)) =
+            commands.dispatch("/resume", &app.context()).await
+        else {
+            panic!("expected the empty-project explanation");
+        };
+        assert!(view.is_empty());
+        assert_eq!(view.hints.scan_issue_path.as_deref(), Some(path));
+        assert!(view.hints.other_projects_have_history);
     }
 
     /// A successful busy resume carries the source/fork notice. It belongs on
@@ -8184,6 +8255,7 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(Ok(HostReply::Sessions {
+                hints: Default::default(),
                 sessions: paths
                     .into_iter()
                     .enumerate()
@@ -8242,6 +8314,7 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(Ok(HostReply::Sessions {
+                hints: Default::default(),
                 sessions: vec![
                     atomcode_host_api::StoredSession {
                         id: "one".into(),
@@ -8383,6 +8456,68 @@ mod tests {
         assert!(
             c.all().iter().all(|x| x.name != "look"),
             "`/look` is hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_is_one_alias_and_lists_retained_tasks_from_the_host() {
+        let commands = builtin_for_test();
+        let app = bare();
+        let ctx = app.context();
+        let roster = Arc::new(crate::plugin::Roster::default());
+        roster.note_for_test("lead/scout", "scout", true);
+        let _ = ctx.provide::<crate::plugin::TeamRosterSvc>(roster).unwrap();
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::TaskSessions {
+                sessions: vec![
+                    atomcode_host_api::TaskSession {
+                        id: "sub-a".into(),
+                        label: Some("Audit parser".into()),
+                    },
+                    atomcode_host_api::TaskSession {
+                        id: "sub-old".into(),
+                        label: None,
+                    },
+                ],
+            }));
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.connect(tokio::sync::mpsc::unbounded_channel().0, host.clone());
+        client.follow("lead");
+        let _ = ctx
+            .provide::<crate::plugin::AgentClientSvc>(client)
+            .unwrap();
+
+        assert_eq!(commands.find("subagents").unwrap().name, "agents");
+        assert!(commands
+            .all()
+            .iter()
+            .all(|command| command.name != "subagents"));
+        let sheet = sheet_of(commands.dispatch("/subagents", &ctx).await);
+        let crate::sheet::Page::List(list) = sheet.page else {
+            panic!("an agent picker");
+        };
+        assert!(list.rows.iter().any(|row| row.value == "/look lead/scout"));
+        assert!(list
+            .rows
+            .iter()
+            .any(|row| row.value == "/look sub-old" && row.label.contains("sub-old")));
+        let task = list
+            .rows
+            .iter()
+            .find(|row| row.label.contains("Audit parser"))
+            .unwrap();
+        assert_eq!(
+            commands.dispatch(&task.value, &ctx).await,
+            Outcome::Do(Action::LookAt("sub-a".into()))
+        );
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![HostCommand::ListTaskSessions {
+                session: "lead".into()
+            }]
         );
     }
 

@@ -51,6 +51,9 @@ pub enum InjectionOrigin {
     /// still says who spoke, whether or not that agent is alive.
     Peer {
         from: String,
+        /// Sender turn of a claimed in-tree message. Absent for old logs and passive notes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_turn: Option<u64>,
         /// The sender is not a session of this tree: a job this conversation
         /// started elsewhere, reporting back.
         ///
@@ -195,6 +198,9 @@ pub enum SessionEvent {
         text: String,
         reasoning: String,
         reset: bool,
+        /// True only at admission to the conversation provider, including failed attempts.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provider_call: bool,
     },
     /// Transient UI boundary, never written to a session file.
     ReasoningDiscarded {
@@ -682,6 +688,12 @@ pub struct SessionHeader {
     /// role as it is defined then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberHeader>,
+    /// A one-line description of what a delegated child was asked to do — the
+    /// task's own short label, cut to listing width. Only a delegated child
+    /// carries one; its session's first user message is the task, but the
+    /// header is what a picker reads, one line per file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What a team member was created with.
@@ -719,6 +731,7 @@ impl SessionHeader {
             inherited: 0,
             context: None,
             member: None,
+            label: None,
         }
     }
 }
@@ -732,6 +745,50 @@ pub struct LoggedEvent {
     /// before commit times were kept.
     pub at: u64,
     pub event: SessionEvent,
+}
+
+/// Drop the transient facts the newest fact of an in-memory log makes
+/// redundant. Call it after each append.
+///
+/// Chunks exist for a live view of a round that is still streaming, and to
+/// rebuild what an interrupted round said (`PartialReply`). Once the round has
+/// its `AssistantMessage`, or the turn its `TurnEnd`, neither needs them — and a
+/// log that keeps every delta of a long session holds hundreds of megabytes the
+/// session file never had. What remains is the shape a resumed log has: the
+/// file never stored them. Durable facts and their order are untouched, so a
+/// sequence-number cursor stays valid; a cursor counting positions does not.
+///
+/// Only the tail after the turn's `TurnStart` is scanned: a settled turn's
+/// chunks never come before it.
+pub fn settle_transients(events: &mut Vec<LoggedEvent>) {
+    let (turn, round) = match events.last().map(|logged| &logged.event) {
+        Some(SessionEvent::AssistantMessage { turn, round, .. }) => (*turn, Some(*round)),
+        Some(SessionEvent::TurnEnd { turn, .. }) => (*turn, None),
+        _ => return,
+    };
+    let start = events
+        .iter()
+        .rposition(
+            |logged| matches!(logged.event, SessionEvent::TurnStart { turn: t } if t == turn),
+        )
+        .unwrap_or(0);
+    let redundant = |event: &SessionEvent| match event {
+        SessionEvent::AssistantChunk {
+            turn: t, round: r, ..
+        }
+        | SessionEvent::ReasoningDiscarded { turn: t, round: r } => {
+            *t == turn && round.is_none_or(|round| *r == round)
+        }
+        _ => false,
+    };
+    if !events[start..]
+        .iter()
+        .any(|logged| redundant(&logged.event))
+    {
+        return;
+    }
+    let tail: Vec<LoggedEvent> = events.drain(start..).collect();
+    events.extend(tail.into_iter().filter(|logged| !redundant(&logged.event)));
 }
 
 /// A committed fact, broadcast with the session it belongs to.
@@ -1380,6 +1437,23 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                     }
                 };
                 message.synthetic = true;
+                // A team member's first request is its lead's delegation. Kept
+                // under a summary it is history, exactly as a person's first
+                // request is, and says so: unframed, the member reads the task
+                // it already worked on as a fresh instruction.
+                if matches!(origin, InjectionOrigin::Peer { .. })
+                    && folded.iter().any(|(from, _)| *from > 0 && seq <= *from)
+                {
+                    message.internal_origin =
+                        Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
+                    if !with_meta {
+                        message.internal_origin =
+                            Some(crate::message::COMPACTION_RETAINED_MODEL_ORIGIN.into());
+                        message
+                            .text
+                            .insert_str(0, crate::message::COMPACTION_RETAINED_FRAMING);
+                    }
+                }
                 let source = match origin {
                     InjectionOrigin::CompactionSummary => Provenance::Summary(seq),
                     _ => Provenance::Derived(seq),
@@ -1724,9 +1798,10 @@ const STUB_OMISSION_END: &str = " chars] … ";
 /// as "folded far enough" in a single pass.
 const STUB_PREVIEW_HEAD: usize = 1_400;
 const STUB_PREVIEW_TAIL: usize = 400;
-/// The preview only fires when the cut middle is at least half the head: a
-/// near-threshold rewrite would bust the prefix cache for almost no saving,
-/// and the corpus's mean tool result sits right in that dead zone.
+/// The preview only fires when the cut middle exceeds 896 chars — well
+/// over half the 1,400-char head: a near-threshold rewrite would bust the
+/// prefix cache for almost no saving, and the corpus's mean tool result sits
+/// right in that dead zone.
 const STUB_PREVIEW_MIN_OMITTED: usize = 896;
 
 /// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]` for
@@ -1742,12 +1817,22 @@ const STUB_PREVIEW_MIN_OMITTED: usize = 896;
 /// re-busts the prefix cache the first stub paid for.
 pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let status = if success { "ok" } else { "FAILED" };
+    // A name with whitespace (or an empty one) would produce an envelope the
+    // predicate cannot recognize — `[my tool ok: …]` parses as name "my" —
+    // and an unrecognized stub gets re-stubbed on the next pass, a stub of a
+    // stub. Fall back to the generic name so every stub built here round-trips
+    // through `text_is_compact_stub`.
+    let tool_name = if tool_name.is_empty() || tool_name.chars().any(char::is_whitespace) {
+        "tool"
+    } else {
+        tool_name
+    };
     if text_is_compact_stub(output) {
         return output.to_string();
     }
     let line_count = output.lines().count();
-    // The preview fires only when the cut middle is at least half the head
-    // (a near-threshold rewrite busts the prefix cache for almost no
+    // The preview fires only when the cut middle exceeds 896 chars (a
+    // near-threshold rewrite busts the prefix cache for almost no
     // saving), and the candidate is compared against the original: one that
     // is not strictly shorter falls back to the first-line shape, so no
     // fixed overhead approximation can ever let a stub grow past the text
@@ -1755,16 +1840,19 @@ pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> Strin
     let budget = STUB_PREVIEW_HEAD + STUB_PREVIEW_TAIL;
     let char_count = output.chars().count();
     if char_count > budget + STUB_PREVIEW_MIN_OMITTED {
-        let head_end = output
-            .char_indices()
-            .nth(STUB_PREVIEW_HEAD)
-            .map(|(i, _)| i)
-            .unwrap_or(output.len());
-        let tail_start = output
-            .char_indices()
-            .nth(char_count - STUB_PREVIEW_TAIL)
-            .map(|(i, _)| i)
-            .unwrap_or(output.len());
+        // One char-index pass finds both cut points (the count itself already
+        // took one full scan; a third `nth` pass for the tail would double the
+        // decode work again on every projection).
+        let mut head_end = output.len();
+        let mut tail_start = output.len();
+        for (index, (byte, _)) in output.char_indices().enumerate() {
+            if index == STUB_PREVIEW_HEAD {
+                head_end = byte;
+            }
+            if char_count - index == STUB_PREVIEW_TAIL {
+                tail_start = byte;
+            }
+        }
         let omitted = char_count - STUB_PREVIEW_HEAD - STUB_PREVIEW_TAIL;
         let candidate = format!(
             "[{tool_name} {status}: {line_count} lines, head: {}{STUB_OMISSION_START}{omitted}{STUB_OMISSION_END}{}]",

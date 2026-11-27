@@ -25,6 +25,7 @@
   "atomcode.configuration.sendWithCtrlEnter.description": "Use Ctrl+Enter instead of Enter to send messages",
   "atomcode.configuration.fontSize.description": "Default chat font size (9–40px), applied immediately to open panels",
   "atomcode.configuration.showInlineHints.description": "Show inline diff hints when AI edits files",
+  "atomcode.configuration.cue.enabled.description": "Show AI inline completions (ghost text) as you type. Uses the model configured for completions; each suggestion spends model quota.",
   "atomcode.commands.enableLanguageBridge.title": "AtomCode: Enable IDE Language Bridge (Copy Configuration)",
   "atomcode.commands.disableLanguageBridge.title": "AtomCode: Disable IDE Language Bridge",
   "atomcode.commands.languageBridgeStatus.title": "AtomCode: IDE Language Bridge Status",

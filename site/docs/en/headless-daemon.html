@@ -2,79 +2,76 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Headless &amp; Daemon · AtomCode Docs</title>
 <meta name="description" content="Two non-interactive ways to run AtomCode: the -p headless CLI mode and the atomcode-daemon HTTP+SSE service.">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<meta name="theme-color" content="#050605">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../docs.css">
-<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+<script>try{if(localStorage.getItem('atomcode_theme')==='light')document.documentElement.classList.add('light')}catch(e){}</script>
 </head>
-<body data-page="headless-daemon">
+<body data-page="headless-daemon" data-lang="en">
+<div class="prog" id="prog"></div>
 
-<header class="dhdr" id="dhdr">
-  <a class="dhdr-logo" href="../../index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
-    <span>AtomCode</span>
-    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.8</span>
-  </a>
-  <div class="dhdr-right">
-    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span data-i18n="search.trigger.text">搜索文档…</span>
-      <span class="kbd">⌘K</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
-    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
-    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
-    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
-  </div>
+<!-- ==================== 头部 ==================== -->
+<header class="dh">
+  <button class="ib sb-btn" id="sbBtn" aria-label="Menu" aria-expanded="false">☰</button>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>DOCS</em><small>v5.2.9</small></a>
+  <button class="dh-search" id="sBtn"><b>/</b><span>Search docs…</span><kbd>⌘K</kbd></button>
+  <nav class="dh-r">
+    <a class="ib txt" href="../../index.html">Home</a>
+    <a class="ib" href="../zh/headless-daemon.html" id="langBtn" hreflang="zh" aria-label="中文">中</a>
+    <button class="ib" id="themeBtn" aria-label="Toggle theme"><span class="i-moon">◐</span></button>
+    <a class="ib txt" href="https://atomgit.com/atomgit_atomcode/atomcode">Repository ↗</a>
+  </nav>
 </header>
 
-<div class="dlayout">
-  <aside class="dside" id="dside">
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
-    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
-    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
-    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
-    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
-    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
-    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
-    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
-    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
-    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
-    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
-    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
-    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
-    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
-    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
-    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
-    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
-    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
-    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
-    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
-    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
-  </div>
+<div class="dl">
+  <!-- ==================== 侧栏 ==================== -->
+  <aside class="ds" id="ds" aria-label="Menu">
+<div class="sg"><div class="sg-t">Overview</div>
+<a class="sl" href="./index.html"><i>Ac</i><span>Docs home</span></a>
+</div>
+<div class="sg"><div class="sg-t">Start</div>
+<a class="sl" href="./getting-started.html"><i>Qs</i><span>Quickstart</span></a>
+<a class="sl" href="./login.html"><i>Lg</i><span>Login methods</span></a>
+<a class="sl" href="./configuration.html"><i>Cf</i><span>Configuration</span></a>
+</div>
+<div class="sg"><div class="sg-t">Usage</div>
+<a class="sl" href="./basic-usage.html"><i>Bu</i><span>Basic usage</span></a>
+<a class="sl" href="./slash-commands.html"><i>Sc</i><span>Slash commands</span></a>
+<a class="sl" href="./keybindings.html"><i>Kb</i><span>Keybindings</span></a>
+<a class="sl" href="./sessions.html"><i>Ud</i><span>Sessions & undo</span></a>
+<a class="sl" href="./interactive-questions.html"><i>Iq</i><span>Interactive questions</span></a>
+</div>
+<div class="sg"><div class="sg-t">Advanced</div>
+<a class="sl" href="./tools.html"><i>Tl</i><span>Built-in tools</span></a>
+<a class="sl" href="./subagents.html"><i>Sa</i><span>Subagents</span></a>
+<a class="sl" href="./approvals.html"><i>Ap</i><span>Approvals</span></a>
+<a class="sl" href="./skills.html"><i>Sk</i><span>Skills</span></a>
+<a class="sl" href="./mcp.html"><i>Mc</i><span>MCP</span></a>
+<a class="sl" href="./plugins.html"><i>Pl</i><span>Plugins</span></a>
+<a class="sl" href="./memory.html"><i>Me</i><span>Memory</span></a>
+<a class="sl" href="./project-instructions.html"><i>Pi</i><span>Project instructions</span></a>
+<a class="sl" href="./webui.html"><i>Wb</i><span>WebUI</span></a>
+<a class="sl" href="./webui-remote-access.html"><i>Ra</i><span>Remote access</span></a>
+</div>
+<div class="sg"><div class="sg-t">Help</div>
+<a class="sl" href="./faq.html"><i>Fq</i><span>FAQ</span></a>
+</div>
+<div class="sg"><div class="sg-t">Releases</div>
+<a class="sl" href="./changelog.html"><i>Cl</i><span>Changelog</span></a>
+</div>
   </aside>
+  <div class="ds-bg" id="dsBg"></div>
 
-  <main class="dmain prose-docs">
+  <!-- ==================== 正文 ==================== -->
+  <main class="dm">
+    <div class="crumb"><a href="./index.html">Docs</a><span>/</span><span>Advanced</span><span>/</span><b>Headless &amp; Daemon</b><em>5 min read</em></div>
+    <article class="prose" id="prose">
 <h1>Headless &amp; Daemon</h1>
       <p class="lede">In addition to the interactive TUI, AtomCode offers two non-interactive modes: <code>-p</code> headless on the CLI for scripts and CI, and <code>atomcode-daemon</code> — an HTTP + SSE API service that any client can drive.</p>
 
@@ -84,7 +81,7 @@
       <p>By default only the AI's final reply text goes to stdout — handy for piping. Tool calls and token usage are kept out of stdout.</p>
 
       <h3>Common headless flags</h3>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Flag</th><th>Description</th></tr>
         </thead>
@@ -92,21 +89,22 @@
           <tr><td><code>-p, --prompt TEXT</code></td><td>Task description to run</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>Read the prompt from a file (good for long input; mutually exclusive with <code>-p</code>)</td></tr>
           <tr><td><code>-v, --verbose</code></td><td>Send tool-call logs, token usage, and turn summaries to <em>stderr</em>; stdout is untouched</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>Hard cap of N LLM calls — keeps the agent from running away. No cap by default</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>Disable specific tools, e.g. <code>bash,web_fetch</code>. Disabled tools are absent from the schema list so the model won't try to call them</td></tr>
+          <tr><td><code>--no-tools</code></td><td>Headless only. Exposes no built-in, MCP, skill, or child-agent tools to the model.</td></tr>
+          <tr><td><code>--ephemeral</code></td><td>Run without creating, resuming, or writing a persistent session.</td></tr>
+          <tr><td><code>--output-format text|jsonl</code></td><td>Write assistant text by default, or versioned JSON Lines events with <code>jsonl</code>.</td></tr>
+          <tr><td><code>--require-approval-hook</code></td><td>Require an enabled, catch-all required approval hook for tools.</td></tr>
           <tr><td><code>-C, --dir PATH</code></td><td>Working directory; defaults to the current directory</td></tr>
           <tr><td><code>--provider / --model</code></td><td>Temporarily override provider or model</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>Disable telemetry for this invocation</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h3>Examples</h3>
       <pre><code># Generate a project summary and write it to a README draft
 atomcode -p "summarise the project structure and produce a README draft" &gt; README.draft.md
 
-# Auto-fix lint errors in CI
-atomcode -p "run pnpm lint and fix every error; don't modify test files" \
-         --max-turns 30 --disable-tools web_search,web_fetch
+# Explain existing lint output in CI without exposing tools
+atomcode --prompt-file lint-report.txt --no-tools --ephemeral
 
 # Read the prompt from a file
 atomcode --prompt-file task.md -v 2&gt; run.log
@@ -122,18 +120,18 @@ atomcode -p "explain this code" --provider local --model qwen2.5:14b</code></pre
 
       <div class="callout callout-warn">
         <strong>Note: permission model</strong>
-        <p>Headless mode has no interactive permission dialog. In the current implementation, <code>bash</code> calls that would prompt are auto-approved, and the reason is written to stderr:</p>
-        <pre><code>[headless] auto-approved bash: &lt;reason&gt;</code></pre>
-        <p>Other tools that would prompt for confirmation (<code>edit</code>, <code>write</code>, high-risk paths for <code>web_fetch</code>, …) are auto-denied:</p>
-        <pre><code>[approval-denied] tool=&lt;name&gt; reason=&lt;reason&gt;</code></pre>
-        <p>When <code>[approval-denied]</code> fires, the process exits with a non-zero code. If you don't want shell execution in CI, add <code>--disable-tools bash</code> explicitly to remove it from the tool list entirely.</p>
+        <p>A normal <code>-p</code> run has no interactive prompts. Approval requests for <code>bash</code> and <code>bash_start</code> are approved automatically, with the tool name written to stderr:</p>
+        <pre><code>[headless] auto-approved bash</code></pre>
+        <p>Other requests that reach interactive approval are denied by default, for example:</p>
+        <pre><code>[denied] edit_file requires interactive approval</code></pre>
+        <p>An approval denial causes a nonzero exit. Use <code>--no-tools</code> to remove the entire model tool catalog in CI. Unattended scheduled runs deny every tool call that reaches interactive approval.</p>
       </div>
 
       <h2>atomcode-daemon</h2>
       <p><code>atomcode-daemon</code> is a standalone transport adapter over <code>CodingRuntime</code>. It exposes an HTTP + Server-Sent Events API for web frontends, IDE plugins, and editor extensions. The official AtomCode VS Code extension and the AtomCode Air desktop app both connect through it.</p>
 
       <h3>Launching</h3>
-      <pre><code># Recommended: launch via the CLI subcommand — it invokes the sibling atomcode-daemon binary
+      <pre><code># Launch the daemon in the CLI process, bound to 127.0.0.1
 atomcode daemon
 
 # Pick a port and client identity (drives telemetry segmentation)
@@ -145,38 +143,39 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
       <p>The daemon reads the same <code>~/.atomcode/config.toml</code> as the CLI — login state, provider config, and session history are all shared.</p>
 
       <h3>Launch flags</h3>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Flag</th><th>Description</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>--host HOST</code></td><td>Listen address; default <code>127.0.0.1</code>. Non-loopback addresses trigger a warning (the daemon has no auth and must not be exposed publicly)</td></tr>
+          <tr><td><code>--host HOST</code></td><td>Standalone <code>atomcode-daemon</code> only. Sets the listen address and defaults to <code>127.0.0.1</code>.</td></tr>
           <tr><td><code>--port PORT</code></td><td>Listen port; default <code>13456</code></td></tr>
-          <tr><td><code>--client NAME</code></td><td>Client identity; currently <code>vscode</code> / <code>atomcode-air</code> are recognised, anything else is treated as a generic IDE. Affects telemetry tagging and some behaviour</td></tr>
-          <tr><td><code>--idle-timeout SECS</code></td><td>Idle timeout in seconds. Default 1800 (30 min); <code>0</code> disables it; non-zero values are clamped to a minimum of 60. Also accepts the env var <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code></td></tr>
+          <tr><td><code>--client NAME</code></td><td>Tags client telemetry. Both entrypoints recognise <code>vscode</code>, <code>jetbrains</code>, and <code>atomcode-air</code>.</td></tr>
+          <tr><td><code>--idle-timeout SECS</code></td><td>Idle timeout. Defaults to 1800 seconds, and <code>0</code> disables it. Also configurable via <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code>. The standalone binary clamps nonzero values to at least 60 seconds.</td></tr>
+          <tr><td><code>--no-auth</code></td><td>Disable API token authentication for isolated local development.</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>Disable telemetry for this process</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <div class="callout callout-warn">
         <strong>Security</strong>
-        <p>The daemon has no built-in auth and binds <code>127.0.0.1</code> by default. <strong>Never expose it to the public internet or to your LAN directly</strong> — callers gain full execution rights for every tool on your machine (including <code>bash</code>, <code>write</code>, <code>edit</code>). For remote access, terminate at a reverse proxy that handles auth / TLS / origin restrictions.</p>
+        <p>Both daemon entrypoints require API token authentication by default. <code>GET /health</code> is available without a token. For protected endpoints, read the token from <code>$ATOMCODE_HOME/daemon-&lt;port&gt;.json</code> (under <code>~/.atomcode/</code> by default) and send <code>Authorization: Bearer &lt;token&gt;</code>. The standalone binary refuses non-loopback binds with authentication disabled by default. Keep authentication enabled and use TLS for remote access.</p>
       </div>
 
       <h3>Endpoint overview</h3>
-      <p>All endpoints are registered in <code>crates/atomcode-daemon/src/main.rs</code>, grouped below.</p>
+      <p>Common endpoints are listed below. Routes are registered or merged in <code>crates/atomcode-daemon/src/lib.rs</code>.</p>
 
       <h4>Health &amp; lifecycle</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /health</code></td><td>Health check</td></tr>
           <tr><td><code>POST /shutdown</code></td><td>Shut the daemon down gracefully (used when the client exits)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>Sessions / projects</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /sessions</code></td><td>List all sessions</td></tr>
@@ -190,20 +189,20 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>DELETE /projects/:hash/sessions/:id</code></td><td>Delete a session</td></tr>
           <tr><td><code>PATCH /projects/:hash/sessions/:id/rename</code></td><td>Rename a session</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>Chat &amp; models</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /models</code></td><td>List available providers / models</td></tr>
           <tr><td><code>POST /chat</code></td><td>Send a prompt; returns an SSE stream</td></tr>
           <tr><td><code>POST /chat/stop</code></td><td>Stop an in-progress <code>/chat</code></td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>Config / providers</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /config</code></td><td>Read the current <code>config.toml</code></td></tr>
@@ -215,19 +214,19 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /providers/:name/default</code></td><td>Set this provider as the default</td></tr>
           <tr><td><code>PATCH /providers/:name/thinking</code></td><td>Toggle / adjust the provider's thinking mode</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>MCP</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /mcp/status</code></td><td>MCP server connection status</td></tr>
           <tr><td><code>POST /mcp/reload</code></td><td>Reload <code>.mcp.json</code></td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>Auth / CodingPlan</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td><code>GET /auth/status</code></td><td>Current login status</td></tr>
@@ -237,7 +236,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /auth/logout</code></td><td>Log out</td></tr>
           <tr><td><code>POST /codingplan/setup</code></td><td>Claim CodingPlan and write the provider config (equivalent to the CLI <code>atomcode login</code>; <code>atomcode codingplan</code> is kept as a hidden alias)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h3>SSE streaming chat</h3>
       <p>The SSE stream returned by <code>POST /chat</code> includes events for AI text deltas, reasoning deltas, tool-call batches (start / end), token stats, errors, and more. The daemon wire schema is defined by <code>LiveWireEvent</code> in <code>crates/atomcode-daemon/src/live_api.rs</code>.</p>
@@ -259,26 +258,26 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
         <li><a href="./skills.html">Skills</a> — codify workflows into commands; particularly useful with headless</li>
         <li><a href="./faq.html">FAQ</a> — common headless / daemon pitfalls</li>
       </ul>
-
-    <footer class="dftr">
-      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
-      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
-    </footer>
+    </article>
+    <nav class="pager"><span></span><span></span></nav>
+    <footer class="df"><span>© 2026 AtomCode · MIT</span><a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">Report an issue ↗</a></footer>
   </main>
+
+  <!-- ==================== 本页目录 ==================== -->
+  <aside class="toc" id="toc" aria-label="On this page"><p>On this page</p><nav id="tocList"></nav><button id="toTop">↑ Back to top</button></aside>
 </div>
 
-<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
-  <div class="search-modal-bg"></div>
-  <div class="search-modal-box">
-    <div class="search-input-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
-      <span class="search-esc">ESC</span>
-    </div>
-    <div class="search-results" id="searchResults"></div>
+<!-- ==================== 搜索 ==================== -->
+<div class="sm" id="sm" role="dialog" aria-modal="true" aria-label="Search docs…">
+  <div class="sm-box">
+    <div class="sm-in"><b>/</b><input id="sIn" type="search" autocomplete="off" spellcheck="false" placeholder="Search docs…"><kbd>ESC</kbd></div>
+    <ul class="sm-list" id="sList" role="listbox"></ul>
+    <div class="sm-ft">↑↓ select · ↵ open · esc close</div>
   </div>
 </div>
-
+<div class="toast" id="toast" role="status"></div>
+<script>window.DOCS_UI={"copy": "Copy", "copied": "Copied", "noRes": "No results"};</script>
+<script src="../search-index.en.js"></script>
 <script src="../docs.js"></script>
 </body>
 </html>

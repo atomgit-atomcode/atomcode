@@ -111,7 +111,6 @@ pub enum Msg<'a> {
     },
     UpgradeProgressEtaUnknown,
     MomentQuitAgain,
-    MomentHistoryClear,
     MomentEofAgain,
 
     // ── overlays (`overlay.rs`) ──
@@ -535,49 +534,21 @@ pub enum Msg<'a> {
     CmdAboutErrors,
     CmdAboutShowInject,
     CmdAboutMouse,
-    /// `/provider`'s model picker: the listing had nothing the account lacks.
-    ProviderDiscoverNothingNew,
     ProviderCatalogCandidates,
     /// …this account's protocol (or this screen) lists no models.
     ProviderDiscoverUnsupported,
     /// …while the listing is on its way.
     ProviderDiscovering,
-    /// …beside an empty model field: the key that opens it.
-    ProviderDiscoverHint,
-    ProviderAdvanced,
     ProviderManualAdd,
-    ProviderBatchCount {
-        n: usize,
-    },
-    ProviderWillUse,
-    ProviderSetUse,
-    ProviderBatchChoose,
     ProviderNotProvided,
-    ProviderEdit,
-    ProviderContinue,
-    ProviderConnectUse,
-    ProviderSaveOnly,
     ProviderConnected,
     ProviderAvailable,
     ProviderCapabilitiesUnknown,
     ProviderOutputLimit,
-    ProviderSavedSwitchFailed {
-        id: &'a str,
-        error: &'a str,
-    },
-    ProviderSavedSwitching {
-        id: &'a str,
-    },
     ProviderConnectTitle {
         id: &'a str,
     },
 
-    /// …its keys.
-    ProviderPickKeys,
-    /// …its filter line.
-    ProviderPickFilter {
-        query: &'a str,
-    },
     /// …the listing could not be had, and why.
     ProviderDiscoverFailed {
         why: &'a str,
@@ -861,6 +832,9 @@ pub enum Msg<'a> {
     AgentsStopped {
         name: &'a str,
     },
+    AgentsTaskChild {
+        label: &'a str,
+    },
     AgentsNoneYet,
     AgentsPickerHint,
     SessionNeedsNewerVersion {
@@ -875,7 +849,15 @@ pub enum Msg<'a> {
         turns: u32,
         when: &'a str,
     },
+    ResumeAllProjects,
+    ResumeThisProject,
+    ResumeLoadingAll,
+    ResumeNoneAll,
     ResumeNoOthers,
+    ResumeHistoryElsewhere,
+    ResumeScanIssue {
+        path: &'a str,
+    },
     ResumePickerHint,
 
     // ── background sessions (`bg.rs`, `modules/bg.rs`, the host's `background`) ──
@@ -1676,6 +1658,7 @@ pub enum Msg<'a> {
     /// Most important first — how to take the mouse back — because the tip
     /// row is one right-aligned row that cuts what does not fit at the end.
     MouseHandedBack,
+    MouseHandedBackArrowScroll,
     /// Printed above the conversation `/raw` puts on the terminal's own screen.
     RawTop,
     /// …and under it: what this screen is for and the way back.
@@ -1683,6 +1666,7 @@ pub enum Msg<'a> {
     /// Said once at start when `[ui] mouse = false` hands the pointer to the
     /// terminal from the first frame.
     MouseHandedBackAtStart,
+    MouseHandedBackArrowScrollAtStart,
     /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
     MouseUnreportedAtStart,
     MouseDisabledByTmux,
@@ -1824,6 +1808,8 @@ pub enum Msg<'a> {
     ProviderAuthenticationFailed,
     ProviderRateLimitError,
     ProviderConnectionError,
+    ProviderSystemProxyReadFailed,
+    ProviderCheckSystemProxy,
     ProviderResponseTimeout,
     ProviderConnectionTimeout,
     ProviderTlsInterrupted,
@@ -1858,16 +1844,8 @@ pub enum Msg<'a> {
     StopInvariantViolated,
     StopInternalError,
     StopMaxContinuations,
-    /// A turn the model ended on its own while the task list it kept still had
-    /// open items: not a failure, and not a finish either.
-    StopWithOpenItems {
-        count: usize,
-    },
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-    StopWithMembersRunning {
-        n: usize,
-    },
     LiveWaitingForMember {
         n: usize,
     },
@@ -1978,16 +1956,13 @@ pub enum Msg<'a> {
     ProviderFormAddModelTo {
         account: &'a str,
     },
-    ProviderFormAddModel,
     ProviderModelCount {
         n: usize,
     },
     ProviderHasKey,
     ProviderNoKey,
     ProviderManaged,
-    ProviderUnconfigured,
     ProviderVision,
-    ArmedDelete,
     FieldName,
     FieldProtocol,
     FieldKey,
@@ -1999,7 +1974,6 @@ pub enum Msg<'a> {
     ContextBudgetSource,
     /// Routed responses do not guarantee the next request uses the same model.
     AutoContextBudgetNote,
-    FieldUseAfterSaving,
     VisionYes,
     VisionNo,
     EffortUnsupported,
@@ -2025,9 +1999,59 @@ pub enum Msg<'a> {
     /// The arrows on the custom window field: leave it for the presets.
     LegendBackToPresets,
     LegendPressAgainToDelete,
-    LegendSeeItsModels,
-    LegendSwitchToIt,
     LegendChange,
+
+    // ── the providers panel: list → detail (2026-11 redesign) ──
+    /// The detail page's heading over the models the account already has.
+    ProviderSectionAdded,
+    /// …over the models the endpoint lists that it does not have yet.
+    ProviderSectionServer,
+    /// The detail page's first row: the account's connection.
+    ProviderConnectionRow,
+    /// The pinned last row of the provider list.
+    ProviderAddProviderRow,
+    /// The pinned last row of `/model`: opens the provider list.
+    ProviderAddModelRow,
+    /// The pinned last row of a detail page.
+    ProviderManualRow,
+    /// …the same row while a filter is typed: adds what was typed.
+    ProviderManualRowWith {
+        query: &'a str,
+    },
+    /// A server row whose write is in flight.
+    ProviderAdding,
+    /// The server section while the listing is on its way.
+    ProviderDiscoveryLoading,
+    /// A managed account's connection row: how to sign in or out instead.
+    ProviderManagedHint,
+    /// An add that was dropped because the connection changed under it.
+    ProviderConnectionChanged,
+    /// The row a second Ctrl+D would delete.
+    ProviderArmedDelete,
+    LegendEditIt,
+    LegendDelete,
+    LegendRemove,
+    LegendSwitch,
+    LegendAddIt,
+    LegendEditThenAdd,
+    LegendRetry,
+    /// Enter on a server row while the person has no model: add it and use it.
+    LegendAddAndUse,
+    /// The last row of a short connection form: Enter shows every field.
+    ProviderMoreSettings,
+    /// The level was refused after the switch went through: said under what
+    /// the switch said.
+    ProviderEffortFailed {
+        why: &'a str,
+    },
+    /// The 「更多设置 ▸」 row's Enter: show every field.
+    LegendShowAll,
+    /// An added model whose add-and-use switch is on its way.
+    ProviderSwitching,
+    /// An added model whose switch was refused: Enter tries again.
+    ProviderSwitchFailedOnRow {
+        why: &'a str,
+    },
 
     // ── the host side of the screen (`atomcode-cli`) ──
     HostConfigNotEditable,
@@ -2367,6 +2391,29 @@ pub enum Msg<'a> {
     ScheduleOff,
     ScheduleEditInTheCli,
     CmdAboutProxy,
+    GcAbout,
+    GcUsage,
+    GcBusy,
+    GcPreviewFirst,
+    GcApplyHint,
+    GcLowSpace {
+        free: &'a str,
+    },
+    GcFailed {
+        error: &'a str,
+    },
+    GcPreview {
+        used: &'a str,
+        count: usize,
+        estimated: &'a str,
+        skipped: usize,
+    },
+    GcApplied {
+        deleted: usize,
+        skipped: usize,
+        failed: usize,
+        removed: &'a str,
+    },
     ProxyTakes,
     ProxyPickerTitle {
         current: &'a str,
@@ -2461,6 +2508,9 @@ pub enum Msg<'a> {
     /// names the key, because a dim line with no key on it reads as a label.
     ComposerSuggested {
         text: &'a str,
+    },
+    ComposerContinueTodo {
+        title: &'a str,
     },
     ComposerPlaceholder,
     /// A command that replaces or rewinds the conversation, typed while a turn

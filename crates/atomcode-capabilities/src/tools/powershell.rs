@@ -89,6 +89,10 @@ impl Shell for PowerShell {
     fn decode(&self, bytes: &[u8]) -> String {
         super::bash::decode_output(bytes)
     }
+
+    fn decode_capture(&self, output: crate::world::CapturedOutput) -> String {
+        super::bash::decode_captured_output(output)
+    }
 }
 
 /// Probe the real executable and version, not merely the presence of a filename.

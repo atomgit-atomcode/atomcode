@@ -13,6 +13,18 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
+// Mirrors CHAT_REQUEST_BODY_LIMIT_BYTES in the daemon. Check the serialized
+// UTF-8 payload because base64, JSON escaping, and non-ASCII text affect its size.
+const CHAT_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+
+function encodeChatBody(body: StreamChatBody | { message: string; images?: ImageData[] }): string {
+  const json = JSON.stringify(body);
+  if (new Blob([json]).size > CHAT_REQUEST_BODY_LIMIT_BYTES) {
+    throw new ApiCallError('Chat request exceeds 32 MiB', 413);
+  }
+  return json;
+}
+
 /** Current session token (from the page URL). */
 export function getToken(): string {
   return token;
@@ -181,6 +193,17 @@ export async function cancelDetachedChat(
   await stopChat(requestId);
 }
 
+// Bound each event, including buffered partial events. Allow room for JSON
+// envelopes and inline content such as images in live snapshots.
+const SSE_EVENT_LIMIT_BYTES = 32 * 1024 * 1024;
+
+export class SseEventTooLargeError extends Error {
+  constructor() {
+    super('Server-sent event exceeds 32 MiB');
+    this.name = 'SseEventTooLargeError';
+  }
+}
+
 /** Parse the daemon's single-data-line SSE blocks, keeping partial chunks. */
 async function readEventStream<T>(
   response: Response,
@@ -191,13 +214,27 @@ async function readEventStream<T>(
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let bytes = 0;
+  // Hold a final LF until the next byte tells us whether it is part of the
+  // event or the delimiter, including when the two LFs arrive in different chunks.
+  let pendingLf = false;
+  const lf = Uint8Array.of(10);
+  const append = (piece: Uint8Array) => {
+    bytes += piece.length;
+    if (bytes > SSE_EVENT_LIMIT_BYTES) throw new SseEventTooLargeError();
+    buffer += decoder.decode(piece, { stream: true });
+  };
   const dispatch = (block: string) => {
-    const line = block.split('\n').find(line => line.startsWith('data:'));
-    const json = line?.slice('data:'.length).trim();
+    const json = /(?:^|\n)data:([^\n]*)/.exec(block)?.[1].trim();
     if (!json) return;
     let event: T;
     try { event = JSON.parse(json) as T; } catch { return; }
     onEvent(event);
+  };
+  const dispatchBuffered = () => {
+    dispatch(buffer + decoder.decode());
+    buffer = '';
+    bytes = 0;
   };
   try {
     for (;;) {
@@ -209,14 +246,40 @@ async function readEventStream<T>(
       });
       if (done) break;
       options.onActivity?.();
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split('\n\n');
-      buffer = parts.pop() ?? '';
-      for (const part of parts) dispatch(part);
+      if (value.length === 0) continue;
+      let start = 0;
+      if (pendingLf) {
+        pendingLf = false;
+        if (value[0] === 10) {
+          dispatchBuffered();
+          start = 1;
+        } else {
+          append(lf);
+        }
+      }
+      let newline = value.indexOf(10, start);
+      while (newline !== -1) {
+        if (newline === value.length - 1) {
+          append(value.subarray(start, newline));
+          pendingLf = true;
+          start = value.length;
+          break;
+        }
+        if (value[newline + 1] === 10) {
+          append(value.subarray(start, newline));
+          dispatchBuffered();
+          start = newline + 2;
+          newline = value.indexOf(10, start);
+        } else {
+          newline = value.indexOf(10, newline + 1);
+        }
+      }
+      append(value.subarray(start));
     }
     // /chat accepts a final block without a separator. /live dispatches only
     // complete blocks before reconnecting; keep that existing distinction.
-    if (options.flushTrailing && buffer.trim()) dispatch(buffer);
+    if (pendingLf) append(lf);
+    if (options.flushTrailing) dispatchBuffered();
   } finally {
     try { await reader.cancel(); } catch { /* fetch already aborted */ }
     reader.releaseLock();
@@ -234,7 +297,7 @@ export async function streamChat(
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify(body),
+    body: encodeChatBody(body),
     signal,
   });
 
@@ -251,9 +314,11 @@ export async function streamChat(
       } catch { /* legacy /chat dispatch isolation */ }
     }, { flushTrailing: true, signal });
   } catch (error) {
-    // An authoritative terminal has already settled the turn. A late
-    // transport failure cannot put the chat back into detached recovery.
-    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError)) throw error;
+    // An authoritative terminal has already settled the turn. A later
+    // transport or framing error cannot put the chat back into recovery.
+    if (!terminalSeen || !(error instanceof ApiStreamInterruptedError || error instanceof SseEventTooLargeError)) {
+      throw error;
+    }
   }
 
   if (signal?.aborted) {
@@ -307,6 +372,34 @@ export interface SessionMeta {
 }
 
 export type SessionActivity = 'open' | 'running' | 'waiting';
+
+export interface TeamMember {
+  id: string;
+  name: string;
+  role: string;
+  activity: SessionActivity | null;
+}
+
+export interface TeamTranscript {
+  entries: { seq: number; kind: 'user' | 'peer' | 'assistant' | 'tool' | 'tool_result' | 'tool_error'; text: string }[];
+  truncated: boolean;
+}
+
+function teamPath(project: string, lead: string) {
+  return `/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(lead)}/team`;
+}
+
+export async function getTeamMembers(project: string, lead: string, signal: AbortSignal): Promise<TeamMember[]> {
+  const resp = await apiFetch(teamPath(project, lead), { headers: authHeaders(), signal, cache: 'no-store' });
+  if (resp.status === 404) return [];
+  return readJson(resp);
+}
+
+export async function getTeamTranscript(project: string, lead: string, member: string, signal: AbortSignal): Promise<TeamTranscript> {
+  const resp = await apiFetch(`${teamPath(project, lead)}/${encodeURIComponent(member)}`, { headers: authHeaders(), signal, cache: 'no-store' });
+  return readJson(resp);
+}
+
 
 export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
@@ -1108,6 +1201,7 @@ export interface ApprovalModeResponse {
 }
 
 export interface TurnStats {
+  turn_id?: number;
   duration_ms: number;
   rounds: number;
   tool_calls: number;
@@ -1137,8 +1231,11 @@ export interface GoalRecoveryProgress {
   retry_in_secs: number;
 }
 export interface LiveGoalProgress {
+  control_id?: string;
   active: boolean;
   phase: string;
+  condition?: string;
+  elapsed_secs?: number;
   last_reason: string | null;
   recovery?: GoalRecoveryProgress | null;
 }
@@ -1218,7 +1315,7 @@ export async function postLiveMessage(
   const resp = await apiFetch('/live/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({
+    body: encodeChatBody({
       message,
       ...(images && images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
@@ -1267,6 +1364,16 @@ export async function postLiveStop(): Promise<void> {
   });
   const body = await readJson(resp) as { accepted?: boolean };
   if (!body.accepted) throw new Error('live runtime rejected the stop request');
+}
+
+export async function postLiveGoalAction(sessionId: string, controlId: string, action: 'pause' | 'remove'): Promise<void> {
+  const resp = await apiFetch('/live/goal/action', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, control_id: controlId, action }),
+  });
+  const body = await readJson<{ accepted?: boolean; error?: string }>(resp);
+  if (body.accepted !== true) throw new Error(body.error ?? 'Goal action rejected');
 }
 
 /** Sync-mode manual compaction: dispatch a compaction against the shared live
@@ -1572,6 +1679,74 @@ export async function workbenchPreview(session: string, path: string, signal?: A
   return response.blob();
 }
 
+/** One `git status` row as the daemon reports it; the single wire shape shared
+ *  by the Git panel, the file viewer and the commit-detail view. */
+export type Change = {
+  path: string;
+  original?: string | null;
+  index: string;
+  worktree: string;
+  stats?: { additions: number; deletions: number } | null;
+};
+
+/** A file a Git action should touch. `original` carries a rename source;
+ *  `untracked` records the status displayed before a discard. */
+export type GitPathSelection = {
+  path: string;
+  original?: string | null;
+  untracked?: boolean;
+};
+
+export type GitBranchList = {
+  current: string | null;
+  branches: { name: string; current: boolean }[];
+  detached: boolean;
+};
+
+export type GitLogEntry = {
+  hash: string;
+  short: string;
+  author: string;
+  /** Unix seconds. */
+  at: number;
+  subject: string;
+};
+
+export type GitCommitDetail = { files: Change[]; diff: string };
+
+function gitAction(session: string, action: string, body: Record<string, unknown>) {
+  return workbenchRequest<{ ok: boolean }>(`git/${action}`, { session_id: session, ...body });
+}
+
+export function stageGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'stage', { paths, all });
+}
+export function unstageGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'unstage', { paths, all });
+}
+export function discardGitPaths(session: string, paths: GitPathSelection[], all = false) {
+  return gitAction(session, 'discard', { paths, all });
+}
+export function commitGitStaged(session: string, message: string, amend = false) {
+  return workbenchRequest<{ ok: boolean; hash?: string | null }>('git/commit', { session_id: session, message, amend });
+}
+export async function readGitBranches(session: string): Promise<GitBranchList> {
+  return workbenchRequest<GitBranchList>('git/branches?' + new URLSearchParams({ session_id: session }));
+}
+export function switchGitBranch(session: string, name: string, create = false) {
+  return gitAction(session, 'branch', { name, create });
+}
+export async function readGitLog(session: string, limit = 30): Promise<GitLogEntry[]> {
+  // The daemon rejects anything outside 1–100. A finite override is clamped
+  // into that window (0 becomes 1, not the default page); only a non-finite
+  // value falls back to the default.
+  const bounded = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.trunc(limit))) : 30;
+  return workbenchRequest<GitLogEntry[]>('git/log?' + new URLSearchParams({ session_id: session, limit: String(bounded) }));
+}
+export async function readGitCommit(session: string, rev: string): Promise<GitCommitDetail> {
+  return workbenchRequest<GitCommitDetail>('git/commit-diff?' + new URLSearchParams({ session_id: session, rev }));
+}
+
 /** Explicit raw upload: no text decoding, base64 or model echo. */
 export async function importPatchFile(session: string, file: File, signal?: AbortSignal): Promise<string> {
   if (file.size > 8 * 1024 * 1024) throw new Error('Patch exceeds 8 MiB');
@@ -1607,6 +1782,15 @@ export async function getLivePersona(sessionId: string): Promise<{persona: Perso
 }
 
 export interface FollowUpView { prompt: string | null; current_task: boolean; new_session?: unknown; execution_id?: string | null }
+export async function getTurnRecap(sessionId: string, turnId: number): Promise<string | null> {
+  const response = await apiFetch('/chat/recap', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, turn_id: turnId }),
+  });
+  return (await readJson<{ text: string | null }>(response)).text;
+}
+
 export async function followUp(sessionId: string, args: string): Promise<FollowUpView> {
   const response = await apiFetch('/live/followup', {
     method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},

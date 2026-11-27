@@ -20,7 +20,7 @@ use crate::Config;
 pub struct ConfigRevision(String);
 
 impl ConfigRevision {
-    fn from_bytes(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         let digest = Sha256::digest(bytes);
         Self(format!("{digest:x}"))
     }
@@ -178,10 +178,26 @@ impl ConfigStore {
     where
         F: FnOnce(&mut DocumentMut, Option<&ConfigSnapshot>) -> Result<()>,
     {
+        self.update_document_with_base_revision(mutate)
+            .map(|(_, commit)| commit)
+    }
+
+    /// Also return the revision of the exact bytes patched by this transaction.
+    /// A missing document has no base revision.
+    pub fn update_document_with_base_revision<F>(
+        &self,
+        mutate: F,
+    ) -> Result<(Option<ConfigRevision>, ConfigCommit)>
+    where
+        F: FnOnce(&mut DocumentMut, Option<&ConfigSnapshot>) -> Result<()>,
+    {
         self.with_lock(false, |disk| {
-            let source = match std::fs::read_to_string(&self.path) {
-                Ok(source) => source,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            let (source, base) = match std::fs::read_to_string(&self.path) {
+                Ok(source) => {
+                    let revision = ConfigRevision::from_bytes(source.as_bytes());
+                    (source, Some(revision))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!("Failed to read config document: {}", self.path.display())
@@ -199,7 +215,7 @@ impl ConfigStore {
             // mutation. This makes it explicit that the document was patched
             // against the same locked generation, not a pre-lock cached copy.
             drop(disk);
-            Ok(ConfigCommit { snapshot })
+            Ok((base, ConfigCommit { snapshot }))
         })
     }
 
@@ -383,8 +399,12 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("Failed to create temporary config in {}", parent.display()))?;
+    #[cfg(windows)]
+    let temp = crate::windows_private_file::tempfile_in(parent);
+    #[cfg(not(windows))]
+    let temp = tempfile::NamedTempFile::new_in(parent);
+    let mut temp =
+        temp.with_context(|| format!("Failed to create temporary config in {}", parent.display()))?;
     temp.write_all(bytes)
         .with_context(|| format!("Failed to write temporary config for {}", path.display()))?;
     temp.as_file()

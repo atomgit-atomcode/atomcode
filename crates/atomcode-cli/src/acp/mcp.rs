@@ -72,6 +72,7 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    team_read_only_tools: Default::default(),
                     allowed_tools: None,
                     required_experimental_capabilities: Default::default(),
                 });
@@ -98,6 +99,7 @@ pub fn acp_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    team_read_only_tools: Default::default(),
                     allowed_tools: None,
                     required_experimental_capabilities: Default::default(),
                 });

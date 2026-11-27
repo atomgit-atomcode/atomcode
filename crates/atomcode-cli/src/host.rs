@@ -16,6 +16,7 @@ use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use atomcode_capabilities::session::{CatalogEntry, CatalogScan, SessionManager};
 use atomcode_harness::feed::Feed;
 use atomcode_host_api::{
     HostCommand, HostConnection, HostControl, HostError, HostEvent, HostReply, StoredSession,
@@ -29,6 +30,13 @@ use atomcode_coding::runtime::{
     ProviderUnavailableReason, RuntimeError, TurnCompletion, UserInput,
 };
 use atomcode_coding::CodingAgentConfig;
+
+/// The exact config revisions on either side of a host-owned settings write.
+#[derive(Debug)]
+pub struct ConfigFingerprintChange {
+    pub before: String,
+    pub after: String,
+}
 
 /// What a host knows about configuration that a front end asks it to act on:
 /// the provider settings a model id means, and the settings as they are now
@@ -118,14 +126,18 @@ pub trait HostConfig: Send + Sync {
         &self,
         selection: &str,
         effort: Option<atomcode_kernel::provider::ReasoningEffort>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<ConfigFingerprintChange>, String> {
         let _ = (selection, effort);
-        Ok(())
+        Ok(None)
     }
 
-    fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+    fn set_thinking_enabled(
+        &self,
+        selection: &str,
+        on: bool,
+    ) -> Result<Option<ConfigFingerprintChange>, String> {
         let _ = (selection, on);
-        Ok(())
+        Ok(None)
     }
 
     /// Who is signed in, when anybody is.
@@ -222,6 +234,7 @@ pub(crate) fn attach(
         task,
         session,
     } = runtime;
+    let mut working_dir = config.working_dir.clone();
     let control = Arc::new(RuntimeControl {
         handle: handle.clone(),
         session: Mutex::new(session.map(|s| s.id).unwrap_or_default()),
@@ -283,6 +296,7 @@ pub(crate) fn attach(
                     break;
                 }
                 CodingRuntimeEvent::SessionChanged(changed) => {
+                    working_dir = changed.working_dir;
                     let Some(session) = changed.session_id else {
                         continue;
                     };
@@ -319,11 +333,9 @@ pub(crate) fn attach(
                             met,
                         });
                     }
-                    let ended = progress.terminal.is_some()
-                        && progress.phase != atomcode_coding::GoalPhase::PausedAtCap;
                     watched.announce(HostEvent::Autonomy {
                         session,
-                        running: (!ended).then(|| running_of_goal(progress)),
+                        running: active_goal(progress),
                     });
                 }
                 // 一句「接下来也许可以说」。回合自己结束之后采一次,由运行时
@@ -342,10 +354,9 @@ pub(crate) fn attach(
                 }
                 CodingRuntimeEvent::LoopChanged(progress) => {
                     let session = watched.session.lock().expect("session poisoned").clone();
-                    let stopped = !progress.active;
                     watched.announce(HostEvent::Autonomy {
                         session,
-                        running: (!stopped).then(|| running_of_loop(progress)),
+                        running: active_loop(progress),
                     });
                 }
                 // The turn finished and its record did not. Both are said:
@@ -357,7 +368,7 @@ pub(crate) fn attach(
                     // 完了告诉一声。发在这儿而不是屏幕上:弹窗和铃声是操作系统
                     // 的事,而屏幕碰不到操作系统(`gates/tui-layers.sh`)。「刚才有没有
                     // 人在看」由屏幕那边的焦点事件存进同一个全局,这里只读。
-                    notify_turn(&watched, &completion);
+                    notify_turn(&watched, &working_dir, &completion);
                     if let Some(message) = persistence_failure(&completion) {
                         let session = watched.session.lock().expect("session poisoned").clone();
                         watched.announce(HostEvent::PersistenceFailed { session, message });
@@ -412,7 +423,7 @@ pub(crate) fn attach(
                     // 在等人拿主意。这是另一种“活停在这儿了”,而人很可能已经去
                     // 干别的了 —— 正是通知存在的理由。
                     if let CodingRuntimeEvent::Request(request) = &other {
-                        notify_waiting(&watched, request);
+                        notify_waiting(&watched, &working_dir, request);
                     }
                     if let Some(event) = translate(other) {
                         if out.send(event).is_err() {
@@ -976,6 +987,15 @@ fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
     }
 }
 
+fn active_goal(goal: atomcode_coding::GoalProgress) -> Option<atomcode_host_api::Running> {
+    (goal.terminal.is_none() || goal.phase == atomcode_coding::GoalPhase::PausedAtCap)
+        .then(|| running_of_goal(goal))
+}
+
+fn active_loop(progress: atomcode_coding::LoopProgress) -> Option<atomcode_host_api::Running> {
+    progress.active.then(|| running_of_loop(progress))
+}
+
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
     use atomcode_host_api::GoalStage;
@@ -1341,7 +1361,11 @@ pub fn notify_stop_reason(
 ///
 /// 发在宿主而不是屏幕上:弹窗和铃声是操作系统的事,而屏幕碰不到操作
 /// 系统。这也顺手给 daemon / ACP 那几个走同一个宿主的入口带上了。
-fn notify_turn(control: &RuntimeControl, completion: &atomcode_coding::TurnCompletion) {
+fn notify_turn(
+    control: &RuntimeControl,
+    working_dir: &std::path::Path,
+    completion: &atomcode_coding::TurnCompletion,
+) {
     use atomcode_capabilities::notify;
     let Some(source) = control.host_config.as_ref() else {
         return;
@@ -1358,12 +1382,6 @@ fn notify_turn(control: &RuntimeControl, completion: &atomcode_coding::TurnCompl
             (notify::NotifyStopReason::Error, stats)
         }
     };
-    let working_dir = control
-        .config
-        .lock()
-        .expect("config poisoned")
-        .working_dir
-        .clone();
     notify::notify_turn_finished(
         &cfg,
         notify::TurnNotification {
@@ -1372,7 +1390,7 @@ fn notify_turn(control: &RuntimeControl, completion: &atomcode_coding::TurnCompl
             tool_call_count: stats.tool_call_count,
             total_tokens: Some(stats.prompt_tokens + stats.completion_tokens),
             stop_reason: reason,
-            working_dir: Some(&working_dir),
+            working_dir: Some(working_dir),
         },
     );
 }
@@ -1381,7 +1399,11 @@ fn notify_turn(control: &RuntimeControl, completion: &atomcode_coding::TurnCompl
 ///
 /// 和回合结束同一条路,同一批开关:这也是“活停在这儿了”,而且更坏 ——
 /// 回合结束至少是结束了,这一件是在等,没人回来就一直等。
-fn notify_waiting(control: &RuntimeControl, request: &atomcode_coding::RuntimeRequest) {
+fn notify_waiting(
+    control: &RuntimeControl,
+    working_dir: &std::path::Path,
+    request: &atomcode_coding::RuntimeRequest,
+) {
     use atomcode_capabilities::notify;
     let Some(source) = control.host_config.as_ref() else {
         return;
@@ -1390,18 +1412,12 @@ fn notify_waiting(control: &RuntimeControl, request: &atomcode_coding::RuntimeRe
     if !would_notify(&cfg) {
         return;
     }
-    let working_dir = control
-        .config
-        .lock()
-        .expect("config poisoned")
-        .working_dir
-        .clone();
     notify::notify(
         &cfg,
         notify::NotificationEvent::ApprovalNeeded(notify::ApprovalNotification {
             tool_name: &request.kind,
             detail: None,
-            working_dir: Some(&working_dir),
+            working_dir: Some(working_dir),
         }),
     );
 }
@@ -1481,6 +1497,27 @@ pub(crate) struct RuntimeControl {
 }
 
 impl RuntimeControl {
+    fn reasoning_persistence_reply(
+        &self,
+        saved: Result<Option<ConfigFingerprintChange>, String>,
+    ) -> HostReply {
+        match saved {
+            Ok(change) => {
+                if let Some(change) = change {
+                    let mut applied = self.fingerprint.lock().expect("fingerprint poisoned");
+                    // An intervening external edit still needs a full reload.
+                    if applied.as_ref() == Some(&change.before) {
+                        *applied = Some(change.after);
+                    }
+                }
+                HostReply::Done
+            }
+            Err(error) => HostReply::DoneWithNote {
+                note: tr(SMsg::ReasoningNotKept { error: &error }).into_owned(),
+            },
+        }
+    }
+
     /// Whether `reason` still has to be said: `false` when it is already what
     /// the screen was told and nothing has served since.
     fn tell_unavailable(&self, reason: ProviderUnavailableReason) -> bool {
@@ -1651,14 +1688,10 @@ impl RuntimeControl {
         // directory, and the one being deleted is usually not this session's.
         let scan =
             SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
-        let entry = scan
-            .entries
-            .into_iter()
-            .find(|entry| entry.id == session)
-            .ok_or(HostError::NotFound)?;
-        let manager = SessionManager::for_project(
-            &entry.working_dir,
-            &atomcode_coding::config::product_dirs_from_env(),
+        let entry = unique_stored_entry(&scan.entries, session)?;
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let manager = SessionManager::with_root(
+            SessionManager::sessions_root(dirs.user()).join(&entry.project_bucket),
         );
         // The lease is the other runtime's answer to "is anyone using this?":
         // one held elsewhere fails here rather than deleting under it.
@@ -1672,7 +1705,89 @@ impl RuntimeControl {
         })
     }
 
-    fn list(&self, working_dir: Option<String>) -> Vec<StoredSession> {
+    async fn resume_stored(
+        &self,
+        session: String,
+        target: String,
+        across_projects: bool,
+    ) -> Result<HostReply, HostError> {
+        self.addressed(&session)?;
+        if target == session {
+            return Err(HostError::SessionInUse { id: target });
+        }
+        // Find the project once across the catalog. The importer revalidates
+        // only that bucket before taking the lease.
+        let scan = scan_session_catalog().await?;
+        self.addressed(&session)?;
+        let entry = find_switchable_entry(&scan.entries, &target)?;
+        if entry.needs_newer_version {
+            return Err(HostError::Failed {
+                message: format!(
+                    "session {target} was written by a newer AtomCode; update to resume it"
+                ),
+            });
+        }
+        // Resolve the runtime's current project before any fork or disk
+        // mutation. A foreign lease cannot be mounted in this project;
+        // adopting its bucket would also redirect future persistence.
+        let here = self
+            .handle
+            .context_stats()
+            .await
+            .map_err(refused)?
+            .working_dir;
+        let working_dir = resume_working_dir(entry, here, across_projects)?;
+        self.resume_catalog_entry(&session, entry, working_dir)
+            .await
+    }
+
+    pub(crate) async fn resume_catalog_entry(
+        &self,
+        session: &str,
+        entry: &CatalogEntry,
+        working_dir: std::path::PathBuf,
+    ) -> Result<HostReply, HostError> {
+        self.addressed(session)?;
+        if session == entry.id {
+            return Err(HostError::SessionInUse {
+                id: entry.id.clone(),
+            });
+        }
+        // Interactive resume has the same busy-session semantics as
+        // `atomcode-tuix`: the original runtime keeps its lease and we
+        // continue from its last committed state in a native fork. The
+        // prepared lease is handed straight to the runtime, so there is
+        // no acquire/drop race between deciding and switching.
+        let prepared =
+            atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
+                &entry.project_bucket,
+                &entry.id,
+            )
+            .map_err(|error| HostError::Failed {
+                message: error.to_string(),
+            })?
+            .ok_or(HostError::NotFound)?;
+        let resumed_id = prepared.view.meta.id.clone();
+        let forked_from = prepared.forked_from;
+        let changed = self
+            .handle
+            .resume_session_with_lease(resumed_id.clone(), working_dir, prepared.lease)
+            .await
+            .map_err(refused)?;
+        let reply = self.changed(changed.session_id)?;
+        match forked_from {
+            Some(source_id) => Ok(HostReply::DoneWithNote {
+                note: atomcode_config::i18n::t(atomcode_config::i18n::Msg::SessionBusyForked {
+                    source_id: &source_id,
+                    fork_id: &resumed_id,
+                })
+                .into_owned(),
+            }),
+            None => Ok(reply),
+        }
+    }
+
+    fn list(working_dir: Option<String>) -> HostReply {
         use atomcode_capabilities::session::SessionManager;
         let scan =
             SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
@@ -1719,19 +1834,52 @@ impl RuntimeControl {
                 &atomcode_coding::config::product_dirs_from_env(),
             )
         });
+        let hints = atomcode_host_api::SessionListHints {
+            other_projects_have_history: here_bucket
+                .as_ref()
+                .is_some_and(|here| all.iter().any(|(bucket, _)| bucket != here)),
+            scan_issue_path: scan
+                .diagnostics
+                .iter()
+                .find(|issue| {
+                    here_bucket.is_none()
+                        || issue.project_bucket.is_none()
+                        || issue.project_bucket == here_bucket
+                })
+                .map(|issue| issue.path.to_string_lossy().replace(char::is_control, "�")),
+        };
         let mut sessions = scope_sessions(all, working_dir.as_deref(), here_bucket.as_deref());
         // Only the rows the picker shows are probed: a lease and a log tail each.
         for session in &mut sessions {
             if let Some(bucket) = buckets.get(&session.id) {
-                session.held = held_activity(
-                    &SessionManager::with_root(sessions_root.join(bucket)),
-                    &session.id,
-                );
+                let bucket = SessionManager::with_root(sessions_root.join(bucket));
+                session.held = held_activity(&bucket, &session.id);
+                session.title = heading(&bucket, &session.id, session.title.take());
             }
         }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        sessions
+        HostReply::Sessions { sessions, hints }
     }
+}
+
+/// The name a picker row shows. A placeholder (`session-<id>`, `default`) is no
+/// name: a session whose title was never generated — the side call off or
+/// failed — showed its bare id here, while the reference picker and ACP already
+/// read the first prompt in its place. Read the same way here, and only for a
+/// placeholder, so a named session costs nothing.
+fn heading(
+    bucket: &atomcode_capabilities::session::SessionManager,
+    id: &str,
+    title: Option<String>,
+) -> Option<String> {
+    use atomcode_capabilities::session::SessionMeta;
+    let placeholder = title
+        .as_deref()
+        .is_none_or(|t| t.trim().is_empty() || SessionMeta::name_needs_fallback(t, id));
+    if !placeholder {
+        return title;
+    }
+    bucket.first_prompt_preview(id).ok().flatten().or(title)
 }
 
 /// What another runtime holding `id` is doing with it. A failed probe leaves
@@ -1805,7 +1953,7 @@ fn typed_words(user: &str) -> String {
 }
 
 fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String> {
-    use atomcode_capabilities::session::{events, SessionManager};
+    use atomcode_capabilities::session::SessionManager;
     let manager =
         SessionManager::for_project(here, &atomcode_coding::config::product_dirs_from_env());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1821,15 +1969,12 @@ fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String>
         if meta.id == skip {
             continue;
         }
-        let Ok(logged) = manager.load_events(&meta.id) else {
+        let Ok(history) = manager.read_history_text(&meta.id) else {
             continue;
         };
-        for record in events::turn_records(&meta.id, &logged).into_iter().rev() {
+        for record in history.turns.into_iter().rev() {
             if out.len() >= limit {
                 break;
-            }
-            if record.undone {
-                continue;
             }
             let typed = typed_words(&record.user);
             let said = typed.trim();
@@ -1896,7 +2041,7 @@ mod recall_tests {
 /// Undone turns are left out: they were taken back, and a preview that shows
 /// them describes a conversation that no longer exists.
 fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
-    use atomcode_capabilities::session::{events, SessionManager};
+    use atomcode_capabilities::session::SessionManager;
     /// How many exchanges. Enough to recognise a conversation, few enough to
     /// read at a glance while walking the list.
     const TURNS: usize = 3;
@@ -1905,17 +2050,13 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     const WIDE: usize = 160;
 
     let scan = SessionManager::scan_all(atomcode_coding::config::product_dirs_from_env().user());
-    let entry = scan
-        .entries
-        .into_iter()
-        .find(|entry| entry.id == session)
-        .ok_or(HostError::NotFound)?;
-    let manager = SessionManager::for_project(
-        &entry.working_dir,
-        &atomcode_coding::config::product_dirs_from_env(),
+    let entry = unique_stored_entry(&scan.entries, session)?;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let manager = SessionManager::with_root(
+        SessionManager::sessions_root(dirs.user()).join(&entry.project_bucket),
     );
-    let logged = manager
-        .load_events(session)
+    let history = manager
+        .read_history_text(session)
         .map_err(|error| HostError::Failed {
             message: error.to_string(),
         })?;
@@ -1930,19 +2071,9 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
     //
     // The LAST header, because a session that switched models ended on the one
     // it would resume from.
-    let model = logged.iter().rev().find_map(|entry| match &entry.event {
-        atomcode_kernel::session::SessionEvent::RequestHeader { model, .. } => Some(model.clone()),
-        _ => None,
-    });
-    let records = events::turn_records(session, &logged);
-    let kept: Vec<_> = records
-        .iter()
-        .filter(|record| !record.undone)
-        .rev()
-        .take(TURNS)
-        .collect();
+    let kept: Vec<_> = history.turns.iter().rev().take(TURNS).collect();
     let mut lines = Vec::new();
-    if let Some(model) = &model {
+    if let Some(model) = &history.model {
         lines.push(
             atomcode_i18n::product::t(atomcode_i18n::product::Msg::PreviewModel { model })
                 .into_owned(),
@@ -2119,13 +2250,19 @@ fn source_groups(
     groups
 }
 
-fn reasoning_persistence_reply(saved: Result<(), String>) -> HostReply {
-    match saved {
-        Ok(()) => HostReply::Done,
-        Err(error) => HostReply::DoneWithNote {
-            note: tr(SMsg::ReasoningNotKept { error: &error }).into_owned(),
-        },
-    }
+async fn session_disk<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T, HostError> + Send + 'static,
+) -> Result<T, HostError> {
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|error| HostError::Failed {
+            message: error.to_string(),
+        })?
+}
+
+pub(crate) async fn scan_session_catalog() -> Result<CatalogScan, HostError> {
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    session_disk(move || Ok(SessionManager::scan_all(dirs.user()))).await
 }
 
 #[async_trait]
@@ -2151,78 +2288,10 @@ impl HostControl for RuntimeControl {
                 })
             }
             HostCommand::Resume { session, target } => {
-                use atomcode_capabilities::session::SessionManager;
-                self.addressed(&session)?;
-                if target == session {
-                    return Err(HostError::SessionInUse { id: target });
-                }
-                // ONE catalog scan serves both the existence/version check and the
-                // cross-bucket pin decision below — a resume walks every project's
-                // sessions once, not twice. `message_count > 0` matches what the
-                // picker offers (a 0-message phantom is not resumable).
-                let scan = SessionManager::scan_all(
-                    atomcode_coding::config::product_dirs_from_env().user(),
-                );
-                let entry = find_switchable_entry(&scan.entries, &target)?;
-                if entry.needs_newer_version {
-                    return Err(HostError::Failed {
-                        message: format!(
-                            "session {target} was written by a newer AtomCode; update to resume it"
-                        ),
-                    });
-                }
-                // Resolve the runtime's current project before any fork or disk
-                // mutation. A foreign lease cannot be mounted in this project;
-                // adopting its bucket would also redirect future persistence.
-                let here = self
-                    .handle
-                    .context_stats()
-                    .await
-                    .map_err(refused)?
-                    .working_dir;
-                let current_bucket = SessionManager::project_hash(
-                    &here,
-                    &atomcode_coding::config::product_dirs_from_env(),
-                );
-                if entry.project_bucket != current_bucket {
-                    return Err(HostError::Failed {
-                        message: "Cannot resume a session from another project.".into(),
-                    });
-                }
-                // Interactive resume has the same busy-session semantics as
-                // `atomcode-tuix`: the original runtime keeps its lease and we
-                // continue from its last committed state in a native fork. The
-                // prepared lease is handed straight to the runtime, so there is
-                // no acquire/drop race between deciding and switching.
-                let prepared = atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
-                    &entry.project_bucket,
-                    &target,
-                )
-                .map_err(|error| HostError::Failed {
-                    message: error.to_string(),
-                })?
-                .ok_or(HostError::NotFound)?;
-                let resumed_id = prepared.view.meta.id.clone();
-                let working_dir = here;
-                let forked_from = prepared.forked_from;
-                let changed = self
-                    .handle
-                    .resume_session_with_lease(resumed_id.clone(), working_dir, prepared.lease)
-                    .await
-                    .map_err(refused)?;
-                let reply = self.changed(changed.session_id)?;
-                match forked_from {
-                    Some(source_id) => Ok(HostReply::DoneWithNote {
-                        note: atomcode_config::i18n::t(
-                            atomcode_config::i18n::Msg::SessionBusyForked {
-                                source_id: &source_id,
-                                fork_id: &resumed_id,
-                            },
-                        )
-                        .into_owned(),
-                    }),
-                    None => Ok(reply),
-                }
+                self.resume_stored(session, target, false).await
+            }
+            HostCommand::ResumeAcrossProjects { session, target } => {
+                self.resume_stored(session, target, true).await
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.addressed(&session)?;
@@ -2234,8 +2303,8 @@ impl HostControl for RuntimeControl {
                     .map_err(refused)?;
                 let selection = next.provider_name.clone();
                 *self.config.lock().expect("config poisoned") = next;
-                Ok(reasoning_persistence_reply(
-                    self.host_config.as_ref().map_or(Ok(()), |source| {
+                Ok(self.reasoning_persistence_reply(
+                    self.host_config.as_ref().map_or(Ok(None), |source| {
                         source.set_reasoning_effort(&selection, level)
                     }),
                 ))
@@ -2254,9 +2323,34 @@ impl HostControl for RuntimeControl {
                     groups: source_groups(&now.working_dir, &now.assets.unwrap_or_default()),
                 })
             }
-            HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
-                sessions: self.list(working_dir),
-            }),
+            HostCommand::ListSessions { working_dir } => {
+                session_disk(move || Ok(Self::list(working_dir))).await
+            }
+            HostCommand::ListTaskSessions { session } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                let parent = session.clone();
+                let sessions = session_disk(move || {
+                    let dirs = atomcode_coding::config::product_dirs_from_env();
+                    let manager = SessionManager::for_project(&here, &dirs);
+                    Ok(manager
+                        .children(&parent)
+                        .into_iter()
+                        .filter_map(|meta| manager.read_event_header(&meta.id).ok())
+                        .filter_map(|header| {
+                            atomcode_host_api::TaskSession::from_header(header, &parent)
+                        })
+                        .collect())
+                })
+                .await?;
+                self.addressed(&session)?;
+                Ok(HostReply::TaskSessions { sessions })
+            }
             HostCommand::DeleteSession { session } => {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)
@@ -2313,9 +2407,14 @@ impl HostControl for RuntimeControl {
                     seed: result.1,
                 })
             }
-            HostCommand::PreviewSession { session } => Ok(HostReply::SessionPreview {
-                lines: preview_of(&session)?,
-            }),
+            HostCommand::PreviewSession { session } => {
+                session_disk(move || {
+                    Ok(HostReply::SessionPreview {
+                        lines: preview_of(&session)?,
+                    })
+                })
+                .await
+            }
             HostCommand::History { session, limit } => {
                 self.addressed(&session)?;
                 // Where this session works, from the runtime rather than from
@@ -2327,9 +2426,11 @@ impl HostControl for RuntimeControl {
                     .await
                     .map_err(refused)?
                     .working_dir;
-                Ok(HostReply::History {
-                    entries: typed_before(&here, &session, limit as usize),
-                })
+                let id = session.clone();
+                let entries =
+                    session_disk(move || Ok(typed_before(&here, &id, limit as usize))).await?;
+                self.addressed(&session)?;
+                Ok(HostReply::History { entries })
             }
             HostCommand::Undo {
                 session,
@@ -2767,21 +2868,24 @@ impl HostControl for RuntimeControl {
                 self.addressed(&session)?;
                 use atomcode_capabilities::session::{aggregate_session_cost, SessionManager};
                 let working_dir = self
-                    .config
-                    .lock()
-                    .expect("config poisoned")
-                    .working_dir
-                    .clone();
-                let manager = SessionManager::for_project(
-                    &working_dir,
-                    &atomcode_coding::config::product_dirs_from_env(),
-                );
-                let report = manager
-                    .read_meta(&session)
-                    .map(|meta| aggregate_session_cost(&meta))
-                    .map_err(|error| HostError::Failed {
-                        message: error.to_string(),
-                    })?;
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                self.addressed(&session)?;
+                let dirs = atomcode_coding::config::product_dirs_from_env();
+                let id = session.clone();
+                let report = session_disk(move || {
+                    SessionManager::for_project(&working_dir, &dirs)
+                        .read_meta(&id)
+                        .map(|meta| aggregate_session_cost(&meta))
+                        .map_err(|error| HostError::Failed {
+                            message: error.to_string(),
+                        })
+                })
+                .await?;
+                self.addressed(&session)?;
                 // 账号名而不是选择 id:同一个账号下的好几个选择折成一个名字,
                 // 而那是人认得出来的那个。目录里没有的(比如已经删掉的 provider)
                 // 就原样用 id —— 编一个好听的名字比一串 id 更坏。
@@ -2975,8 +3079,8 @@ impl HostControl for RuntimeControl {
                 // waiting on the goal.
                 let running = now
                     .goal
-                    .map(running_of_goal)
-                    .or_else(|| now.looping.map(running_of_loop));
+                    .and_then(active_goal)
+                    .or_else(|| now.looping.and_then(active_loop));
                 Ok(HostReply::Autonomy { running })
             }
             HostCommand::Context { session, prompt } => {
@@ -3240,10 +3344,10 @@ impl HostControl for RuntimeControl {
                     .map_err(refused)?;
                 let selection = next.provider_name.clone();
                 *self.config.lock().expect("config poisoned") = next;
-                Ok(reasoning_persistence_reply(
-                    self.host_config
-                        .as_ref()
-                        .map_or(Ok(()), |source| source.set_thinking_enabled(&selection, on)),
+                Ok(self.reasoning_persistence_reply(
+                    self.host_config.as_ref().map_or(Ok(None), |source| {
+                        source.set_thinking_enabled(&selection, on)
+                    }),
                 ))
             }
             HostCommand::Readiness { session } => {
@@ -3348,6 +3452,31 @@ fn file_change(
     }
 }
 
+/// A foreign selection must still map to the bucket that supplied the row before
+/// the host takes a lease, forks a busy session, or changes the foreground.
+pub(crate) fn resume_working_dir(
+    entry: &atomcode_capabilities::session::CatalogEntry,
+    here: std::path::PathBuf,
+    across_projects: bool,
+) -> Result<std::path::PathBuf, HostError> {
+    use atomcode_capabilities::session::SessionManager;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    if entry.project_bucket == SessionManager::project_hash(&here, &dirs) {
+        return Ok(here);
+    }
+    if !across_projects {
+        return Err(HostError::Failed {
+            message: "Cannot resume a session from another project.".into(),
+        });
+    }
+    if !entry.working_dir.is_dir()
+        || SessionManager::project_hash(&entry.working_dir, &dirs) != entry.project_bucket
+    {
+        return Err(HostError::Failed { message: "The session's project directory is unavailable or belongs to another storage bucket.".into() });
+    }
+    Ok(entry.working_dir.clone())
+}
+
 /// The destination of a session switch, looked up in the catalog. A
 /// session with no messages is found but not switchable: say so, instead of
 /// answering "not found" for a session that exists.
@@ -3355,13 +3484,28 @@ pub(crate) fn find_switchable_entry<'a>(
     entries: &'a [atomcode_capabilities::session::CatalogEntry],
     target: &str,
 ) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
-    match entries.iter().find(|entry| entry.id == target) {
-        Some(entry) if entry.message_count > 0 => Ok(entry),
-        Some(_) => Err(HostError::Failed {
+    let entry = unique_stored_entry(entries, target)?;
+    if entry.message_count > 0 {
+        Ok(entry)
+    } else {
+        Err(HostError::Failed {
             message: "That session has no messages yet, so there is nothing to switch to.".into(),
-        }),
-        None => Err(HostError::NotFound),
+        })
     }
+}
+
+pub(crate) fn unique_stored_entry<'a>(
+    entries: &'a [atomcode_capabilities::session::CatalogEntry],
+    id: &str,
+) -> Result<&'a atomcode_capabilities::session::CatalogEntry, HostError> {
+    let mut matches = entries.iter().filter(|entry| entry.id == id);
+    let entry = matches.next().ok_or(HostError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(HostError::Failed {
+            message: format!("Session {id} exists in multiple project stores."),
+        });
+    }
+    Ok(entry)
 }
 
 pub fn refused(error: RuntimeError) -> HostError {
@@ -3822,6 +3966,7 @@ mod tests {
     fn goal_recovery_is_not_a_pause_in_the_host_projection() {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalRecoveryKind, GoalRecoveryProgress};
         let mut goal = GoalProgress {
+            control_id: uuid::Uuid::nil(),
             active: true,
             terminal: None,
             phase: GoalPhase::Pursuing,
@@ -3877,8 +4022,9 @@ mod tests {
         );
         goal.active = false;
         goal.phase = GoalPhase::PausedAtCap;
+        goal.terminal = Some(atomcode_coding::GoalTerminal::Stopped);
         goal.last_reason = Some("provider recovery budget exhausted".into());
-        let paused = running_of_goal(goal.clone());
+        let paused = active_goal(goal.clone()).expect("a budget pause stays visible");
         assert!(!paused.recovering);
         assert_eq!(paused.retry_in_secs, None);
         assert_eq!(
@@ -3887,6 +4033,7 @@ mod tests {
         );
         for phase in [GoalPhase::Satisfied, GoalPhase::Ended] {
             goal.phase = phase;
+            assert!(active_goal(goal.clone()).is_none());
             let ended = running_of_goal(goal.clone());
             assert_eq!(
                 ended.goal_stage, None,
@@ -3894,6 +4041,15 @@ mod tests {
             );
             assert_eq!(ended.paused, None);
         }
+        assert!(active_loop(atomcode_coding::LoopProgress {
+            active: false,
+            round: 2,
+            elapsed_secs: 3,
+            label: "repeat".into(),
+            last_reason: Some("stopped".into()),
+            recovery: None,
+        })
+        .is_none());
     }
 
     /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。
@@ -3905,6 +4061,7 @@ mod tests {
     #[test]
     fn goal_projection_keeps_cumulative_usage_and_unknown_checkpoint_history() {
         let mut progress = atomcode_coding::GoalProgress {
+            control_id: uuid::Uuid::nil(),
             active: true,
             terminal: None,
             phase: atomcode_coding::GoalPhase::Pursuing,
@@ -3943,6 +4100,7 @@ mod tests {
         use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};
         let ended = |terminal, last_reason| {
             goal_ending(&GoalProgress {
+                control_id: uuid::Uuid::nil(),
                 report: Default::default(),
                 evaluation_ready: false,
                 recovery: None,
@@ -3968,5 +4126,51 @@ mod tests {
         assert_eq!(ended(GoalTerminal::Failed, None), None);
         // 人自己停的,命令已经答过「目标停了。」
         assert_eq!(ended(GoalTerminal::Cancelled, None), None);
+    }
+}
+
+#[cfg(test)]
+mod heading_tests {
+    use super::heading;
+    use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+    /// A session left with its placeholder name is shown by its first prompt,
+    /// not `session-<id>`; a real name is kept as it is.
+    #[test]
+    fn a_placeholder_name_reads_as_the_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionManager::with_root(dir.path().join("0123456789abcdef"));
+        let id = "7d0c2b1e-0000-4000-8000-000000000001";
+        let lease = store.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, "/workspace", 1_000);
+        meta.owner = StorageOwner::Native;
+        store
+            .create_event_session(&lease, &SessionHeader::new(id), &meta)
+            .unwrap();
+        store
+            .append_events(
+                &lease,
+                &[LoggedEvent {
+                    seq: 1,
+                    at: 0,
+                    event: SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "整理 v5.2.9 的更新日志".into(),
+                        images: Vec::new(),
+                    },
+                }],
+            )
+            .unwrap();
+
+        let placeholder = Some(format!("session-{id}"));
+        assert_eq!(
+            heading(&store, id, placeholder).as_deref(),
+            Some("整理 v5.2.9 的更新日志")
+        );
+        assert_eq!(
+            heading(&store, id, Some("发布前检查".into())).as_deref(),
+            Some("发布前检查")
+        );
     }
 }

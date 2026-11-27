@@ -11,20 +11,27 @@ use std::path::Path;
 /// directory** (avoids EXDEV on iCloud/Dropbox symlinks), fsyncs the file
 /// before persist, then fsyncs the parent directory for POSIX durability.
 ///
-/// On Windows, `tempfile::NamedTempFile::persist` uses `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` so the rename is
-/// atomic even when the target exists.
+/// On Windows, `NamedTempFile::persist` replaces the destination using a
+/// same-volume `MoveFileExW` rename.
 ///
 /// `mode` is the Unix file mode. Use `0o644` for normal config files and
-/// `0o600` for secrets (tokens, OAuth credentials). Ignored on Windows
-/// for now; ACL handling is a P8 follow-up.
+/// `0o600` for secrets (tokens, OAuth credentials). On Windows an owner-only mode
+/// requests a protected DACL.
 pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().context("atomic_write: path has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("atomic_write: create_dir_all({})", parent.display()))?;
 
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("atomic_write: NamedTempFile::new_in({})", parent.display()))?;
+    #[cfg(windows)]
+    let tmp = if mode & 0o077 == 0 {
+        atomcode_config::windows_private_file::tempfile_in(parent)
+    } else {
+        tempfile::NamedTempFile::new_in(parent)
+    };
+    #[cfg(not(windows))]
+    let tmp = tempfile::NamedTempFile::new_in(parent);
+    let mut tmp =
+        tmp.with_context(|| format!("atomic_write: NamedTempFile::new_in({})", parent.display()))?;
     tmp.write_all(content)
         .with_context(|| format!("atomic_write: write({})", tmp.path().display()))?;
     tmp.as_file_mut()
@@ -37,14 +44,9 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("atomic_write: chmod({:o})", mode))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = mode;
-        // TODO(P8-v2): Windows ACL for mode 0o600 files (mcp.json with tokens).
-        // Use `windows-acl` crate or `icacls` command to restrict to owner-only.
-        // Currently Windows files inherit parent directory ACL, which is acceptable
-        // for most dev environments but not for shared/enterprise machines.
-        // Tracked in spec Section 5 / "Windows ACL" follow-up.
     }
 
     tmp.persist(path)

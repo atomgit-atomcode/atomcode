@@ -276,6 +276,12 @@ function upsertStatusBlock(message: ChatMessage, status: StatusData): ChatMessag
   return { ...message, blocks: nextBlocks };
 }
 
+function expirePendingPermission(request: PermissionRequestData): PermissionRequestData {
+  return request.status === 'pending' || request.status === 'submitting'
+    ? { ...request, status: 'expired', error: undefined }
+    : request;
+}
+
 function settleOpenTools(
   message: ChatMessage,
   status: 'incomplete' | 'error',
@@ -293,6 +299,11 @@ function settleOpenTools(
         }
       : tool,
   );
+  for (const block of currentBlocks(message)) {
+    if (block.type === 'permission') {
+      message = updatePermissionBlock(message, block.request.id, expirePendingPermission);
+    }
+  }
   if (!tools) return message;
   return tools.reduce<ChatMessage>(
     (updatedMessage, tool) => upsertToolBlock(updatedMessage, tool),
@@ -714,6 +725,9 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         msgs[assistantIndex] = updatedTool
           ? upsertToolBlock({ ...assistant, toolCalls: tools }, updatedTool)
           : { ...assistant, toolCalls: tools };
+      }
+      if (assistant) {
+        msgs[assistantIndex] = updatePermissionBlock(msgs[assistantIndex], action.id, expirePendingPermission);
       }
       return { ...state, messages: msgs };
     }
@@ -1242,18 +1256,21 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
       const msgs = [...state.messages];
       const last = msgs[msgs.length - 1];
       if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => request.approvalId !== action.approvalId ? request : action.success
-          ? {
-              ...request,
-              status: request.decision === 'deny' ? 'denied' : 'allowed',
-              error: undefined,
-            }
-          : {
-              ...request,
-              status: 'pending',
-              decision: undefined,
-              error: action.message || 'Permission response failed',
-            });
+        msgs[msgs.length - 1] = updatePermissionBlock(last, action.id, (request) => {
+          if (request.approvalId !== action.approvalId || request.status === 'allowed' || request.status === 'denied') {
+            return request;
+          }
+          if (action.success) {
+            return { ...request, status: request.decision === 'deny' ? 'denied' : 'allowed', error: undefined };
+          }
+          if (request.status === 'expired') return request;
+          return {
+            ...request,
+            status: action.expired ? 'expired' : 'pending',
+            decision: undefined,
+            error: action.message || 'Permission response failed',
+          };
+        });
       }
       return { ...state, messages: msgs };
     }

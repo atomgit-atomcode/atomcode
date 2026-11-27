@@ -39,7 +39,7 @@
 use atomcode_harness::session::SessionEvent;
 
 use crate::el::El;
-use crate::frame::Line;
+use crate::frame::{Line, Span};
 use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::moment::Viewport;
@@ -57,6 +57,62 @@ pub const ID: &str = "tip";
 pub struct State;
 
 pub struct Tip;
+
+/// The runtime sample that belongs to `goal`, with the moment it arrived.
+///
+/// [`Moment::autonomy`](crate::moment::Moment::autonomy) says which row is on
+/// screen, not which session a sample came from: a lead's and a member's
+/// samples share the map, and neither may inherit the other's goal clock. So
+/// every branch that reads a goal's elapsed time matches the sample against the
+/// goal itself, viewing first and lead second.
+fn goal_sample<'a>(
+    moment: &'a crate::moment::Moment,
+    goal: &atomcode_host_api::Running,
+) -> Option<(&'a atomcode_host_api::Running, crate::moment::Timestamp)> {
+    moment
+        .autonomy_samples
+        .get(&moment.viewing)
+        .filter(|(sample, _)| sample == goal)
+        .or_else(|| {
+            moment
+                .autonomy_samples
+                .get(&moment.lead)
+                .filter(|(sample, _)| sample == goal)
+        })
+        .map(|(sample, since)| (sample, *since))
+}
+
+/// The goal badge's elapsed time, or nothing when the state is not a running
+/// goal (a loop, retry, quota wait, or an older host that sent no sample).
+///
+/// A running goal advances on the injected clock between samples, so the badge
+/// steps every frame instead of waiting for the host to report again. A paused
+/// goal freezes at the sample's own `elapsed_secs`: adding the time since that
+/// receipt would keep the clock running while the work is stopped, and the next
+/// sample after resume carries the paused value forward rather than resetting.
+fn goal_duration(
+    moment: &crate::moment::Moment,
+    goal: &atomcode_host_api::Running,
+) -> Option<String> {
+    if goal.kind != "goal" || goal.recovering {
+        return None;
+    }
+    let (sample, since) = goal_sample(moment, goal)?;
+    let mut ms = sample.elapsed_secs.saturating_mul(1_000);
+    if goal.paused.is_none() {
+        ms = ms.saturating_add(moment.now.as_millis().saturating_sub(since.as_millis()));
+    }
+    let secs = ms / 1_000;
+    if secs < 3_600 {
+        return Some(crate::text::compact_duration(ms));
+    }
+    Some(format!(
+        "{}h {:02}m {:02}s",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60
+    ))
+}
 
 impl View for Tip {
     type State = State;
@@ -126,8 +182,8 @@ impl View for Tip {
                 ),
             },
         };
-        // Goal status uses the already-reserved row above the box, never the
-        // rename pill's position on the input rule. Preserve a tip on the left.
+        // Goal and notices share the right edge of the reserved row. Leave
+        // the input rule and its rename pill to the composer.
         if vp.moment.secret.is_none() {
             if let Some(goal) = vp
                 .moment
@@ -135,25 +191,28 @@ impl View for Tip {
                 .as_ref()
                 .filter(|a| a.kind == "goal" || (a.kind == "loop" && a.waiting_for_quota))
             {
-                let (mut label, mut badge_role) = if goal.paused.is_some() && !goal.recovering {
-                    ("Goal paused · /goal report".to_owned(), Role::Warning)
+                let duration = goal_duration(vp.moment, goal);
+                let paused_bare = "Goal paused · /goal report";
+                // The badge without its elapsed time, for the fallback below.
+                let (mut label, bare, badge_role) = if goal.paused.is_some() && !goal.recovering {
+                    (
+                        match duration {
+                            Some(duration) => format!("Goal paused · {duration} · /goal report"),
+                            None => paused_bare.to_owned(),
+                        },
+                        Some(paused_bare),
+                        Role::Warning,
+                    )
                 } else if goal.recovering {
-                    let elapsed = vp
-                        .moment
-                        .autonomy_samples
-                        .get(&vp.moment.viewing)
-                        .filter(|(sample, _)| sample == goal)
-                        .or_else(|| {
-                            vp.moment
-                                .autonomy_samples
-                                .get(&vp.moment.lead)
-                                .filter(|(sample, _)| sample == goal)
-                        })
+                    let elapsed = goal_sample(vp.moment, goal)
                         .map(|(_, at)| {
                             vp.moment.now.as_millis().saturating_sub(at.as_millis()) / 1000
                         })
                         .unwrap_or(0);
-                    match goal.retry_in_secs.map(|secs| secs.saturating_sub(elapsed)) {
+                    let (label, role) = match goal
+                        .retry_in_secs
+                        .map(|secs| secs.saturating_sub(elapsed))
+                    {
                         Some(secs) if secs > 0 && goal.waiting_for_quota => (
                             t(if goal.kind == "loop" {
                                 Msg::LoopQuotaWaiting { secs }
@@ -179,18 +238,44 @@ impl View for Tip {
                             ("Goal evaluating".to_owned(), Role::Accent)
                         }
                         _ => ("Goal recovering".to_owned(), Role::Accent),
-                    }
+                    };
+                    (label, None, role)
                 } else if goal.goal_stage == Some(atomcode_host_api::GoalStage::Continuing) {
-                    ("Goal continuing".to_owned(), Role::Accent)
+                    (
+                        match duration {
+                            Some(duration) => format!("Goal continuing · {duration}"),
+                            None => "Goal continuing".to_owned(),
+                        },
+                        Some("Goal continuing"),
+                        Role::Accent,
+                    )
                 } else {
-                    ("Goal active".to_owned(), Role::Accent)
+                    (
+                        match duration {
+                            Some(duration) => format!("Goal active · {duration}"),
+                            None => "Goal active".to_owned(),
+                        },
+                        Some("Goal active"),
+                        Role::Accent,
+                    )
                 };
-                let mut text = if text.is_empty() && !goal.recovering {
-                    goal.paused.as_deref().unwrap_or(&text).to_owned()
+                let text = if text.is_empty() && !goal.recovering {
+                    goal.paused.as_deref().unwrap_or(&text)
                 } else {
-                    text.clone()
+                    &text
                 };
                 let available = w.saturating_sub(1) as usize;
+                // The elapsed time is the newest and least important thing the
+                // badge says, so it is what goes first when the row is narrow:
+                // at 27–34 columns a paused goal keeps `/goal report` instead of
+                // losing it to the clock. Only a row too narrow for the bare
+                // badge falls back to the short form.
+                let bare = bare.filter(|bare| crate::width::str_width(bare) <= available);
+                if crate::width::str_width(&label) > available {
+                    if let Some(bare) = bare {
+                        label = bare.to_owned();
+                    }
+                }
                 if crate::width::str_width(&label) > available {
                     label = if goal.waiting_for_quota {
                         t(if goal.kind == "loop" {
@@ -207,33 +292,36 @@ impl View for Tip {
                         "Goal active".to_owned()
                     };
                 }
-                // A quiet, wide row can keep goal state on the left and the
-                // restart reminder on the right. Narrow rows preserve the goal.
-                if quiet {
-                    if let Some(hint) = restart.filter(|hint| {
-                        crate::width::str_width(hint) + crate::width::str_width(&label) + 1
+                // Keep the existing quiet restart reminder when it fits,
+                // dropping the clock first if the bare badge makes room.
+                let restart = restart.filter(|hint| {
+                    quiet
+                        && crate::width::str_width(hint)
+                            + crate::width::str_width(bare.unwrap_or(&label))
+                            + 1
                             <= available
-                    }) {
-                        text = if text.is_empty() {
-                            label
-                        } else {
-                            format!("{label} · {text}")
-                        };
-                        label = hint.to_owned();
-                        badge_role = Role::Muted;
+                });
+                if let Some(hint) = restart {
+                    let room = available - crate::width::str_width(hint) - 1;
+                    if crate::width::str_width(&label) > room {
+                        label = bare.unwrap_or(&label).to_owned();
                     }
                 }
-                let badge_width = crate::width::str_width(&label);
-                if available >= badge_width {
-                    let room = available.saturating_sub(badge_width + 1);
-                    let mut line = Line::from_spans(vec![crate::frame::Span::styled(
-                        text.to_owned(),
-                        theme::fg(role),
-                    )])
-                    .truncate(room);
-                    let gap = available.saturating_sub(line.width() + badge_width);
-                    line.push(crate::frame::Span::raw(" ".repeat(gap)));
-                    line.push(crate::frame::Span::styled(label, theme::fg(badge_role)));
+                if crate::width::str_width(&label) <= available {
+                    let mut content = Line::styled(label, theme::fg(badge_role));
+                    let restart_width = restart.map_or(0, |hint| crate::width::str_width(hint) + 1);
+                    let tip_room = available.saturating_sub(content.width() + restart_width + 2);
+                    let tip = crate::width::take_width(text, tip_room);
+                    if !tip.is_empty() {
+                        content.push(Span::raw("  "));
+                        content.push(Span::styled(tip, theme::fg(role)));
+                    }
+                    if let Some(hint) = restart {
+                        content.push(Span::raw(" "));
+                        content.push(Span::styled(hint, theme::fg(Role::Muted)));
+                    }
+                    let mut line = Line::raw(" ".repeat(available - content.width()));
+                    line.spans.extend(content.spans);
                     return vec![line];
                 }
             }
@@ -383,6 +471,55 @@ mod tests {
     }
 
     #[test]
+    fn transient_tips_follow_the_goal_at_the_right_edge_and_expire_in_place() {
+        let mut moment = Moment {
+            clipboard_hint: true,
+            autonomy: Some(atomcode_host_api::Running {
+                usage: None,
+                recovering: false,
+                waiting_for_quota: false,
+                retry_in_secs: None,
+                goal_stage: None,
+                goal_detail: None,
+                kind: "goal".into(),
+                what: "objective".into(),
+                round: 1,
+                of: None,
+                elapsed_secs: 61,
+                paused: None,
+            }),
+            ..Moment::default()
+        };
+        let badge = "Goal active · 1m01s";
+        moment.autonomy_samples.insert(
+            moment.viewing.clone(),
+            (moment.autonomy.clone().unwrap(), moment.now),
+        );
+        let clipboard = moment.clipboard_caption().unwrap();
+        let row = draw_at(&moment, 100, 1)[0].plain();
+        assert!(
+            row.starts_with(' ') && row.ends_with(&format!("{badge}  {clipboard}")),
+            "{row:?}"
+        );
+
+        let copy = t(Msg::CopiedSelection);
+        moment = moment.with_notice(copy.as_ref(), false, Timestamp::millis(0));
+        let row = draw_at(&moment, 100, 1)[0].plain();
+        assert!(
+            row.ends_with(&format!("{badge}  {copy}")) && !row.contains(&clipboard),
+            "{row:?}"
+        );
+
+        let narrow = draw_at(&moment, 14, 1)[0].plain();
+        assert_eq!(narrow.trim(), "Goal active");
+        moment.clipboard_hint = false;
+        moment.now = Timestamp::millis(3_000);
+        let rows = draw_at(&moment, 100, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].plain().ends_with("Goal active · 1m04s"));
+    }
+
+    #[test]
     fn restart_and_goal_share_a_wide_tip_without_hiding_the_goal_on_narrow_rows() {
         let mut moment = Moment::default();
         moment.autonomy = Some(atomcode_host_api::Running {
@@ -452,6 +589,231 @@ mod tests {
                 .as_ref()
             ));
         }
+    }
+
+    #[test]
+    fn goal_badge_counts_up_while_running_freezes_when_paused_and_resumes() {
+        let mut goal = atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            waiting_for_quota: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 61,
+            paused: None,
+        };
+        let mut m = Moment {
+            now: Timestamp::millis(10_000),
+            autonomy: Some(goal.clone()),
+            ..Moment::default()
+        };
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1m01s"));
+
+        m.now = Timestamp::millis(11_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1m02s"));
+
+        goal.paused = Some("paused by user".into());
+        goal.elapsed_secs = 62;
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
+        let frozen = draw_at(&m, 100, 1)[0].plain();
+        assert!(
+            frozen.contains("Goal paused · 1m02s · /goal report"),
+            "{frozen:?}"
+        );
+        m.now = Timestamp::millis(21_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal paused · 1m02s · /goal report"));
+
+        goal.paused = None;
+        goal.elapsed_secs = 62;
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
+        m.now = Timestamp::millis(22_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1m03s"));
+
+        goal.elapsed_secs = 3_599;
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 59m59s"));
+        m.now = Timestamp::millis(23_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1h 00m 00s"));
+        m.now = Timestamp::millis(24_000);
+        assert!(draw_at(&m, 100, 1)[0]
+            .plain()
+            .contains("Goal active · 1h 00m 01s"));
+    }
+
+    #[test]
+    fn a_loop_does_not_gain_a_goal_duration_badge() {
+        let running = atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            waiting_for_quota: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "loop".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 61,
+            paused: None,
+        };
+        let mut m = Moment {
+            now: Timestamp::millis(10_000),
+            autonomy: Some(running.clone()),
+            ..Moment::default()
+        };
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (running, m.now));
+        let line = draw_at(&m, 100, 1)[0].plain();
+        assert!(
+            !line.contains("Goal active") && !line.contains("1m"),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_row_drops_the_clock_before_it_drops_the_goal_state() {
+        let goal = atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            waiting_for_quota: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 62,
+            paused: Some("paused by user".into()),
+        };
+        let mut m = Moment {
+            now: Timestamp::millis(10_000),
+            autonomy: Some(goal.clone()),
+            ..Moment::default()
+        };
+        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        // 27..=34 columns used to lose `/goal report` along with the clock.
+        let narrow = draw_at(&m, 30, 1)[0].plain();
+        assert!(narrow.contains("Goal paused · /goal report"), "{narrow:?}");
+        assert!(!narrow.contains("1m02s"), "{narrow:?}");
+        let wide = draw_at(&m, 40, 1)[0].plain();
+        assert!(
+            wide.contains("Goal paused · 1m02s · /goal report"),
+            "{wide:?}"
+        );
+    }
+
+    #[test]
+    fn a_running_clock_does_not_crowd_out_the_restart_reminder() {
+        let goal = atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            waiting_for_quota: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "objective".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 61,
+            paused: None,
+        };
+        let mut m = Moment {
+            now: Timestamp::millis(10_000),
+            autonomy: Some(goal.clone()),
+            restart_hint: Some("restart to apply".into()),
+            ..Moment::default()
+        };
+        m.autonomy_samples
+            .insert(m.viewing.clone(), (goal.clone(), m.now));
+        // 29..=35 columns: the bare badge plus the reminder still fit.
+        let line = draw_at(&m, 30, 1)[0].plain();
+        assert!(line.ends_with("restart to apply"), "{line:?}");
+        assert!(line.contains("Goal active"), "{line:?}");
+        assert!(!line.contains('·'), "{line:?}");
+        assert!(crate::width::str_width(&line) <= 30, "{line:?}");
+
+        let mut goal = goal;
+        goal.paused = Some("pause".into());
+        m.autonomy = Some(goal.clone());
+        m.autonomy_samples.insert(m.viewing.clone(), (goal, m.now));
+        let narrow = draw_at(&m, 47, 1)[0].plain();
+        assert!(
+            narrow
+                .trim_start()
+                .starts_with("Goal paused · /goal report"),
+            "{narrow:?}"
+        );
+        assert!(narrow.ends_with("restart to apply"), "{narrow:?}");
+        let wide = draw_at(&m, 70, 1)[0].plain();
+        assert!(
+            wide.trim_start()
+                .starts_with("Goal paused · 1m01s · /goal report"),
+            "{wide:?}"
+        );
+        assert!(wide.ends_with("restart to apply"), "{wide:?}");
+    }
+
+    #[test]
+    fn the_badge_reads_only_the_sample_that_belongs_to_its_goal() {
+        let lead = atomcode_host_api::Running {
+            usage: None,
+            recovering: false,
+            waiting_for_quota: false,
+            retry_in_secs: None,
+            goal_stage: None,
+            goal_detail: None,
+            kind: "goal".into(),
+            what: "lead task".into(),
+            round: 1,
+            of: None,
+            elapsed_secs: 100,
+            paused: None,
+        };
+        let mut member = lead.clone();
+        member.what = "member task".into();
+        member.elapsed_secs = 200;
+        let mut m = Moment {
+            lead: "lead".into(),
+            viewing: "member".into(),
+            now: Timestamp::millis(10_000),
+            autonomy: Some(lead.clone()),
+            ..Moment::default()
+        };
+        m.autonomy_samples
+            .insert("lead".into(), (lead, Timestamp::millis(0)));
+        m.autonomy_samples
+            .insert("member".into(), (member, Timestamp::millis(0)));
+        // The row is the lead's goal, even though the member's clock is on
+        // screen — 100s + 10s, not the member's 200s + 10s.
+        let line = draw_at(&m, 100, 1)[0].plain();
+        assert!(line.contains("Goal active · 1m50s"), "{line:?}");
+        assert!(!line.contains("3m30s"), "{line:?}");
     }
 
     #[test]
