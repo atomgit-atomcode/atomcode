@@ -22,6 +22,9 @@ struct Provider {
     streams: Mutex<VecDeque<Vec<StreamEvent>>>,
     requests: Mutex<Vec<Vec<Message>>>,
     options: Mutex<Vec<ChatOptions>>,
+    /// Answer a request asking for more output tokens than this with a 400, as
+    /// an endpoint with its own output limit does.
+    refuse_output_above: Option<u32>,
 }
 
 #[async_trait]
@@ -40,6 +43,16 @@ impl LlmProvider for Provider {
     ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
         self.requests.lock().unwrap().push(messages.to_vec());
         self.options.lock().unwrap().push(options.clone());
+        if let (Some(limit), Some(asked)) = (self.refuse_output_above, options.max_tokens) {
+            if asked > limit {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: format!("max_tokens must be less than or equal to {limit}"),
+                    http_status: Some(400),
+                    ..ProviderError::default()
+                });
+            }
+        }
         let events = self
             .streams
             .lock()
@@ -198,6 +211,7 @@ async fn signed_blocks_and_response_identity_survive_resume_and_reach_the_next_r
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let first = app(&root, provider.clone(), false).await;
     assert_eq!(
@@ -286,6 +300,7 @@ async fn a_recovered_attempt_keeps_its_own_signatures_and_identity() {
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let app = app(&root, provider.clone(), false).await;
     let outcome = run_turn(&app, "start").await.unwrap();
@@ -324,6 +339,44 @@ async fn a_recovered_attempt_keeps_its_own_signatures_and_identity() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// An endpoint with its own output limit refuses the raised budget; the
+/// request is made again as it was, and the turn goes on.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_refused_budget_raise_falls_back_to_the_original_budget() {
+    let root = std::env::temp_dir().join(format!("atomcode-budget-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let provider = Arc::new(Provider {
+        streams: Mutex::new(VecDeque::from([
+            vec![
+                StreamEvent::Reasoning("long analysis".into()),
+                StreamEvent::Done { truncated: true },
+            ],
+            vec![
+                StreamEvent::TextDelta("finished".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ])),
+        requests: Mutex::new(Vec::new()),
+        options: Mutex::new(Vec::new()),
+        refuse_output_above: Some(atomcode_kernel::agent::DEFAULT_MAX_OUTPUT_TOKENS),
+    });
+    let mut app = app(&root, provider.clone(), false).await;
+    let outcome = run_turn(&app, "start").await.unwrap();
+    assert_eq!(outcome.text, "finished", "{outcome:?}");
+    assert!(outcome.error.is_none(), "{outcome:?}");
+    let options = provider.options.lock().unwrap();
+    assert_eq!(
+        options.len(),
+        3,
+        "first, raised (refused), retried as before"
+    );
+    assert!(options[1].max_tokens > options[0].max_tokens);
+    assert_eq!(options[2].max_tokens, options[0].max_tokens);
+    drop(options);
+    app.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn successful_tool_rounds_break_the_truncation_streak() {
     let root =
@@ -352,6 +405,7 @@ async fn successful_tool_rounds_break_the_truncation_streak() {
         streams: Mutex::new(streams),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     let outcome = run_turn(&app, "start").await.unwrap();
@@ -365,6 +419,21 @@ async fn successful_tool_rounds_break_the_truncation_streak() {
         .text
         .contains("writing the remaining content INCREMENTALLY")));
     drop(requests);
+    // Reasoning that ran out of budget gets a larger one for the next request only.
+    let options = provider.options.lock().unwrap();
+    let base = options[0].max_tokens;
+    assert!(
+        options[1].max_tokens.unwrap()
+            > base.unwrap_or(atomcode_kernel::agent::DEFAULT_MAX_OUTPUT_TOKENS),
+        "{:?} -> {:?}",
+        base,
+        options[1].max_tokens
+    );
+    assert_eq!(
+        options[2].max_tokens, base,
+        "the raise is for one request only"
+    );
+    drop(options);
     app.stop();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -386,6 +455,7 @@ async fn consecutive_reasoning_only_truncations_stop_without_an_unbounded_retry(
         ),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     run_turn(&app, "start").await.unwrap();
@@ -415,6 +485,7 @@ async fn reasoning_only_stops_end_without_an_output_limit_checkpoint() {
         streams: Mutex::new((0..2).map(|_| reasoning_stop()).collect()),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let driver = Arc::new(CheckpointDriver {
         // Any checkpoint is a failure, even if it would have been declined.
@@ -455,6 +526,7 @@ async fn a_suppressed_reasoning_reply_to_an_internal_note_keeps_its_usage() {
         ]])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     let agent = atomcode_harness::create_agent(&app).await.unwrap();
@@ -508,6 +580,7 @@ async fn a_reasoning_only_stop_is_nudged_to_act_instead_of_replayed() {
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     let outcome = run_turn(&app, "start").await.unwrap();
@@ -534,6 +607,7 @@ async fn repeated_reasoning_only_stops_end_the_turn_without_a_provider_error() {
         streams: Mutex::new((0..2).map(|_| reasoning_stop()).collect()),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     let outcome = run_turn(&app, "start").await.unwrap();
@@ -590,6 +664,7 @@ async fn repeated_text_is_only_a_redump_within_a_consecutive_truncation_streak()
             streams: Mutex::new(streams),
             requests: Mutex::new(Vec::new()),
             options: Mutex::new(Vec::new()),
+            refuse_output_above: None,
         });
         let mut app = app(&root, provider.clone(), false).await;
         let outcome = run_turn(&app, "start").await.unwrap();
@@ -640,6 +715,7 @@ async fn lowering_effort_is_explicit_and_applies_to_only_one_recovery_request() 
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let driver = Arc::new(CheckpointDriver {
         answers: Mutex::new(VecDeque::from([
@@ -684,6 +760,7 @@ async fn continuing_at_the_reasoning_checkpoint_grants_one_request_without_reset
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let driver = Arc::new(CheckpointDriver {
         answers: Mutex::new(VecDeque::from([
@@ -717,6 +794,7 @@ async fn a_forged_lower_effort_choice_cannot_continue_when_no_lower_level_is_ava
         streams: Mutex::new(VecDeque::from([reasoning_cut(), reasoning_cut()])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let driver = Arc::new(CheckpointDriver {
         answers: Mutex::new(VecDeque::from([
@@ -747,6 +825,7 @@ async fn a_malformed_lower_effort_choice_cannot_silently_retry_at_the_original_e
         streams: Mutex::new(VecDeque::from([reasoning_cut(), reasoning_cut()])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let driver = Arc::new(CheckpointDriver {
         answers: Mutex::new(VecDeque::from([
@@ -820,6 +899,7 @@ async fn incomplete_tool_calls_cannot_bypass_the_no_progress_recovery_limit() {
         streams: Mutex::new(VecDeque::from([partial.clone(), partial])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider.clone(), false).await;
     let outcome = run_turn(&app, "start").await.unwrap();
@@ -847,6 +927,7 @@ async fn remounting_jsonl_keeps_persisting_the_live_session() {
         ])),
         requests: Mutex::new(Vec::new()),
         options: Mutex::new(Vec::new()),
+        refuse_output_above: None,
     });
     let mut app = app(&root, provider, false).await;
     run_turn(&app, "open the session").await.unwrap();
