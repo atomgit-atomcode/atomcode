@@ -14,6 +14,7 @@
 //! (`Subscribe { from: 0 }`)。唯一记着的是「挂着没答的那个 `Request`」——它不是
 //! 日志里的事实,重订阅不会再发一次。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -169,7 +170,10 @@ struct Live {
     review_assignment: Option<String>,
     control: Arc<RuntimeControl>,
     commands: mpsc::UnboundedSender<AgentCommand>,
-    track: Arc<Mutex<Track>>,
+    /// 这个会话的日志投影:面板的聚合、回合状态与缓存游标都在这里。泵每收到一个
+    /// 事件就喂它(事实只从日志折入,见 [`LogProjection::absorb`]),`describe` 只读
+    /// 字段。`Arc` 是因为泵与 [`Live`] 都要用。
+    projection: Arc<Mutex<LogProjection>>,
     /// 放到后台的时刻,unix 毫秒。
     since: u64,
     /// 是替哪个会话干活的(会话 id)。等于它自己 = 不是替谁干活,没有第二个读者 ——
@@ -183,7 +187,19 @@ struct Live {
     /// 交给它的那件事的第一行。日志里还没有它说的第一句话时(刚起、还没落盘),
     /// 面板那一列靠它认,而不是一串 id。
     task: Option<String>,
-    projection: Mutex<LogProjection>,
+    /// 是谁发起的:人(`/bg`、`/review`),还是这场对话里的一个工具(模型的
+    /// `code_review`)。隐藏只认这面旗,不再认 `name` 里的字符串哨兵 -- 一个概念,
+    /// 一处编码(issue #1821 #3)。
+    initiated_by: InitiatedBy,
+}
+
+/// 谁起了一个后台会话。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InitiatedBy {
+    #[default]
+    Person,
+    /// 这场对话里的一个工具:它的结果回投给这场对话,未打开时不出现在 `/resume`。
+    Tool,
 }
 
 /// The last fact read from one live log. A replacement App can rebuild the same
@@ -222,14 +238,36 @@ impl LogCursor {
 struct LogProjection {
     cursor: LogCursor,
     summary: LogSummary,
+    /// 正在整份重建(`seed`)。只有这时日志侧 `TurnEnd` 的 `error` 才写成面板的错。
+    rebuilding: bool,
 }
 
+/// 一次要喂给投影的事实:日志里的一条,或运行时说出的一条。
+///
+/// 两条来源汇进同一个 [`LogProjection::absorb`],面板聚合与回合状态就不会有两套
+/// 推导 -- 这也让 `attach` 的全量 seed 与之后的增量无论先后都得出同一份结果
+/// (issue #1821 #12)。事实只认 `Logged` 这一种形状:运行时事件里也有 `Fact`,说的
+/// 是同一件事,它不参与计数(理由见 [`LogProjection::absorb`])。
+enum Observed<'a> {
+    Logged(&'a LoggedEvent),
+    Live(&'a AgentEvent),
+}
+
+/// 面板要说的一切,全部由 [`LogProjection::absorb`] 增量维护。
+///
+/// 一半来自日志(标题、第一句、花费、`TurnEnd` 的结局),一半来自运行时事件
+/// (挂着的请求、错误);两边都只写这里,描述只读这里。
 #[derive(Default)]
 struct LogSummary {
+    /// 折进来的日志事实条数。只有日志那一路(seed 与 `update`)推进它 —— 通道上
+    /// 的 `Fact` 不算(见 [`LogProjection::absorb`])。它等于日志长度,就是「同一条
+    /// 事实只折一次」的判据(`a_fact_on_the_channel_is_folded_once_with_its_log_record`)。
+    len: u64,
     title: Option<String>,
-    first_words: Option<String>,
+    first_user: Option<String>,
     asked: Option<String>,
-    said: Option<String>,
+    last_said: Option<String>,
+    has_user_message: bool,
     first_at: Option<u64>,
     last_at: u64,
     steps: u32,
@@ -238,6 +276,15 @@ struct LogSummary {
     sent: u64,
     sent_cached: u64,
     usage: Option<atomcode_kernel::stream::TokenUsage>,
+    /// 在等人回答的那个请求。不是日志里的事实:重订阅不会再发一次,所以由运行时
+    /// 事件记在这里,回到前台时再投一次。
+    pending: Option<AgentEvent>,
+    /// 上一个回合怎么结束的。日志的 `TurnEnd` 与运行时的 `TurnComplete` 说的是
+    /// 同一件事,两边都写同一个字段。
+    ended: Option<BackgroundState>,
+    /// 最近一次出的错,给面板那一行。运行时的新回合(`TurnStarted`)清掉 ——
+    /// 日志里的 `TurnStart` 说的是过去,不清现在这一行。
+    error: Option<String>,
 }
 
 /// 一个替别的对话干活的后台会话,在盘上怎么记。
@@ -256,17 +303,6 @@ enum Mark {
     Home(PathBuf),
     /// 人接手了(叫到前台、对它说话):它是人的对话了,不再标。
     TakenUp,
-}
-
-/// 从一个 runtime 的事件里记下的、面板要说的那几件事。
-#[derive(Default)]
-struct Track {
-    /// 在等人回答的那个请求。回到前台、屏幕重订阅之后再发一次。
-    pending: Option<AgentEvent>,
-    /// 上一个回合怎么结束的。新回合开始(由这里提交的,或放到后台时正在跑的)时清掉。
-    ended: Option<BackgroundState>,
-    /// 最近一次出的错,给面板那一行。
-    error: Option<String>,
 }
 
 /// 这个范围里有多少个文件在变。
@@ -309,7 +345,7 @@ async fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
 
 /// 一个回合结束后,这个会话该被算成什么状态。
 ///
-/// 一处判断两处用:面板那一行(`Track::saw`)与"要不要把结果投回去"看的是同一件事
+/// 一处判断两处用:面板那一行(`LogSummary` 的 `ended`)与"要不要把结果投回去"看的是同一件事
 /// —— 被中断和出错都不是一次结果,投回去只会让人读一段没有结论的话。
 ///
 /// 只有模型自己说完(`Stopped`)才算干完。被熔断(`RepeatLoop` / `ToolLoopDetected` /
@@ -372,36 +408,9 @@ fn completion_report(log: &[LoggedEvent], reason: &StopReason) -> String {
     .into_owned()
 }
 
-impl Track {
-    /// 记下一件事。返回面板要不要重画。
-    fn saw(&mut self, event: &AgentEvent) -> bool {
-        match event {
-            AgentEvent::TurnStarted { .. } => {
-                self.error = None;
-                self.ended = None;
-                true
-            }
-            AgentEvent::Request { .. } => {
-                self.pending = Some(event.clone());
-                true
-            }
-            AgentEvent::TurnComplete { reason, .. } => {
-                self.pending = None;
-                self.ended = Some(ended_state(reason));
-                true
-            }
-            AgentEvent::Error { message, .. } => {
-                self.error = Some(message.clone());
-                false
-            }
-            _ => false,
-        }
-    }
-}
-
 struct State {
-    front: Live,
-    slots: Vec<Live>,
+    front: Arc<Live>,
+    slots: Vec<Arc<Live>>,
     /// 屏幕订阅了前台那个会话没有。换前台之后、屏幕重订阅之前,前台的事件不转:
     /// 那些是上一个视图不认识的东西,而它们都在日志里,订阅时会重放。
     gate: bool,
@@ -419,6 +428,12 @@ pub struct Background {
     /// 换前台、放后台、丢弃一次只做一件:两件交错,槽位表会被写成两者都没想要的样子。
     op: tokio::sync::Mutex<()>,
     me: Weak<Background>,
+    /// 已经排上队、等发起它的那段对话收下的结果,键是 sender 的会话 id。
+    ///
+    /// 事件到达时与 10 秒一次的兜底扫描([`Self::settle_waiting`])都只看它:命中
+    /// 一条就标 [`Mark::Home`] 并摘除,
+    /// 不再有每条投递一个 10 分钟的全量轮询(issue #1821 #14 / #9)。
+    settling: Mutex<HashMap<String, SettleEntry>>,
     /// The sessions stopped because the screen went away, in slot order — what
     /// the launcher prints a `resume` line for after the terminal is back.
     left: Mutex<Vec<String>>,
@@ -427,6 +442,28 @@ pub struct Background {
     /// empty one, which gets no `resume` line.
     exit_front: Mutex<Option<Option<String>>>,
 }
+
+/// 一次「结果已排队、等 home 收下」的投递。
+struct SettleEntry {
+    mark: Arc<Mutex<Mark>>,
+    /// 发起它的那段对话的 runtime,用来读它的日志。
+    home: Arc<RuntimeControl>,
+    /// 投递前 home 日志的末 seq。只有**之后**的 `Injected{Peer{from}}` 才算这次
+    /// 收下了 —— 同一段对话第二次委派时,第一次的旧注入事实不能把它提前标成
+    /// [`Mark::Home`](issue #1821 #1)。
+    baseline_seq: u64,
+    /// 上一次检查时 home 日志的末 seq。事件到达时先比这一条:日志没有新事实,就
+    /// 不必从 `baseline_seq` 反向扫一遍(issue #1821 #13)。
+    seen_seq: u64,
+    /// 到这个时刻(unix 毫秒)还没收下就放弃:结果没投进,会话仍该可恢复。
+    deadline: u64,
+}
+
+/// 被丢进 home 的注可能只落日志、不产生事件,所以除了事件到达时的检查,还有一条
+/// 低频兜底:每 10 秒借日志的 `seq` 看一次,不做全量克隆。
+const SETTLE_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
+/// 一次投递最多等这么久。过了就不再等 —— 没投进去的结果仍在 `/bg` 里。
+const SETTLE_BUDGET_MS: u64 = 10 * 60 * 1000;
 
 /// [`crate::host::connect`],外加后台会话。
 pub fn connect(
@@ -449,7 +486,7 @@ pub fn connect(
     )?;
     let background = Arc::new_cyclic(|me: &Weak<Background>| Background {
         state: Mutex::new(State {
-            front,
+            front: Arc::new(front),
             slots: Vec::new(),
             gate: true,
         }),
@@ -460,6 +497,7 @@ pub fn connect(
         next: AtomicU64::new(1),
         op: tokio::sync::Mutex::new(()),
         me: me.clone(),
+        settling: Mutex::new(HashMap::new()),
         left: Mutex::new(Vec::new()),
         exit_front: Mutex::new(None),
     });
@@ -482,6 +520,22 @@ pub fn connect(
                 if background.someone_running() {
                     background.announce_list();
                 }
+            }
+        });
+    }
+    // 注可能只落 home 的日志、不产生事件。低频借一次 seq 兜底;平时
+    // `settle_waiting` 在事件到达时就关掉了。
+    {
+        let weak = Arc::downgrade(&background);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SETTLE_SWEEP);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(background) = weak.upgrade() else {
+                    break;
+                };
+                background.settle_waiting();
             }
         });
     }
@@ -512,7 +566,7 @@ struct Pumps {
     id: u64,
     events: mpsc::UnboundedReceiver<AgentEvent>,
     said: mpsc::UnboundedReceiver<HostEvent>,
-    track: Arc<Mutex<Track>>,
+    projection: Arc<Mutex<LogProjection>>,
 }
 
 impl Pumps {
@@ -522,13 +576,16 @@ impl Pumps {
             id,
             mut events,
             mut said,
-            track,
+            projection,
         } = self;
         {
             let background = background.clone();
             tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
-                    let changed = track.lock().expect("track poisoned").saw(&event);
+                    let changed = projection
+                        .lock()
+                        .expect("background projection poisoned")
+                        .absorb(Observed::Live(&event));
                     let Some(background) = background.upgrade() else {
                         break;
                     };
@@ -564,28 +621,37 @@ fn attach(
     let HostConnection {
         commands, events, ..
     } = connection;
-    let track = Arc::new(Mutex::new(Track::default()));
+    let projection = Arc::new(Mutex::new(LogProjection::default()));
     let said = control.subscribe();
     let own = control.session_id();
+    let live = Live {
+        id,
+        review_assignment: None,
+        control,
+        commands,
+        projection: projection.clone(),
+        since: now_ms(),
+        origin: own,
+        mark: Arc::new(Mutex::new(Mark::Own)),
+        name: None,
+        task: None,
+        initiated_by: InitiatedBy::Person,
+    };
+    // seed 与增量走同一个 `absorb`:这里把已有的日志折一遍,之后 `describe` /
+    // `list` 只补差异。新起的会话这里是空的,恢复的会话在这里或第一次更新时补上。
+    if let Some(log) = session_log(&live.control) {
+        live.projection
+            .lock()
+            .expect("background projection poisoned")
+            .seed(&log);
+    }
     Ok((
-        Live {
-            id,
-            review_assignment: None,
-            control,
-            commands,
-            track: track.clone(),
-            since: now_ms(),
-            origin: own,
-            mark: Arc::new(Mutex::new(Mark::Own)),
-            name: None,
-            task: None,
-            projection: Mutex::new(LogProjection::default()),
-        },
+        live,
         Pumps {
             id,
             events,
             said,
-            track,
+            projection,
         },
     ))
 }
@@ -598,21 +664,31 @@ fn now_ms() -> u64 {
 }
 
 /// 一个 runtime 现在在干什么,照面板要的样子。
-fn state_of(live: &Live) -> BackgroundState {
-    let handle = live.control.runtime();
-    if handle.is_stopped() {
+fn state_of(live: &Live, summary: &LogSummary) -> BackgroundState {
+    state_for(
+        live.control.runtime().is_stopped(),
+        live.control.runtime().status().phase,
+        summary.ended,
+        summary.pending.is_some(),
+    )
+}
+
+/// 阶段与回合结局怎么合成面板状态。拆出来是为了能按矩阵把每一条都钉住
+/// (issue #1821 #23),而不是只靠相邻的注释。
+fn state_for(
+    stopped: bool,
+    phase: RuntimePhase,
+    ended: Option<BackgroundState>,
+    pending: bool,
+) -> BackgroundState {
+    if stopped {
         return BackgroundState::Failed;
     }
-    let (ended, pending) = {
-        let track = live.track.lock().expect("track poisoned");
-        (track.ended, track.pending.is_some())
-    };
-    match handle.status().phase {
-        // 阶段先翻、pump 记下 `pending` 后到(`Track::saw` 在 `Request` 事件送到时
-        // 才写):这一小段里还不能说「在等」——不然报出去的 `Waiting` 没有请求可答,
-        // `BackgroundQuestion` 只会落回 `NotFound`。等 `pending` 落地那一刻,
-        // `Track::saw` 自己会返回 changed=true 让 `announce_list` 立刻把它翻过来,
-        // 不会漏报,只是晚一拍。
+    match phase {
+        // 阶段先翻、pump 记下 `pending` 后到:这一小段里还不能说「在等」——不然报出去
+        // 的 `Waiting` 没有请求可答,`BackgroundQuestion` 只会落回 `NotFound`。等
+        // `pending` 落地那一刻,泵自己会报 changed=true 让 `announce_list` 立刻把它
+        // 翻过来,不会漏报,只是晚一拍。
         RuntimePhase::WaitingApproval if pending => BackgroundState::Waiting,
         RuntimePhase::Failed | RuntimePhase::Stopped | RuntimePhase::ShuttingDown => {
             BackgroundState::Failed
@@ -740,40 +816,135 @@ fn one_line(text: &str) -> Option<String> {
 /// `running_at`:还在跑时的此刻(unix 毫秒)。那时用时量到此刻,而不是最后一条事实 ——
 /// 模型安静地想一分钟,面板上的用时不该停在一分钟前。
 impl LogSummary {
-    fn absorb(&mut self, events: &[LoggedEvent]) {
-        for logged in events {
-            self.first_at.get_or_insert(logged.at);
-            self.last_at = logged.at;
-            match &logged.event {
-                SessionEvent::StepEnd { tool_calls, .. } => {
-                    self.steps += 1;
-                    self.tools = self.tools.saturating_add(*tool_calls);
-                }
-                SessionEvent::Usage { usage, .. } => {
-                    self.completion = self.completion.saturating_add(usage.completion);
-                    self.sent += u64::from(usage.prompt);
-                    self.sent_cached += u64::from(usage.cached);
-                    self.usage = Some(*usage);
-                }
-                SessionEvent::Titled { title, .. } if !title.trim().is_empty() => {
-                    self.title = Some(title.clone());
-                }
-                SessionEvent::UserMessage { text, .. } if self.first_words.is_none() => {
-                    self.first_words = one_line(text);
-                }
-                SessionEvent::Asked { question, .. } => {
-                    if let Some(words) = one_line(&question.prompt) {
-                        self.asked = Some(words);
-                    }
-                }
-                SessionEvent::AssistantMessage { text, .. }
-                | SessionEvent::PartialReply { text, .. } => {
-                    if let Some(words) = one_line(text) {
-                        self.said = Some(words);
-                    }
-                }
-                _ => {}
+    /// 复位日志派生的一半,只把只来自运行时事件的字段搬回来。
+    ///
+    /// `pending`/`error` 不是日志里的事实:提问(与它的回答)只在提问那一刻发一次,
+    /// 重订阅不会再补发,日志里也没有对应记录。清掉就再也补不回来 —— 提问侧还挂在
+    /// `rx` 上,面板却从 `Waiting` 掉回 `Running`,`question()`/`answer()` 再也取不回
+    /// 那个请求。日志那一半由随后的 seed/增量重建(issue #1821 #12)。
+    fn reset_log_derived(&mut self) {
+        let pending = self.pending.take();
+        let error = self.error.take();
+        *self = Self::default();
+        self.pending = pending;
+        self.error = error;
+    }
+
+    /// 折进日志里的一条事实:计一条,再按它改字段。seed 与增量都走这里,所以两条
+    /// 路径不可能各说一套(issue #1821 #12)。
+    ///
+    /// `rebuild`:这一批是不是 `seed` 的整份重建。日志侧的 `error` 只在这时写 ——
+    /// 增量折进来的一条 `TurnEnd` 可能早于运行时刚报的 `Error`(面板没开时日志只积
+    /// 不折),它说的不是「现在」。
+    fn absorb_logged(&mut self, logged: &LoggedEvent, rebuild: bool) -> bool {
+        self.len += 1;
+        self.absorb_event(logged.at, &logged.event, rebuild)
+    }
+
+    /// 一条已提交的事实对面板那一行的影响,返回它会不会因此变。
+    ///
+    /// 事实的计数在 [`Self::absorb_logged`]:这里只管它改哪个字段。
+    fn absorb_event(&mut self, at: u64, event: &SessionEvent, rebuild: bool) -> bool {
+        self.first_at.get_or_insert(at);
+        self.last_at = at;
+        match event {
+            SessionEvent::TurnStart { .. } => {
+                // 新回合开始:上一个回合的结局不再代表现在。`error` 不在这里清:
+                // 这条事实可能早于它被折进来的那一秒 —— 面板关着时日志只积不折,
+                // 一条还没折的旧 `TurnStart` 会清掉运行时刚刚报上来的 `Error`,而
+                // 那条 `Error` 恰恰是「现在这一回合失败了」。清 `error` 只在运行
+                // 时那一侧(`saw(TurnStarted)`)做,那里说的才是现在。
+                self.ended = None;
+                true
             }
+            SessionEvent::TurnEnd { stop, error, .. } => {
+                // `pending` 不在这里清:它不是日志里的事实,日志这一侧从不产生它。
+                // 而这条 `TurnEnd` 可能已经旧了 —— 面板没开时日志只积不折,新的
+                // `AgentEvent::Request` 先到(`pending` 已置位),第一次 `describe`
+                // 折上一回合的 `TurnEnd` 就会把刚到的请求清掉:面板从 `Waiting`
+                // 掉回 `Running`,`question()` 永久 `NotFound`,`answer()` 回
+                // `Stale`。回合结束该由运行时的 `saw(TurnComplete)` 说 —— 与
+                // `ended` 同一条路径(issue #1821 #24)。
+                self.ended = Some(ended_state(stop));
+                if error.is_some() && rebuild {
+                    // 日志侧的 `error` 只在整份重建时写。增量折进来的这条 `TurnEnd`
+                    // 可能已经旧了 —— 面板关着时日志只积不折,运行时刚报的 `Error`
+                    // 先到,一次增量读上一回合的 `TurnEnd` 就把新错盖掉,那一行要等
+                    // 下一条无关 announce 才播,而新 `Error` 才是「现在这一回合失败了」。
+                    self.error = error.clone();
+                }
+                true
+            }
+            SessionEvent::StepEnd { tool_calls, .. } => {
+                self.steps += 1;
+                self.tools = self.tools.saturating_add(*tool_calls);
+                true
+            }
+            SessionEvent::Usage { usage, .. } => {
+                self.completion = self.completion.saturating_add(usage.completion);
+                self.sent += u64::from(usage.prompt);
+                self.sent_cached += u64::from(usage.cached);
+                self.usage = Some(*usage);
+                true
+            }
+            SessionEvent::Titled { title, .. } if !title.trim().is_empty() => {
+                self.title = Some(title.clone());
+                true
+            }
+            SessionEvent::UserMessage { text, .. } => {
+                let first = !self.has_user_message;
+                self.has_user_message = true;
+                if first {
+                    self.first_user = one_line(text);
+                }
+                first
+            }
+            SessionEvent::Asked { question, .. } => {
+                if let Some(words) = one_line(&question.prompt) {
+                    self.asked = Some(words);
+                    return true;
+                }
+                false
+            }
+            SessionEvent::AssistantMessage { text, .. }
+            | SessionEvent::PartialReply { text, .. } => {
+                if let Some(words) = one_line(text) {
+                    self.last_said = Some(words);
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// 折进一条运行时事件。`pending` 只在这里记(它不是日志里的事实);
+    /// `ended` / `error` 与日志的 `TurnEnd` 写同一个字段 —— 但**清** error 只在这里
+    /// 的 `TurnStarted`,日志那条路说的是过去。
+    fn saw(&mut self, event: &AgentEvent) -> bool {
+        match event {
+            AgentEvent::TurnStarted { .. } => {
+                self.error = None;
+                self.ended = None;
+                true
+            }
+            AgentEvent::Request { .. } => {
+                self.pending = Some(event.clone());
+                true
+            }
+            AgentEvent::TurnComplete { reason, .. } => {
+                self.pending = None;
+                self.ended = Some(ended_state(reason));
+                true
+            }
+            AgentEvent::Error { message, .. } => {
+                // 这一行确实会变:phase 已经落 `Failed`,没有 `TurnComplete` 的收尾
+                // 路径(重配回滚失败、恢复持久化失败、fail-close)不会再有第二条事件
+                // 来说它 —— 所以这里要一次重画,否则面板要等下一条无关 announce 才播。
+                self.error = Some(message.clone());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -800,32 +971,85 @@ impl LogSummary {
 }
 
 impl LogProjection {
+    /// 折进一条观察。返回面板要不要重画。
+    ///
+    /// `Logged` 是日志事实的唯一来源(seed、增量都算 `len`);其余运行时事件只更新
+    /// 回合状态。两条来源共用 [`LogSummary`],没有第二套推导。
+    ///
+    /// 通道上的 `AgentEvent::Fact` **不**在这里折:它说的是日志刚多了哪一条,而
+    /// pump 与 `describe` 面对的是同一个前端、同一份日志。屏幕一订阅
+    /// (`Subscribe { from: 0 }`),feed 就把整段历史与新提交的事实逐条推过来,
+    /// `update` 又按 cursor 从日志折同一批 —— 两边都折,首屏重放与回到后台之后
+    /// 面板的步数/工具/token 就会翻倍。事实引起的面板变化由下一次 `update` 带出来
+    /// (面板每秒都在读),所以这里也不必替它要一次重画。
+    fn absorb(&mut self, observed: Observed<'_>) -> bool {
+        match observed {
+            Observed::Logged(logged) => self.summary.absorb_logged(logged, self.rebuilding),
+            Observed::Live(AgentEvent::Fact(_)) => false,
+            Observed::Live(event) => self.summary.saw(event),
+        }
+    }
+
+    /// 从一份已有的日志建投影:与之后的增量走同一个 [`Self::absorb`]。
+    fn seed(&mut self, log: &Arc<SessionLog>) {
+        // 日志这一半整份重建,只在运行时事件里的字段不跟着走。
+        self.summary.reset_log_derived();
+        // 整份重建:日志侧 `error` 在这里说这份日志最后的失败。
+        self.rebuilding = true;
+        let last = log.read_events(|events| {
+            for logged in events {
+                self.absorb(Observed::Logged(logged));
+            }
+            events.last().map_or(0, |logged| logged.seq)
+        });
+        self.rebuilding = false;
+        self.cursor = LogCursor {
+            log: Arc::downgrade(log),
+            seen: last,
+        };
+    }
+
+    /// 只折日志里新增的事实。`reset`(换了日志、或 seq 倒退)时从零重建 —— 同样是
+    /// 一个 `absorb`,所以 seed 与增量等值。
     fn update(&mut self, log: Option<Arc<SessionLog>>) {
         let Some(log) = log else {
-            *self = Self::default();
+            // 日志暂时读不到(App 正在重建、`Feed` 还没找到这个会话):不复位,也不折
+            // 事实。`pending`/`error` 不在日志里,清掉就再也补不回来(提问侧还挂在
+            // `rx` 上,面板却从 `Waiting` 掉回 `Running`);`cursor` 留着,日志回到同一份
+            // `Arc` 时按 `seen` 续读,重建期间新增的事实一条不落,已折过的字段也不会
+            // 因为「只折新增」而永久空着(issue #1821 #12)。
             return;
         };
-        self.cursor.read_new(&log, |reset, events| {
+        // 借出两个字段:`read_new` 握着 `cursor`,折事实的那半边只能碰 `summary`。
+        let Self {
+            cursor, summary, ..
+        } = self;
+        cursor.read_new(&log, |reset, events| {
             if reset {
-                self.summary = LogSummary::default();
+                // 换了日志(或 seq 倒退):日志那一半从头重建,只把不在日志里的字段搬回来。
+                summary.reset_log_derived();
             }
-            self.summary.absorb(events);
+            for logged in events {
+                // `update` 折的是「日志里已有/新增的事实」,即便 `reset` 是整份重建,
+                // 这批事实也可能早于运行时刚报的 `Error`。日志侧的 `error` 只在
+                // `seed`(attach 时)写,这里一律不写。
+                summary.absorb_logged(logged, false);
+            }
         });
     }
 }
 
 fn describe(live: &Live) -> BackgroundSession {
-    let state = state_of(live);
     let mut projection = live
         .projection
         .lock()
         .expect("background projection poisoned");
     projection.update(session_log(&live.control));
     let summary = &projection.summary;
+    let state = state_of(live, summary);
     // 在等的那个请求本身说了什么:不是每种问法都先在日志里记一条 `Asked`。
     let waiting_on = || {
-        let track = live.track.lock().expect("track poisoned");
-        let Some(AgentEvent::Request { payload, .. }) = track.pending.as_ref() else {
+        let Some(AgentEvent::Request { payload, .. }) = summary.pending.as_ref() else {
             return None;
         };
         let words = |key: &str| payload.get(key).and_then(|v| v.as_str()).and_then(one_line);
@@ -841,16 +1065,13 @@ fn describe(live: &Live) -> BackgroundSession {
             .asked
             .clone()
             .or_else(waiting_on)
-            .or_else(|| summary.said.clone()),
-        BackgroundState::Failed => live
-            .track
-            .lock()
-            .expect("track poisoned")
+            .or_else(|| summary.last_said.clone()),
+        BackgroundState::Failed => summary
             .error
             .clone()
             .and_then(|error| one_line(&error))
-            .or_else(|| summary.said.clone()),
-        _ => summary.said.clone(),
+            .or_else(|| summary.last_said.clone()),
+        _ => summary.last_said.clone(),
     };
     BackgroundSession {
         session: live.control.session_id(),
@@ -861,7 +1082,7 @@ fn describe(live: &Live) -> BackgroundSession {
             .name
             .clone()
             .or_else(|| summary.title.clone())
-            .or_else(|| summary.first_words.clone())
+            .or_else(|| summary.first_user.clone())
             .or_else(|| live.task.clone()),
         state,
         created_at: live.since,
@@ -901,18 +1122,24 @@ fn take_up(mark: &Mutex<Mark>, session: &str) {
     }
 }
 
-/// The result of `session` is in `home`'s log: `home` took the note in.
-fn holds_note_from(events: &[LoggedEvent], session: &str) -> bool {
+/// The result of `session` is in `home`'s log: `home` took the note in, *after*
+/// this delivery began. Facts at or before `baseline_seq` belong to an earlier
+/// delegation of the same session and must not count (issue #1821 #1).
+fn holds_note_from(events: &[LoggedEvent], session: &str, baseline_seq: u64) -> bool {
     use atomcode_kernel::session::InjectionOrigin;
-    events.iter().rev().any(|logged| {
-        matches!(
-            &logged.event,
-            SessionEvent::Injected {
-                origin: InjectionOrigin::Peer { from, .. },
-                ..
-            } if from == session
-        )
-    })
+    events
+        .iter()
+        .rev()
+        .take_while(|logged| logged.seq > baseline_seq)
+        .any(|logged| {
+            matches!(
+                &logged.event,
+                SessionEvent::Injected {
+                    origin: InjectionOrigin::Peer { from, .. },
+                    ..
+                } if from == session
+            )
+        })
 }
 
 /// The result of `session` reached the conversation it worked for: mark it on
@@ -939,23 +1166,34 @@ fn came_home(live: &Live) -> bool {
     matches!(*live.mark.lock().expect("mark poisoned"), Mark::Home(_)) && !in_turn(live)
 }
 
-/// How long a background session's result is watched for, once handed over,
-/// to see it taken in: half-second looks, ten minutes in all — a conversation
-/// in a long tool call takes the note in when that call returns.
-const SETTLE_TRIES: u32 = 1_200;
-
-/// 一个会话里有没有人说过话。没有的话它不值得占一个槽位。
-fn has_conversation(live: &Live) -> bool {
-    read_log(&live.control, |events| {
-        events
-            .iter()
-            .any(|logged| matches!(logged.event, SessionEvent::UserMessage { .. }))
-    })
+/// Whether a parent session is hidden from `/resume`/`--continue` right now.
+///
+/// Done with a tool's review stays out; one the person scoped with `/review`
+/// stays visible until its result lands. A settled delivery is out either way.
+fn hides(mark: &Mark, initiated_by: InitiatedBy) -> bool {
+    match mark {
+        Mark::Home(_) => true,
+        Mark::Pending(_) => initiated_by == InitiatedBy::Tool,
+        Mark::Own | Mark::TakenUp => false,
+    }
 }
 
-async fn stop(live: Live) {
+/// 一个会话里有没有人说过话。没有的话它不值得占一个槽位。
+///
+/// 读的是已经折好的投影:先补上日志里新增的事实,再问一个标志 —— 不再为一个是非题
+/// 扫一遍整份日志(issue #1821 #11)。
+fn has_conversation(live: &Live) -> bool {
+    let mut projection = live
+        .projection
+        .lock()
+        .expect("background projection poisoned");
+    projection.update(session_log(&live.control));
+    projection.summary.has_user_message
+}
+
+async fn stop(live: &Live) {
     let handle = live.control.runtime().clone();
-    if in_turn(&live) {
+    if in_turn(live) {
         // 取消失败不挡停:停本身也会把回合带走,取消只是让它以「被打断」落盘。
         match tokio::time::timeout(std::time::Duration::from_secs(5), handle.cancel()).await {
             Ok(Ok(())) => {}
@@ -987,6 +1225,19 @@ impl Background {
 
     /// 一个 runtime 的事件到了。
     fn arrived(&self, id: u64, event: AgentEvent, changed: bool) {
+        // 结果被 home 收下这件事,通常伴随 home 的一条事件(回合开始、被接受、
+        // 上下文加入、回合结束)。借这一刻把注册表里等待的那几条关掉;真正只落日志
+        // 的那种由 10 秒兜底扫描接住。
+        if matches!(
+            &event,
+            AgentEvent::TurnStarted { .. }
+                | AgentEvent::TurnComplete { .. }
+                | AgentEvent::Accepted { .. }
+                | AgentEvent::ContextAdded { .. }
+                | AgentEvent::Fact(_)
+        ) {
+            self.settle_waiting();
+        }
         // 替别的会话干活的那个,干完了把结果投回去 —— 内容落在发起它的那段对话里。
         // 这是"结果回来了"在那段对话里的形状。**只投内容**:要不要接着逐条核实,是那段
         // 对话看了上下文自己决定的事,不由这里替它下令。
@@ -1059,7 +1310,37 @@ impl Background {
             live.map(|live| live.control.clone())
         };
         let Some(home) = handle else { return };
+        // 投递前 home 日志的末 seq:只有它之后的事实才算这一次收下了。同一段对话
+        // 第二次委派时,第一次的旧注入事实不能把它提前标成 `Mark::Home`(#1)。
+        //
+        // 日志此刻读不到(App 正在重建、`Feed` 还没找到这个会话)就**不登记**:下界
+        // 退化成 0 会把整份 home 日志放进匹配范围,上一次委派留下的旧注入事实会被
+        // 算作这次「收下了」,会话随即被隐藏。宁可在退出/恢复里多留一条,也不把没
+        // 确认收下的结果标成 `Mark::Home`。
+        match session_log(&home).map(|log| log.last_seq()) {
+            Some(baseline_seq) => {
+                if matches!(*mark.lock().expect("mark poisoned"), Mark::Pending(_)) {
+                    let mut settling = self.settling.lock().expect("settling poisoned");
+                    settling.insert(
+                        sender.clone(),
+                        SettleEntry {
+                            mark: mark.clone(),
+                            home: home.clone(),
+                            baseline_seq,
+                            seen_seq: baseline_seq,
+                            deadline: now_ms().saturating_add(SETTLE_BUDGET_MS),
+                        },
+                    );
+                }
+            }
+            None => tracing::debug!(
+                origin = %origin,
+                from = %sender,
+                "home log unreadable at delivery: not watching for a settle"
+            ),
+        }
         let handle = home.runtime().clone();
+        let me = self.me.clone();
         tokio::spawn(async move {
             // 一条注,不是一次用户提交:日志里说话的是那个后台会话,不是人。屏上的内容
             // 一字不少 —— 变的只是**谁说的**。
@@ -1069,32 +1350,15 @@ impl Background {
             // 这个 handle 背后未必还是发起它的那段对话;结果仍在 /bg 面板里。
             // 选中接收方以后仍可能切会话;由 runtime owner 在投递时再核对原会话。
             const TRIES: u32 = 10;
+            let mut delivered = false;
             for attempt in 1..=TRIES {
                 match handle
                     .note_to_session(origin.clone(), sender.clone(), frame.clone())
                     .await
                 {
                     Ok(_) => {
-                        // 排上队不等于收下了:那段对话正忙时这是一次 steer。等它真进了
-                        // 那段对话的日志再标。等不到(退出了、那段对话没了)就不标 ——
-                        // 退出前 `shutdown_all` 还会再看一眼。
-                        let mut cursor = LogCursor::default();
-                        for _ in 0..SETTLE_TRIES {
-                            let received = session_log(&home).is_some_and(|log| {
-                                cursor.read_new(&log, |_, events| holds_note_from(events, &sender))
-                            });
-                            if received {
-                                came_home_now(&mark, &sender);
-                                return;
-                            }
-                            // Never mark an unconfirmed delivery as received. A retired
-                            // home cannot add another fact; leave the result recoverable.
-                            if home.runtime().is_stopped() || home.front_end().app().is_none() {
-                                return;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                        return;
+                        delivered = true;
+                        break;
                     }
                     Err(atomcode_coding::RuntimeError::Busy) if attempt < TRIES => {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1106,41 +1370,114 @@ impl Background {
                             %error,
                             "background result not delivered to the conversation that started it; it is still in /bg"
                         );
-                        return;
+                        break;
                     }
                 }
             }
+            let Some(background) = me.upgrade() else {
+                return;
+            };
+            if !delivered {
+                // 重试耗尽:什么都没进 home,不再等。
+                background.remove_settle(&sender);
+                return;
+            }
+            // 排上队不等于收下了:home 正忙时这是一次 steer。事件到达与兜底扫描会
+            // 在它真进了日志之后再标;这里先看一眼,免得事件在登记前就到了。
+            background.settle_sender(&sender);
         });
     }
 
     /// Settle, before the exit reads them, the background sessions whose result
     /// was taken in by the conversation they worked for but not yet marked.
+    ///
+    /// 用的是每次投递自己的 baseline:没有登记的(结果根本没排上队)不在这里结算。
     fn settle_before_exit(&self) {
-        let pending: Vec<(Arc<Mutex<Mark>>, String, Arc<RuntimeControl>)> = {
-            let state = self.state.lock().expect("background poisoned");
-            state
-                .slots
-                .iter()
-                .filter(|slot| {
-                    matches!(*slot.mark.lock().expect("mark poisoned"), Mark::Pending(_))
-                })
-                .filter_map(|slot| {
-                    let home = std::iter::once(&state.front)
-                        .chain(state.slots.iter())
-                        .find(|live| live.control.session_id() == slot.origin)?;
-                    Some((
-                        slot.mark.clone(),
-                        slot.control.session_id(),
-                        home.control.clone(),
-                    ))
-                })
-                .collect()
+        let senders: Vec<String> = {
+            let settling = self.settling.lock().expect("settling poisoned");
+            settling.keys().cloned().collect()
         };
-        for (mark, session, home) in pending {
-            if read_log(&home, |events| holds_note_from(events, &session)) {
-                came_home_now(&mark, &session);
-            }
+        for sender in senders {
+            self.settle_sender(&sender);
         }
+    }
+
+    /// 把注册表里等待的那几条检查一遍。
+    ///
+    /// 两个触发点共用这一个函数体:home 的一条事件到了([`Self::arrived`]),或 10 秒
+    /// 一次的兜底扫描。检查本身只看 `seen_seq` 之后的新事实,所以多问几次不贵 ——
+    /// 而少问一次就可能漏掉只落日志、不产生事件的注(issue #1821 #14)。
+    fn settle_waiting(&self) {
+        let senders: Vec<String> = {
+            let settling = self.settling.lock().expect("settling poisoned");
+            if settling.is_empty() {
+                return;
+            }
+            settling.keys().cloned().collect()
+        };
+        for sender in senders {
+            self.settle_sender(&sender);
+        }
+    }
+
+    /// 一条投递现在收下了没有。收下 → 标 [`Mark::Home`] 并摘除;home 没了或预算
+    /// 耗尽 → 摘除,结果仍可恢复。
+    fn settle_sender(&self, sender: &str) {
+        let (mark, home, baseline_seq, seen_seq) = {
+            let mut settling = self.settling.lock().expect("settling poisoned");
+            let Some(entry) = settling.get(sender) else {
+                return;
+            };
+            if now_ms() >= entry.deadline {
+                settling.remove(sender);
+                return;
+            }
+            (
+                entry.mark.clone(),
+                entry.home.clone(),
+                entry.baseline_seq,
+                entry.seen_seq,
+            )
+        };
+        let Some(log) = session_log(&home) else {
+            // A retired home cannot add another fact: stop watching, leave the result
+            // recoverable rather than marking an undelivered one as received.
+            if home.runtime().is_stopped() || home.front_end().app().is_none() {
+                self.remove_settle(sender);
+            }
+            return;
+        };
+        let last = log.last_seq();
+        // 日志没有新事实就不必反向扫:事件到达时每条登记项只是比一次 seq,与等待的
+        // 条数和日志长度都无关(issue #1821 #13)。
+        if last > seen_seq
+            && log.read_events(|events| holds_note_from(events, sender, baseline_seq))
+        {
+            came_home_now(&mark, sender);
+            self.remove_settle(sender);
+            return;
+        }
+        if let Some(entry) = self
+            .settling
+            .lock()
+            .expect("settling poisoned")
+            .get_mut(sender)
+        {
+            entry.seen_seq = entry.seen_seq.max(last);
+        }
+        // 退役的 home 不会再添事实:停止观察,结果仍可恢复。
+        if home.runtime().is_stopped() {
+            self.remove_settle(sender);
+        }
+    }
+
+    /// Drop a watch. Every give-up path goes through here: stopped home, exhausted
+    /// budget, exhausted delivery retries, delivery error, take-up, drop.
+    fn remove_settle(&self, sender: &str) {
+        self.settling
+            .lock()
+            .expect("settling poisoned")
+            .remove(sender);
     }
 
     /// 一个 runtime 的宿主事件到了。只有前台那个的才是屏幕上那个会话的事。
@@ -1159,8 +1496,13 @@ impl Background {
     }
 
     fn list(&self) -> Vec<BackgroundSession> {
-        let state = self.state.lock().expect("background poisoned");
-        state.slots.iter().map(describe).collect()
+        // 锁内只取槽位快照;读日志、算聚合与 `describe` 都在锁外,不再让每秒钟的
+        // 面板刷新把 `state` 扣在一份大日志上(issue #1821 #10a)。
+        let slots: Vec<Arc<Live>> = {
+            let state = self.state.lock().expect("background poisoned");
+            state.slots.iter().cloned().collect()
+        };
+        slots.iter().map(|live| describe(live)).collect()
     }
 
     /// 有人在看,而且后台有活在跑(在跑一个回合,或在等人回答)。
@@ -1169,7 +1511,7 @@ impl Background {
             return false;
         }
         let state = self.state.lock().expect("background poisoned");
-        state.slots.iter().any(in_turn)
+        state.slots.iter().any(|slot| in_turn(slot))
     }
 
     fn announce_list(&self) {
@@ -1233,14 +1575,15 @@ impl Background {
                         state.gate = true;
                     }
                     // Request publication can precede the phase watch update.
-                    // Track is the authority for an unanswered live request.
+                    // The projection is the authority for an unanswered live request.
                     let pending = lead
                         .then(|| {
                             state
                                 .front
-                                .track
+                                .projection
                                 .lock()
-                                .expect("track poisoned")
+                                .expect("background projection poisoned")
+                                .summary
                                 .pending
                                 .clone()
                         })
@@ -1279,17 +1622,27 @@ impl Background {
             Kind::Respond { id } => {
                 let state = self.state.lock().expect("background poisoned");
                 {
-                    let mut track = state.front.track.lock().expect("track poisoned");
-                    if matches!(&track.pending, Some(AgentEvent::Request { id: waiting, .. }) if *waiting == id)
+                    let mut projection = state
+                        .front
+                        .projection
+                        .lock()
+                        .expect("background projection poisoned");
+                    if matches!(&projection.summary.pending, Some(AgentEvent::Request { id: waiting, .. }) if *waiting == id)
                     {
-                        track.pending = None;
+                        projection.summary.pending = None;
                     }
                 }
                 let _ = state.front.commands.send(command);
             }
             Kind::Send => {
                 let state = self.state.lock().expect("background poisoned");
-                state.front.track.lock().expect("track poisoned").ended = None;
+                state
+                    .front
+                    .projection
+                    .lock()
+                    .expect("background projection poisoned")
+                    .summary
+                    .ended = None;
                 let _ = state.front.commands.send(command);
             }
             // 退出:前台照旧,后台的一个个停下来(`tui_front::run` 等它们停完)。
@@ -1334,10 +1687,15 @@ impl Background {
         self.left.lock().expect("left poisoned").extend(
             slots
                 .iter()
-                .filter(|slot| has_conversation(slot) && !came_home(slot))
+                .filter(|slot| has_conversation(slot.as_ref()) && !came_home(slot.as_ref()))
                 .map(|slot| slot.control.session_id()),
         );
-        futures::future::join_all(slots.into_iter().map(stop)).await;
+        futures::future::join_all(
+            slots
+                .into_iter()
+                .map(|slot| async move { stop(&slot).await }),
+        )
+        .await;
     }
 
     /// Note which session is in front as the screen goes, once: `/bg`,
@@ -1415,7 +1773,7 @@ impl Background {
         let (live, pumps) = attach(id, spawned, self.host_config.clone())
             .map_err(|message| HostError::Failed { message })?;
         if live.control.session_id().is_empty() {
-            stop(live).await;
+            stop(&live).await;
             return Err(HostError::Failed {
                 message: "the new runtime has no session".into(),
             });
@@ -1441,11 +1799,16 @@ impl Background {
     }
 
     /// 把 `incoming` 放到前台。返回被换下来的那个。调用方持着 `op`。
-    fn put_in_front(&self, state: &mut State, incoming: Live) -> Live {
+    fn put_in_front(&self, state: &mut State, incoming: Arc<Live>) -> Arc<Live> {
         let outgoing = std::mem::replace(&mut state.front, incoming);
         if in_turn(&outgoing) {
             // 正在跑的那个回合还没有结局,上一个回合的结局不算数了。
-            outgoing.track.lock().expect("track poisoned").ended = None;
+            outgoing
+                .projection
+                .lock()
+                .expect("background projection poisoned")
+                .summary
+                .ended = None;
         }
         state.gate = false;
         crate::tui_share::remember(state.front.control.clone());
@@ -1484,8 +1847,8 @@ impl Background {
                 crate::tui_share::follow_with(
                     fresh.as_ref().expect("candidate").control.clone(),
                     || {
-                        let outgoing =
-                            self.put_in_front(&mut state, fresh.take().expect("candidate"));
+                        let outgoing = self
+                            .put_in_front(&mut state, Arc::new(fresh.take().expect("candidate")));
                         state.slots.push(outgoing);
                         state.slots.len() as u32
                     },
@@ -1496,7 +1859,7 @@ impl Background {
         let slot = match result {
             Ok(slot) => slot,
             Err(error) => {
-                stop(fresh.expect("uncommitted candidate")).await;
+                stop(fresh.as_ref().expect("uncommitted candidate")).await;
                 return Err(error);
             }
         };
@@ -1551,13 +1914,15 @@ impl Background {
             .map_err(|message| HostError::Failed { message })?
         };
         take_up(&mark, &target);
+        // 人接手了:这条会话不再是无人认领的结果,不必再等它「回家」。
+        self.remove_settle(&target);
         self.announce(HostEvent::SessionChanged {
             session: target.clone(),
             previous: Some(session),
         });
         self.announce_list();
         if let Some(empty) = closed {
-            stop(empty).await;
+            stop(&empty).await;
         }
         Ok(HostReply::SessionChanged { session: target })
     }
@@ -1663,7 +2028,7 @@ impl Background {
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
-                stop(incoming).await;
+                stop(&incoming).await;
                 return Err(error);
             }
         };
@@ -1672,10 +2037,26 @@ impl Background {
         // The hidden control already announced its fresh -> resumed transition.
         // Publish exactly one foreground transition, naming the actual old view.
         while pumps.said.try_recv().is_ok() {}
+        // The seed is the log as it stands after preparation, drained facts included
+        // once: a first cached `len` that disagrees with the session's log would keep
+        // the projection offset for the rest of its life (issue #1821 #12).
+        if let Some(log) = session_log(&incoming.control) {
+            pumps
+                .projection
+                .lock()
+                .expect("background projection poisoned")
+                .seed(&log);
+        }
         while let Ok(event) = pumps.events.try_recv() {
             // Preserve a request that appeared during preparation: subscribing
             // to the committed foreground must still bring that question back.
-            pumps.track.lock().expect("track poisoned").saw(&event);
+            // Facts that arrived meanwhile change nothing: the seed above already
+            // folded them, and the projection takes facts only from the log.
+            pumps
+                .projection
+                .lock()
+                .expect("background projection poisoned")
+                .absorb(Observed::Live(&event));
         }
         let mut incoming = Some(incoming);
         let mut retired = None;
@@ -1696,8 +2077,10 @@ impl Background {
                     incoming.as_ref().expect("candidate").control.clone(),
                     || {
                         let retain = Self::retain_front(&state);
-                        let outgoing =
-                            self.put_in_front(&mut state, incoming.take().expect("candidate"));
+                        let outgoing = self.put_in_front(
+                            &mut state,
+                            Arc::new(incoming.take().expect("candidate")),
+                        );
                         if retain {
                             state.slots.push(outgoing);
                         } else {
@@ -1709,7 +2092,7 @@ impl Background {
             }
         };
         if let Err(error) = switched {
-            stop(incoming.expect("uncommitted candidate")).await;
+            stop(incoming.as_ref().expect("uncommitted candidate")).await;
             return Err(error);
         }
         pumps.pump(self.me.clone());
@@ -1719,7 +2102,7 @@ impl Background {
         });
         self.announce_list();
         if let Some(retired) = retired {
-            stop(retired).await;
+            stop(&retired).await;
         }
         Ok(reply)
     }
@@ -1812,7 +2195,7 @@ impl Background {
         // Configure before publishing the slot or submitting any work. Failure
         // retires the candidate and never runs it with a fallback permission.
         if let Err(error) = live.control.runtime().set_mode(mode).await {
-            stop(live).await;
+            stop(&live).await;
             return Err(crate::host::refused(error));
         }
         if review_only {
@@ -1825,7 +2208,7 @@ impl Background {
                 .app()
                 .and_then(|app| Feed::find(&app, &session));
             let Some(agent) = agent else {
-                stop(live).await;
+                stop(&live).await;
                 return Err(HostError::Unavailable);
             };
             let log = agent.session();
@@ -1843,6 +2226,13 @@ impl Background {
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
+        // 隐藏只由发起方决定:模型的 `code_review` 是一个工具发起的,`/review` /
+        // `/bg` 是人发起的。`review_only` 仍回答权限问题,不再兼做隐藏判断(#3）。
+        live.initiated_by = if name.as_deref() == Some("code-review") {
+            InitiatedBy::Tool
+        } else {
+            InitiatedBy::Person
+        };
         live.name = name;
         live.task = one_line(&text);
         let session = live.control.session_id();
@@ -1853,7 +2243,7 @@ impl Background {
         // The operation lock prevents navigation/drop during this reservation.
         let slot = {
             let mut state = self.state.lock().expect("background poisoned");
-            state.slots.push(live);
+            state.slots.push(Arc::new(live));
             state.slots.len() as u32
         };
         if let Err(error) = handle.submit(UserInput::from(text)).await {
@@ -1866,7 +2256,7 @@ impl Background {
                     .expect("reserved slot");
                 state.slots.remove(at)
             };
-            stop(failed).await;
+            stop(&failed).await;
             self.announce_list();
             return Err(crate::host::refused(error));
         }
@@ -1879,7 +2269,7 @@ impl Background {
     }
 
     async fn tell(&self, target: String, text: String) -> Result<HostReply, HostError> {
-        let (handle, track, mark) = {
+        let (handle, projection, mark) = {
             let state = self.state.lock().expect("background poisoned");
             let slot = state
                 .slots
@@ -1888,16 +2278,21 @@ impl Background {
                 .ok_or(HostError::NotFound)?;
             (
                 slot.control.runtime().clone(),
-                slot.track.clone(),
+                slot.projection.clone(),
                 slot.mark.clone(),
             )
         };
         take_up(&mark, &target);
+        self.remove_settle(&target);
         handle
             .submit(UserInput::from(text))
             .await
             .map_err(crate::host::refused)?;
-        track.lock().expect("track poisoned").ended = None;
+        projection
+            .lock()
+            .expect("background projection poisoned")
+            .summary
+            .ended = None;
         self.announce_list();
         Ok(HostReply::Done)
     }
@@ -1913,7 +2308,8 @@ impl Background {
                 .ok_or(HostError::NotFound)?;
             state.slots.remove(at)
         };
-        stop(live).await;
+        self.remove_settle(&target);
+        stop(&live).await;
         self.announce_list();
         Ok(HostReply::Done)
     }
@@ -1923,15 +2319,22 @@ impl Background {
     /// 不猜、也不编:列表那一行已经说了它在干什么,这里再说一遍是噪音;而屏幕
     /// 只在它自己认为那个会话在等人时才会来要,所以这两条 `NotFound` 都是竞态的护栏。
     fn question(&self, target: String) -> Result<HostReply, HostError> {
-        let state = self.state.lock().expect("background poisoned");
-        let live = state
-            .slots
-            .iter()
-            .find(|slot| slot.control.session_id() == target)
-            .ok_or(HostError::NotFound)?;
+        // 只借一个槽位快照:读日志尾巴不扣着 `state`。
+        let live = {
+            let state = self.state.lock().expect("background poisoned");
+            state
+                .slots
+                .iter()
+                .find(|slot| slot.control.session_id() == target)
+                .cloned()
+                .ok_or(HostError::NotFound)?
+        };
         let (id, kind, payload) = {
-            let track = live.track.lock().expect("track poisoned");
-            match track.pending.clone() {
+            let projection = live
+                .projection
+                .lock()
+                .expect("background projection poisoned");
+            match projection.summary.pending.clone() {
                 Some(AgentEvent::Request { id, kind, payload }) => (id, kind, payload),
                 _ => return Err(HostError::NotFound),
             }
@@ -1964,12 +2367,15 @@ impl Background {
                 .find(|slot| slot.control.session_id() == target)
                 .ok_or(HostError::NotFound)?;
             {
-                let mut track = live.track.lock().expect("track poisoned");
-                match track.pending.as_ref() {
+                let mut projection = live
+                    .projection
+                    .lock()
+                    .expect("background projection poisoned");
+                match projection.summary.pending.as_ref() {
                     Some(AgentEvent::Request { id: waiting, .. }) if *waiting == id => {
                         // 送不送得进去都清:送不进去是那个 runtime 已经没了,留着它只会让
                         // 列表继续说「在等」一个再也答不了的问题。
-                        track.pending = None;
+                        projection.summary.pending = None;
                     }
                     // 挂着的已经不是它了(作废、被别处答过、回合结束):拒绝,而不是把
                     // 人的答案安在别的问题上。
@@ -2128,11 +2534,7 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
         let state = self.state.lock().expect("background poisoned");
         state.slots.iter().any(|slot| {
             slot.control.session_id() == session
-                && match *slot.mark.lock().expect("mark poisoned") {
-                    Mark::Home(_) => true,
-                    Mark::Pending(_) => slot.name.as_deref() == Some("code-review"),
-                    Mark::Own | Mark::TakenUp => false,
-                }
+                && hides(&slot.mark.lock().expect("mark poisoned"), slot.initiated_by)
         })
     }
 
@@ -2175,6 +2577,15 @@ impl atomcode_daemon::native_live::EmbeddedSessions for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一份把时间钉住的日志:`append` 与 `record` 盖出的 `at` 都不变,断言 `stats` 的
+    /// `elapsed_ms` 才不是看运气(两条日志各记一遍同一批事实时,真实时钟会差几毫秒)。
+    fn stamped_log(id: &str) -> Arc<SessionLog> {
+        Arc::new(SessionLog::with_clock(
+            atomcode_kernel::session::SessionHeader::new(id),
+            Arc::new(atomcode_kernel::clock::FixedWallClock(1_700_000_000_000)),
+        ))
+    }
 
     /// Chunks leaving the log between two reads move later facts to lower
     /// positions; the cursor still hands over each new fact exactly once.
@@ -2369,18 +2780,18 @@ mod tests {
     /// 回合怎么结束的,面板就怎么分组——被取消的不算失败,出错的要人看。
     #[test]
     fn how_a_turn_ended_is_what_the_panel_says() {
-        let mut track = Track::default();
+        let mut summary = LogSummary::default();
         let ended = |reason| AgentEvent::TurnComplete {
             turn: None,
             reason,
             provider_failure: None,
         };
-        track.saw(&ended(StopReason::Cancelled));
-        assert_eq!(track.ended, Some(BackgroundState::Cancelled));
-        track.saw(&ended(StopReason::ProviderError));
-        assert_eq!(track.ended, Some(BackgroundState::Failed));
-        track.saw(&ended(StopReason::Stopped));
-        assert_eq!(track.ended, Some(BackgroundState::Done));
+        summary.saw(&ended(StopReason::Cancelled));
+        assert_eq!(summary.ended, Some(BackgroundState::Cancelled));
+        summary.saw(&ended(StopReason::ProviderError));
+        assert_eq!(summary.ended, Some(BackgroundState::Failed));
+        summary.saw(&ended(StopReason::Stopped));
+        assert_eq!(summary.ended, Some(BackgroundState::Done));
         // 被熔断、轮数用尽的按失败回传，不冒充成功结论。
         for reason in [
             StopReason::RepeatLoop,
@@ -2389,14 +2800,28 @@ mod tests {
             StopReason::RunawayFuse,
             StopReason::PolicyDenied,
         ] {
-            track.saw(&ended(reason.clone()));
-            assert_eq!(track.ended, Some(BackgroundState::Failed), "{reason:?}");
+            summary.saw(&ended(reason.clone()));
+            assert_eq!(summary.ended, Some(BackgroundState::Failed), "{reason:?}");
         }
+        // 日志侧的 `TurnEnd` 写的是同一个字段 —— seed 出来的旧回合也能分组。
+        let mut seeded = LogSummary::default();
+        seeded.absorb_event(
+            0,
+            &SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+            true,
+        );
+        assert_eq!(seeded.ended, Some(BackgroundState::Done));
     }
 
     fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundStats> {
         let mut summary = LogSummary::default();
-        summary.absorb(log);
+        for logged in log {
+            summary.absorb_event(logged.at, &logged.event, false);
+        }
         summary.stats(running_at)
     }
 
@@ -2438,7 +2863,7 @@ mod tests {
             (350, 100, 20)
         );
         assert_eq!(Some(stats), stats_of(&log.events(), None));
-        assert_eq!(projection.summary.said.as_deref(), Some("Last reply"));
+        assert_eq!(projection.summary.last_said.as_deref(), Some("Last reply"));
         assert_eq!(projection.summary.title.as_deref(), Some("Previous title"));
 
         let replacement = Arc::new(SessionLog::new("same-session"));
@@ -2450,7 +2875,7 @@ mod tests {
             projection.summary.stats(None),
             stats_of(&replacement.events(), None)
         );
-        assert!(projection.summary.said.is_none());
+        assert!(projection.summary.last_said.is_none());
         assert!(projection.summary.title.is_none());
     }
 
@@ -2569,37 +2994,159 @@ mod tests {
 
     #[test]
     fn a_new_turn_forgets_the_previous_error() {
-        let mut track = Track {
+        let mut summary = LogSummary {
             error: Some("previous failure".into()),
             ended: Some(BackgroundState::Failed),
-            ..Track::default()
+            ..LogSummary::default()
         };
-        track.saw(&AgentEvent::TurnStarted { turn: Some(2) });
-        track.saw(&AgentEvent::TurnComplete {
+        summary.saw(&AgentEvent::TurnStarted { turn: Some(2) });
+        summary.saw(&AgentEvent::TurnComplete {
             turn: Some(2),
             reason: StopReason::MaxRounds,
             provider_failure: None,
         });
-        assert!(track.error.is_none());
-        assert_eq!(track.ended, Some(BackgroundState::Failed));
+        assert!(summary.error.is_none());
+        assert_eq!(summary.ended, Some(BackgroundState::Failed));
+    }
+
+    /// 同一类的另一条:日志里一条还没折进来的 `TurnStart` 不能清掉运行时刚报上来的
+    /// 错 —— 面板关着时它比那条 `Error` 旧,清掉之后那一行要等下一条无关 announce
+    /// 才播,而这条 `Error` 正是「现在这一回合失败了」(issue #1821 #24)。
+    #[test]
+    fn a_late_turn_start_does_not_drop_the_error_the_runtime_just_reported() {
+        let log = stamped_log("late-turn-start");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        });
+        log.append(SessionEvent::TurnStart { turn: 2 });
+
+        let mut projection = LogProjection::default();
+        // 还没折进来的那条 `TurnStart` 说的是过去;运行时先说了现在。
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        projection.update(Some(log.clone()));
+
+        assert_eq!(
+            projection.summary.error.as_deref(),
+            Some("provider died"),
+            "a turn start folded late describes the past, not the runtime's now"
+        );
+        // 日志那一半照旧折进来。
+        assert_eq!(projection.summary.len, 3);
+        assert_eq!(projection.summary.ended, None);
+    }
+
+    /// 同一类的另一条:日志里一条还没折进来的 `TurnEnd { error: Some }` 也不能盖掉
+    /// 运行时刚报上来的错 —— 面板关着时日志只积不折,这条 `TurnEnd` 说的是上一回合
+    /// 的旧错,运行时那条 `Error` 才是「现在这一回合失败了」(issue #1821 #24)。
+    /// 日志侧的 `error` 只该在整份重建(seed)时写。
+    #[test]
+    fn a_late_turn_end_does_not_drop_the_error_the_runtime_just_reported() {
+        let log = stamped_log("late-turn-end-error");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::ProviderError,
+            error: Some("old failure from the previous turn".into()),
+        });
+
+        let mut projection = LogProjection::default();
+        // 这条 `TurnEnd` 还没折进来,说的是过去;运行时先说了现在。
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        projection.update(Some(log.clone()));
+
+        assert_eq!(
+            projection.summary.error.as_deref(),
+            Some("provider died"),
+            "a turn end folded late carries the previous turn's error, not the runtime's now"
+        );
+        // 日志那一半照旧折进来,旧回合的结局仍然分组。
+        assert_eq!(projection.summary.len, 2);
+        assert_eq!(projection.summary.ended, Some(BackgroundState::Failed));
+
+        // 整份重建时,日志侧 `error` 才代表这份日志最后的失败。
+        let mut seeded = LogProjection::default();
+        seeded.seed(&log);
+        assert_eq!(
+            seeded.summary.error.as_deref(),
+            Some("old failure from the previous turn")
+        );
     }
 
     /// 回合结束,挂着的问题就不再挂着——回到前台时不该再问一次已经作废的问题。
     #[test]
     fn a_question_is_forgotten_when_its_turn_ends() {
-        let mut track = Track::default();
-        track.saw(&AgentEvent::Request {
+        let mut summary = LogSummary::default();
+        summary.saw(&AgentEvent::Request {
             id: 7,
             kind: "approval".into(),
             payload: serde_json::Value::Null,
         });
-        assert!(track.pending.is_some());
-        track.saw(&AgentEvent::TurnComplete {
+        assert!(summary.pending.is_some());
+        summary.saw(&AgentEvent::TurnComplete {
             provider_failure: None,
             turn: None,
             reason: StopReason::Stopped,
         });
-        assert!(track.pending.is_none());
+        assert!(summary.pending.is_none());
+    }
+
+    /// 审查 Required:面板没开的时候日志只积不折,上一回合的 `TurnEnd` 要等到第一次
+    /// `describe` 才折进来。它只能改日志那一半 —— `pending` 只来自运行时事件,在这里
+    /// 清掉就等于把刚到的请求吃了:面板从 `Waiting` 掉回 `Running`,`question()`
+    /// 永久 `NotFound`、`answer()` 回 `Stale`,提问那一侧还挂在 `rx` 上(issue #1821 #24)。
+    #[test]
+    fn a_late_turn_end_does_not_drop_the_request_that_arrived_first() {
+        let log = stamped_log("late-turn-end");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "上一回合说过话".into(),
+            images: vec![],
+        });
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        });
+
+        let mut projection = LogProjection::default();
+        // 投影一次都没读过这份日志:上一回合的 `TurnEnd` 还积着。新的回合已经问上
+        // 了,请求先到。
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 7,
+            kind: "approval".into(),
+            payload: serde_json::Value::Null,
+        }));
+        // 第一次 describe:把积着的那条 `TurnEnd` 折进来。
+        projection.update(Some(log.clone()));
+
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 7, .. })
+            ),
+            "a turn end folded late cannot drop the request the runtime just took"
+        );
+        // 日志那一半照旧折对了。
+        assert_eq!(projection.summary.len, 3);
+        assert_eq!(projection.summary.ended, Some(BackgroundState::Done));
     }
 
     #[test]
@@ -2636,5 +3183,424 @@ mod tests {
     fn one_line_takes_the_first_line_with_words() {
         assert_eq!(one_line("\n  \n  改完了 \n第二行"), Some("改完了".into()));
         assert_eq!(one_line("   "), None);
+    }
+
+    /// #1: 同一段对话第二次委派时,第一次留下的注入事实不能算作第二次「收下了」。
+    #[test]
+    fn a_home_note_counts_only_after_this_deliverys_baseline() {
+        use atomcode_kernel::session::InjectionOrigin;
+        let note = |seq, from: &str| LoggedEvent {
+            seq,
+            at: 0,
+            event: SessionEvent::Injected {
+                turn: 1,
+                text: "done".into(),
+                origin: InjectionOrigin::Peer {
+                    from: from.into(),
+                    source_turn: None,
+                    outside: true,
+                },
+            },
+        };
+        // 第一次投递留下的事实不能算作第二次「收下了」:baseline 就是它。
+        let first = vec![note(3, "review-a")];
+        assert!(!holds_note_from(&first, "review-a", 3));
+        // 第二次投递之后新增的那条才成立;再往后看又不再算这一条。
+        let both = vec![note(3, "review-a"), note(9, "review-a"), note(10, "other")];
+        assert!(holds_note_from(&both, "review-a", 3));
+        assert!(!holds_note_from(&both, "review-a", 9));
+        assert!(!holds_note_from(&both, "review-b", 0));
+    }
+
+    /// #12: 全量 seed 与逐条增量必须得出同一份投影。
+    #[test]
+    fn seed_and_incremental_absorption_agree() {
+        let usage = |prompt, cached| SessionEvent::Usage {
+            turn: 1,
+            round: 1,
+            usage: atomcode_kernel::stream::TokenUsage {
+                prompt,
+                completion: 7,
+                cached,
+            },
+        };
+        let events = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "  first words  \nsecond".into(),
+                images: vec![],
+            },
+            SessionEvent::StepEnd {
+                turn: 1,
+                step: 1,
+                tool_calls: 3,
+            },
+            SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: atomcode_kernel::stream::TokenUsage {
+                    prompt: 100,
+                    completion: 7,
+                    cached: 20,
+                },
+            },
+            SessionEvent::Titled {
+                turn: 1,
+                title: "a title".into(),
+                user_set: false,
+            },
+            SessionEvent::PartialReply {
+                turn: 1,
+                round: 1,
+                text: "\n  the last word  ".into(),
+                reasoning: String::new(),
+            },
+            SessionEvent::Asked {
+                turn: 1,
+                question: atomcode_kernel::session::Question {
+                    prompt: "Which one?".into(),
+                    ..Default::default()
+                },
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::StepEnd {
+                turn: 2,
+                step: 1,
+                tool_calls: 1,
+            },
+            usage(50, 0),
+        ];
+
+        let full = stamped_log("seed-equal");
+        for event in &events {
+            full.append(event.clone());
+        }
+        let mut seeded = LogProjection::default();
+        seeded.seed(&full);
+
+        let incremental_log = stamped_log("seed-equal");
+        let mut incremental = LogProjection::default();
+        for event in &events {
+            incremental_log.append(event.clone());
+            incremental.update(Some(incremental_log.clone()));
+        }
+
+        let shape = |s: &LogSummary| {
+            (
+                format!(
+                    "{} {:?} {:?} {:?} {:?} {} {:?} {}",
+                    s.len,
+                    s.title,
+                    s.first_user,
+                    s.last_said,
+                    s.asked,
+                    s.has_user_message,
+                    s.first_at,
+                    s.last_at
+                ),
+                s.last_at,
+                (s.steps, s.tools, s.completion, s.sent, s.sent_cached),
+                format!("{:?}", s.ended),
+            )
+        };
+        assert_eq!(shape(&seeded.summary), shape(&incremental.summary));
+        assert_eq!(seeded.summary.len, events.len() as u64);
+        assert_eq!(seeded.summary.stats(None), incremental.summary.stats(None));
+        // 第二个回合开始后,第一个回合的结局不再代表现在。
+        assert_eq!(seeded.summary.ended, None);
+    }
+
+    /// #12: 同一条事实在通道上(`Fact`)与日志里各来一次,只能折一次。
+    ///
+    /// pump 与 `describe` 面对的是同一个前端、同一份日志:屏幕一订阅
+    /// (`Subscribe { from: 0 }`),feed 就把整段历史逐条推成 `Fact`,新提交的事实
+    /// 也从这里过来;回到后台后 `update` 又按 cursor 从日志折一遍。两边都折,面板的
+    /// 步数/工具/token 就会把每条事实记两遍。渠道喂养与全量 seed 必须等值。
+    #[test]
+    fn a_fact_on_the_channel_is_folded_once_with_its_log_record() {
+        let events = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "  first words  \nsecond".into(),
+                images: vec![],
+            },
+            SessionEvent::StepEnd {
+                turn: 1,
+                step: 1,
+                tool_calls: 3,
+            },
+            SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: atomcode_kernel::stream::TokenUsage {
+                    prompt: 100,
+                    completion: 7,
+                    cached: 20,
+                },
+            },
+            SessionEvent::PartialReply {
+                turn: 1,
+                round: 1,
+                text: "\n  the last word  ".into(),
+                reasoning: String::new(),
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        ];
+
+        let full = stamped_log("fact-once");
+        for event in &events {
+            full.append(event.clone());
+        }
+        let mut seeded = LogProjection::default();
+        seeded.seed(&full);
+
+        // 混合喂养:每条事实先在通道上到一次(订阅重放或新提交),再由日志增量折
+        // 一次 —— 这正是会话在前台被订阅期间发生的事。
+        let mixed_log = stamped_log("fact-once");
+        let mut mixed = LogProjection::default();
+        for event in &events {
+            let (seq, at) = mixed_log.record(event.clone());
+            let fact = AgentEvent::Fact(Box::new(atomcode_kernel::session::Committed {
+                session: "fact-once".into(),
+                seq,
+                at,
+                event: event.clone(),
+            }));
+            assert!(
+                !mixed.absorb(Observed::Live(&fact)),
+                "a fact on the channel says nothing the log does not: {seq}"
+            );
+            mixed.update(Some(mixed_log.clone()));
+        }
+
+        assert_eq!(seeded.summary.len, events.len() as u64);
+        assert_eq!(
+            mixed.summary.len, seeded.summary.len,
+            "a fact is folded once, from the log"
+        );
+        assert_eq!(mixed.summary.stats(None), seeded.summary.stats(None));
+        assert_eq!(mixed.summary.first_user, seeded.summary.first_user);
+        assert_eq!(mixed.summary.last_said, seeded.summary.last_said);
+        assert_eq!(
+            format!("{:?}", mixed.summary.ended),
+            format!("{:?}", seeded.summary.ended)
+        );
+    }
+
+    /// 日志暂时读不到(App 正在重建、`Feed` 还没找到这个会话)时,`update(None)` 不能把
+    /// 只来自运行时事件的字段一起清掉:提问不在日志里,重订阅也不会再补发。日志回来
+    /// 时按 `seen` 续读 —— 重建期间新增的事实一条不落,已折过的字段也不会空着。
+    #[test]
+    fn an_unreadable_log_keeps_the_request_only_the_runtime_knows() {
+        let log = stamped_log("keeps-pending");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "  first words  ".into(),
+            images: vec![],
+        });
+        log.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 1,
+            tool_calls: 3,
+        });
+        let mut projection = LogProjection::default();
+        projection.update(Some(log.clone()));
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 7,
+            kind: "approval".into(),
+            payload: serde_json::Value::Null,
+        }));
+
+        // App 正在重建:日志读不到。
+        projection.update(None);
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 7, .. })
+            ),
+            "a request that never reaches the log must survive an unreadable log"
+        );
+        assert_eq!(
+            projection.summary.first_user.as_deref(),
+            Some("first words"),
+            "the log half is still the last thing the log said"
+        );
+
+        // 重建期间日志又长了一条:回来时把它折进来,已折过的不重复。
+        log.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 2,
+            tool_calls: 2,
+        });
+        projection.update(Some(log.clone()));
+        let mut seeded = LogProjection::default();
+        seeded.seed(&log);
+        assert_eq!(projection.summary.len, seeded.summary.len);
+        assert_eq!(
+            projection.summary.stats(None),
+            seeded.summary.stats(None),
+            "the facts that arrived while the log was unreadable are folded once, not lost"
+        );
+        assert!(projection.summary.has_user_message);
+        assert!(projection.summary.pending.is_some());
+    }
+
+    /// 换了日志(重建后的 App 拿来另一份,`read_new` 判 reset)时,日志那一半从头重建,
+    /// 只来自运行时事件的 `pending`/`error` 仍要在 —— 它们同样补不回来。
+    #[test]
+    fn a_reset_log_rebuilds_the_log_half_and_keeps_the_runtime_half() {
+        let old = stamped_log("reset");
+        old.append(SessionEvent::TurnStart { turn: 1 });
+        old.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "old words".into(),
+            images: vec![],
+        });
+        old.append(SessionEvent::StepEnd {
+            turn: 1,
+            step: 1,
+            tool_calls: 3,
+        });
+        let mut projection = LogProjection::default();
+        projection.update(Some(old.clone()));
+        projection.absorb(Observed::Live(&AgentEvent::Request {
+            id: 9,
+            kind: "question".into(),
+            payload: serde_json::Value::Null,
+        }));
+        projection.absorb(Observed::Live(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: false,
+        }));
+        assert_eq!(projection.summary.steps, 1);
+
+        let rebuilt = stamped_log("reset");
+        rebuilt.append(SessionEvent::UserMessage {
+            turn: 2,
+            text: "rebuilt words".into(),
+            images: vec![],
+        });
+        rebuilt.append(SessionEvent::StepEnd {
+            turn: 2,
+            step: 1,
+            tool_calls: 1,
+        });
+        projection.update(Some(rebuilt.clone()));
+
+        assert!(
+            matches!(
+                &projection.summary.pending,
+                Some(AgentEvent::Request { id: 9, .. })
+            ),
+            "a reset rebuilds the log half, not the request"
+        );
+        assert_eq!(projection.summary.error.as_deref(), Some("provider died"));
+        assert_eq!(
+            projection.summary.first_user.as_deref(),
+            Some("rebuilt words"),
+            "the log half comes from the log that is there now"
+        );
+        assert_eq!(projection.summary.len, 2);
+        assert_eq!((projection.summary.steps, projection.summary.tools), (1, 1));
+        let mut seeded = LogProjection::default();
+        seeded.seed(&rebuilt);
+        assert_eq!(projection.summary.stats(None), seeded.summary.stats(None));
+        assert!(projection.summary.has_user_message);
+    }
+
+    /// 审查 Low:`saw(AgentEvent::Error)` 改写了面板那一行,就要说「会变」——
+    /// 没有 `TurnComplete` 的收尾路径不会再有第二条事件来播它。
+    #[test]
+    fn an_error_asks_for_the_panel_line_to_be_repainted() {
+        let mut summary = LogSummary::default();
+        assert!(summary.saw(&AgentEvent::Error {
+            message: "provider died".into(),
+            http_status: Some(500),
+            code: None,
+            retryable: None,
+            retry_after_secs: None,
+            ends_turn: true,
+        }));
+        assert_eq!(summary.error.as_deref(), Some("provider died"));
+    }
+
+    /// #23: `(stopped, phase, ended, pending)` 的每种组合都有明确答案。
+    #[test]
+    fn the_panel_state_matrix_is_explicit() {
+        use RuntimePhase::*;
+        let done = Some(BackgroundState::Done);
+        assert_eq!(
+            state_for(true, InTurn, done, true),
+            BackgroundState::Failed,
+            "a retired runtime is failed whatever the phase says"
+        );
+        assert_eq!(
+            state_for(false, WaitingApproval, None, true),
+            BackgroundState::Waiting
+        );
+        assert_eq!(
+            state_for(false, WaitingApproval, done, false),
+            BackgroundState::Done
+        );
+        assert_eq!(
+            state_for(false, WaitingApproval, None, false),
+            BackgroundState::Running
+        );
+        assert_eq!(
+            state_for(false, InTurn, None, false),
+            BackgroundState::Running
+        );
+        assert_eq!(
+            state_for(false, InTurn, Some(BackgroundState::Cancelled), false),
+            BackgroundState::Cancelled
+        );
+        for phase in [Failed, Stopped, ShuttingDown] {
+            assert_eq!(
+                state_for(false, phase, done, false),
+                BackgroundState::Failed,
+                "{phase:?}"
+            );
+        }
+        for phase in [Ready, Reconfiguring, AwaitingProvider] {
+            assert_eq!(
+                state_for(false, phase, None, false),
+                BackgroundState::Idle,
+                "{phase:?}"
+            );
+            assert_eq!(
+                state_for(false, phase, done, false),
+                BackgroundState::Done,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// #3: 只有「工具发起且结果还没落地」的审查才隐藏;人发起的 scoped 任务
+    /// 在 Pending 期间照常出现在 `/resume`。
+    #[test]
+    fn a_session_is_hidden_only_while_a_tool_review_is_unopened() {
+        let dir = PathBuf::from("/tmp/project");
+        assert!(hides(&Mark::Home(dir.clone()), InitiatedBy::Person));
+        assert!(hides(&Mark::Home(dir.clone()), InitiatedBy::Tool));
+        assert!(!hides(&Mark::Pending(dir.clone()), InitiatedBy::Person));
+        assert!(hides(&Mark::Pending(dir.clone()), InitiatedBy::Tool));
+        assert!(!hides(&Mark::Own, InitiatedBy::Tool));
+        assert!(!hides(&Mark::TakenUp, InitiatedBy::Tool));
     }
 }
