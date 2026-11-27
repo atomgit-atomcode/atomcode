@@ -452,10 +452,11 @@ impl TodoTool {
 const TODOWRITE_DESCRIPTION: &str = "Create and maintain a structured task list for the current coding session. \
 Call it in one of TWO ways:\n\
 • PLAN / RE-PLAN — send the FULL list: `{\"todos\":[{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}]}` \
-(REPLACES the previous list). Use when the work has multiple requests, phases, files, dependencies, ambiguity, or \
-requires investigation followed by changes. Also use it for a non-trivial refactor even when the exact steps emerge \
-during exploration. The initial list covers the complete work from investigation and architecture/module design \
-through implementation and verification where relevant — not only the next action. SKIP only for a genuinely simple single edit, an informational question, or a one-command ask.\n\
+(REPLACES the previous list). Use when the work is genuinely multi-step — several distinct requests or phases that \
+will take many rounds, or an investigation whose outcome decides the changes. The initial list covers the complete work \
+from investigation and architecture/module design through implementation and verification where relevant — not only \
+the next action. SKIP it for work you can finish in a few rounds — a single quick edit, the same change across a few \
+files, a rename, one bug fix with its check, a one-off command, or an informational question.\n\
 • UPDATE ONE ITEM (preferred after the initial plan — do NOT resend the whole list): \
 `{\"action\":\"update\",\"id\":N,\"status\":\"in_progress|completed|pending\"}` changes ONE task (`id` is its number in \
 the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task. The MOMENT you START a task \
@@ -1606,8 +1607,9 @@ mod tests {
         let t = TodoTool::new();
         let d = t.description();
         assert!(
-            d.contains("multiple requests, phases, files, dependencies, ambiguity"),
-            "uses semantic complexity triggers: {d}"
+            d.contains("several distinct requests or phases that will take many rounds")
+                && d.contains("the same change across a few files"),
+            "uses the persona's complexity triggers: {d}"
         );
         assert!(
             d.contains("PLAN") && d.contains("UPDATE ONE ITEM"),
