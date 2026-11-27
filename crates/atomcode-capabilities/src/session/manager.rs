@@ -5414,27 +5414,45 @@ pub(super) fn open_read_file(path: &Path) -> SessionResult<File> {
 
 pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
-    // Windows: `append(true)` alone grants only FILE_APPEND_DATA, which is not
-    // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
-    // transcript append below would fail with ERROR_ACCESS_DENIED (os error 5).
-    // Note: `write(true)` is IGNORED when `append(true)` is set (Rust std), so
-    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
-    // semantics are unchanged.
-    options.create(true).append(true).read(true);
+    #[cfg(not(windows))]
+    {
+        // Unix: `append(true)` is `O_APPEND`, which appends **atomically** — every
+        // write lands at the end even if another writer moved the file. The
+        // kernel does the positioning, so it cannot be got wrong.
+        options.create(true).append(true).read(true);
+    }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
-        // the end of the file but cannot truncate it; cutting off a torn tail
-        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
-        // by the append flag, so writes keep landing at the end of the file.
-        options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
+        // Windows cannot do both at once. `append(true)` grants only
+        // FILE_APPEND_DATA, which cannot truncate (so a torn tail could not be
+        // cut off) and is not enough for LockFileEx (so the lock failed with
+        // ERROR_ACCESS_DENIED); overriding `access_mode` to add GENERIC_READ and
+        // GENERIC_WRITE — as this used to — silently dropped FILE_APPEND_DATA
+        // again, and every write landed at the **start** of the file instead of
+        // the end. Measured on Windows: with the override the log became
+        // "BBBB\n" where it should have been "AAAA\nBBBB".
+        //
+        // So on Windows the handle is opened for plain read+write and the
+        // position is the handle's business: it is **parked at the end**, which
+        // is where FILE_APPEND_DATA would have put every write anyway. The
+        // caller can still seek elsewhere — the callers that cut a tail off do
+        // exactly that — and the handle keeps the two rights it needs:
+        // truncating (`set_len`) and locking.
+        options.create(true).write(true).read(true);
     }
     set_private_create_mode(&mut options);
     no_follow(&mut options);
-    let file = options.open(path).map_err(|e| io_at(path, e))?;
+    let mut file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
+    #[cfg(windows)]
+    {
+        // Park at the end, so a write that does not seek lands where an append
+        // would have put it.
+        use std::io::Seek;
+        file.seek(io::SeekFrom::End(0))
+            .map_err(|e| io_at(path, e))?;
+    }
     Ok(file)
 }
 

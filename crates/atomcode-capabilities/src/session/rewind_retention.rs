@@ -502,15 +502,22 @@ mod tests {
         let index = dir.join("index");
         fs::write(&index, b"").unwrap();
         let when = SystemTime::now() - age;
-        fs::File::options()
-            .write(true)
-            .open(&index)
-            .unwrap()
-            .set_modified(when)
-            .unwrap();
+        set_mtime(&index, when);
         // The directory's own mtime moved when its files were written.
-        fs::File::open(&dir).unwrap().set_modified(when).unwrap();
+        set_mtime(&dir, when);
         dir
+    }
+
+    /// Set a path's modification time, on a file or a directory.
+    ///
+    /// `File::set_modified` cannot do a directory, and on Windows
+    /// `File::open` on a directory is refused outright (ERROR_ACCESS_DENIED) —
+    /// so the store's age could not be given on that platform at all.
+    /// `filetime` opens a directory with `FILE_FLAG_BACKUP_SEMANTICS`, which is
+    /// what that takes, and it works the same on Unix.
+    fn set_mtime(path: &Path, when: SystemTime) {
+        let when = filetime::FileTime::from_system_time(when);
+        filetime::set_file_mtime(path, when).unwrap();
     }
 
     fn session(user: &Path, bucket: &str, id: &str) {

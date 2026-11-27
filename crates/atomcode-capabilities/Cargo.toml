@@ -309,6 +309,13 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 wiremock = "0.6"
 # Temp dirs for the tool tests; cancellation token construction in tests.
 tempfile = "3"
+# Setting a directory's mtime. `File::set_modified` on a directory does not
+# exist, and on Windows `File::open` on a directory is refused outright
+# (ERROR_ACCESS_DENIED) — so the tests that age a store need a way that works
+# on both platforms. `filetime` opens a directory with
+# FILE_FLAG_BACKUP_SEMANTICS, which is what that takes. Already in the lock
+# through `atomcode-telemetry`, so this adds no new package.
+filetime = "0.2"
 tokio-util = "0.7"
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in the lib's #[cfg(test)] module + every tests/*.rs binary) so tests
