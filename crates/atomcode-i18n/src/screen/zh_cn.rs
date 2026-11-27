@@ -598,6 +598,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
         Msg::AgentsLead => "main · 这个会话本身".into(),
         Msg::AgentsStopped { name } => format!("{name} · 已停,日志还在").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "这个会话底下还没有别的 agent".into(),
         Msg::AgentsPickerHint => "看谁 · enter 切过去".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("需要更新版本才能打开 · {id}").into(),

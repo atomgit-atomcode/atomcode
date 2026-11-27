@@ -688,6 +688,12 @@ pub struct SessionHeader {
     /// role as it is defined then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberHeader>,
+    /// A one-line description of what a delegated child was asked to do — the
+    /// task's own short label, cut to listing width. Only a delegated child
+    /// carries one; its session's first user message is the task, but the
+    /// header is what a picker reads, one line per file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What a team member was created with.
@@ -725,6 +731,7 @@ impl SessionHeader {
             inherited: 0,
             context: None,
             member: None,
+            label: None,
         }
     }
 }

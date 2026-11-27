@@ -832,6 +832,9 @@ pub enum Msg<'a> {
     AgentsStopped {
         name: &'a str,
     },
+    AgentsTaskChild {
+        label: &'a str,
+    },
     AgentsNoneYet,
     AgentsPickerHint,
     SessionNeedsNewerVersion {

@@ -950,7 +950,8 @@ fn session_catalogue() -> Vec<Command> {
             "[prompt|persona]".into(),
             t(Msg::CmdAboutContext),
         ),
-        Command::said("agents", t(Msg::CmdAboutAgents)),
+        Command::said("agents", t(Msg::CmdAboutAgents))
+            .with_aliases(&["subagents"]),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
         // `/session` is the same fresh start, named the way the reference does,
@@ -1780,6 +1781,31 @@ impl CommandSet for SessionCommands {
                         )
                         .about(session.clone()),
                     );
+                }
+                // One-shot `task` children are on no roster: they are not team
+                // members, and the delegation is over the moment the tool call
+                // returns. Their sessions are kept under the lead's all the
+                // same, and the header's label is what the picker lists them
+                // by — the task's own short description, not a minted id.
+                if let Some(store) = ctx.service::<atomcode_harness::seams::SessionPersistenceSvc>()
+                {
+                    let children = store.children(&root).await.unwrap_or_default();
+                    let listed = |session: &str| {
+                        roster.members().iter().any(|(_, s, _)| s == session)
+                    };
+                    for header in children {
+                        if header.member.is_some() || listed(&header.id) {
+                            continue;
+                        }
+                        let label = header.label.as_deref().unwrap_or(&header.id);
+                        rows.push(
+                            crate::sheet::Row::new(
+                                format!("/look {}", header.id),
+                                t(Msg::AgentsTaskChild { label }).into_owned(),
+                            )
+                            .about(header.id.clone()),
+                        );
+                    }
                 }
                 if rows.is_empty() {
                     return Outcome::Said(t(Msg::AgentsNoneYet).into_owned());

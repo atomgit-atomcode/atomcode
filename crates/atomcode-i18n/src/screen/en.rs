@@ -636,6 +636,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "this screen has no agent roster: the launcher provided no `tui-team-roster`".into(),
         Msg::AgentsLead => "main · this session itself".into(),
         Msg::AgentsStopped { name } => format!("{name} · stopped; its log is still here").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "there is no other agent under this session yet".into(),
         Msg::AgentsPickerHint => "read which one · enter switches to it".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("a newer version is needed to open it · {id}").into(),
