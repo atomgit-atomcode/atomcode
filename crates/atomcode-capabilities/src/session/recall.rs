@@ -452,6 +452,16 @@ impl Tool for RecallTool {
 /// Load every transcript incrementally. Missing dir remains an empty history; a present
 /// but corrupt/unsafe/future-schema file is explicit because silently omitting history
 /// would make recall report a false success.
+/// A session this user cannot open — left by a run under another account, such
+/// as `sudo` — is someone else's and says nothing about this one. Passed over:
+/// one of them used to fail every search in the project.
+fn unreadable(error: &SessionStoreError) -> bool {
+    matches!(
+        error,
+        SessionStoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
 fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
@@ -499,6 +509,7 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
                 // Written by a newer build: listed elsewhere as needing one,
                 // and no reason to fail every search in the project.
                 Err(SessionStoreError::FutureSchema { .. }) => continue,
+                Err(error) if unreadable(&error) => continue,
                 Err(error) => return Err(error),
             };
             let records = super::events::turn_records(id, &events);
@@ -536,7 +547,7 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
                 actual: projected_bytes,
             });
         }
-        let (bytes, lines) = for_each_jsonl_line(&path, |line| {
+        let read = for_each_jsonl_line(&path, |line| {
             if out.len() >= MAX_JSONL_LINES {
                 return Err(SessionStoreError::TooLarge {
                     kind: "recall transcript lines",
@@ -558,7 +569,12 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
             }
             out.push(rec);
             Ok(())
-        })?;
+        });
+        let (bytes, lines) = match read {
+            Ok(read) => read,
+            Err(error) if unreadable(&error) => continue,
+            Err(error) => return Err(error),
+        };
         total_bytes = total_bytes
             .checked_add(bytes)
             .ok_or(SessionStoreError::TooLarge {
@@ -1095,6 +1111,20 @@ mod tests {
             )
             .unwrap();
         assert!(unknown.contains("No turns found for session"), "{unknown}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_this_user_cannot_open_is_passed_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "真正的回合", "答")]);
+        write_jsonl(dir.path(), "b.jsonl", &[rec("t", 2, "别人的", "答")]);
+        let locked = dir.path().join("b.jsonl");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = RecallTool::new(dir.path()).search_dir(dir.path(), "真正", None, None, 8);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(out.unwrap().contains("真正的回合"));
     }
 
     #[test]
