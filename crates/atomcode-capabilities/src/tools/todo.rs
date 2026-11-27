@@ -449,21 +449,19 @@ impl TodoTool {
     }
 }
 
+// Only how to call it. When to plan and how to keep the list true is the `tool-todo`
+// row's system-prompt guidance: some models (observed: GLM) under-weight tool
+// descriptions, so that judgment lives where it is read, and is not said twice.
 const TODOWRITE_DESCRIPTION: &str = "Create and maintain a structured task list for the current coding session. \
 Call it in one of TWO ways:\n\
 • PLAN / RE-PLAN — send the FULL list: `{\"todos\":[{\"content\":\"…\",\"status\":\"pending|in_progress|completed\"}]}` \
-(REPLACES the previous list). Use when the work is genuinely multi-step — several distinct requests or phases that \
-will take many rounds, or an investigation whose outcome decides the changes. The initial list covers the complete work \
-from investigation and architecture/module design through implementation and verification where relevant — not only \
-the next action. SKIP it for work you can finish in a few rounds — a single quick edit, the same change across a few \
-files, a rename, one bug fix with its check, a one-off command, or an informational question.\n\
+(REPLACES the previous list).\n\
 • UPDATE ONE ITEM (preferred after the initial plan — do NOT resend the whole list): \
 `{\"action\":\"update\",\"id\":N,\"status\":\"in_progress|completed|pending\"}` changes ONE task (`id` is its number in \
-the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task. The MOMENT you START a task \
-set it `in_progress`; the MOMENT it is actually done (verified) set it `completed`.\n\
-Each task is ONE specific, verifiable action with a concrete outcome a later turn can execute without re-planning — write `add error handling to load_config`, not `handle errors`, `task 1`, or `处理功能`. Keep \
-EXACTLY ONE task `in_progress` at a time (enforced automatically). Mark a task `completed` ONLY after the work is \
-actually done, never on intent. When planning from detailed user guidance, use todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch into a task title or guess the most recent message as its source. Incremental updates preserve these batch references. \
+the list, e.g. `#3`); `{\"action\":\"add\",\"content\":\"…\"}` appends a new pending task.\n\
+EXACTLY ONE task stays `in_progress` (enforced automatically). When planning from detailed user guidance, use \
+todo_sources list to identify the original message(s) and attach source_seqs to the full plan. Never copy the patch \
+into a task title or guess the most recent message as its source. Incremental updates preserve these batch references. \
 Batch this update with the next substantive tool call in the SAME response whenever you are about to use one; do not spend a whole model round on a todo update by itself.";
 
 #[async_trait]
@@ -1607,17 +1605,12 @@ mod tests {
         let t = TodoTool::new();
         let d = t.description();
         assert!(
-            d.contains("several distinct requests or phases that will take many rounds")
-                && d.contains("the same change across a few files"),
-            "uses the persona's complexity triggers: {d}"
-        );
-        assert!(
             d.contains("PLAN") && d.contains("UPDATE ONE ITEM"),
             "covers both modes: {d}"
         );
         assert!(
-            d.contains("specific, verifiable action"),
-            "sets item-quality bar: {d}"
+            d.contains("EXACTLY ONE task stays `in_progress`") && d.contains("source_seqs"),
+            "states the call contract: {d}"
         );
     }
 }
