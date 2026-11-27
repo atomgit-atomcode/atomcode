@@ -859,7 +859,10 @@ pub trait SessionPersistence: Send + Sync {
     /// Delete an inactive session and its owned files. Returns false when no
     /// session exists. Backends must opt in to this destructive operation.
     async fn delete(&self, _session_id: &str) -> Result<bool, String> {
-        Err("this session store does not support deletion".into())
+        Err(
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::SessionStoreDeleteUnsupported)
+                .into_owned(),
+        )
     }
 
     /// The sessions a person can pick up, newest first where the backend can

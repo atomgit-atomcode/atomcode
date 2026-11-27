@@ -643,6 +643,36 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Press Ctrl+D again to delete \"{name}\"").into(),
         Msg::SessionDeleteFailed { error } =>
             format!("Failed to delete session: {error}").into(),
+        Msg::HarnessJournalTooLarge { max_bytes, max_mib } =>
+            format!("Session JSONL exceeds the {max_bytes}-byte limit ({max_mib} MiB)").into(),
+        Msg::HarnessJournalExpectedFile =>
+            "Expected a regular file".into(),
+        Msg::HarnessJournalExpectedDirectory =>
+            "Expected a directory".into(),
+        Msg::HarnessJournalChangedBeforeAppend =>
+            "Session JSONL changed before append".into(),
+        Msg::HarnessJournalRollbackFailed { error, rollback } =>
+            format!("{error}. Failed to roll back the append: {rollback}").into(),
+        Msg::HarnessJournalInUse =>
+            "Session is in use".into(),
+        Msg::HarnessJournalNativeConflict =>
+            "Session ID also belongs to the native store".into(),
+        Msg::HarnessJournalUnknownOwner =>
+            "Cannot identify the harness journal".into(),
+        Msg::HarnessJournalLegacyConflict =>
+            "A legacy journal with the same session ID exists in the storage root".into(),
+        Msg::SessionStoreDeleteUnsupported =>
+            "This session store does not support deletion".into(),
+        Msg::HarnessJournalWriteStopped { error } =>
+            format!("{error}. Subsequent events for this session will not be saved").into(),
+        Msg::HarnessJournalWriterStartFailed { error } =>
+            format!("Failed to start the session journal writer: {error}").into(),
+        Msg::HarnessJournalWriterTerminated =>
+            "The session journal writer terminated unexpectedly".into(),
+        Msg::HarnessJournalNewerFormat { version, supported } =>
+            format!("Session format {version} is newer than this build supports ({supported})").into(),
+        Msg::HarnessJournalInvalidHeader { error } =>
+            format!("Invalid session header: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 

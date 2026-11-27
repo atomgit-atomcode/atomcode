@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use atomcode_config::i18n::{t, Msg};
 use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
@@ -23,7 +24,10 @@ fn at(path: &Path, error: impl std::fmt::Display) -> String {
 fn too_large(path: &Path) -> String {
     at(
         path,
-        format_args!("session JSONL exceeds the {MAX_JSONL_BYTES}-byte limit (512 MiB)"),
+        t(Msg::HarnessJournalTooLarge {
+            max_bytes: MAX_JSONL_BYTES,
+            max_mib: MAX_JSONL_BYTES / (1024 * 1024),
+        }),
     )
 }
 
@@ -47,13 +51,13 @@ fn regular(path: &Path) -> Result<bool, String> {
     match metadata(path)? {
         None => Ok(false),
         Some(m) if m.is_file() => Ok(true),
-        Some(_) => Err(at(path, "expected a regular file")),
+        Some(_) => Err(at(path, t(Msg::HarnessJournalExpectedFile))),
     }
 }
 
 fn directory(path: &Path) -> Result<(), String> {
     if metadata(path)?.is_some_and(|m| !m.is_dir()) {
-        return Err(at(path, "expected a directory"));
+        return Err(at(path, t(Msg::HarnessJournalExpectedDirectory)));
     }
     Ok(())
 }
@@ -107,7 +111,7 @@ fn file_len(path: &Path) -> Result<Option<u64>, String> {
             }
             Ok(Some(m.len()))
         }
-        Some(_) => Err(at(path, "expected a regular file")),
+        Some(_) => Err(at(path, t(Msg::HarnessJournalExpectedFile))),
     }
 }
 
@@ -162,7 +166,7 @@ fn append_records<T: Serialize>(
             .map_err(|e| at(path, e))?,
     };
     if file.seek(SeekFrom::End(0)).map_err(|e| at(path, e))? != len.unwrap_or_default() {
-        return Err(at(path, "session JSONL changed before append"));
+        return Err(at(path, t(Msg::HarnessJournalChangedBeforeAppend)));
     }
     if let Err(error) = file.write_all(&batch.encoded) {
         let rollback = if let Some(len) = len {
@@ -175,7 +179,10 @@ fn append_records<T: Serialize>(
             Ok(()) => at(path, error),
             Err(rollback) => at(
                 path,
-                format_args!("{error}; append rollback failed: {rollback}"),
+                t(Msg::HarnessJournalRollbackFailed {
+                    error: &error.to_string(),
+                    rollback: &rollback.to_string(),
+                }),
             ),
         });
     }
@@ -207,7 +214,10 @@ impl LiveJournal {
         if !self.failed.load(Ordering::Relaxed) {
             if let Err(error) = append_events(&self.path, std::slice::from_ref(event)) {
                 self.failed.store(true, Ordering::Relaxed);
-                eprintln!("session-persistence: {error}; subsequent events for this session will not be saved");
+                eprintln!(
+                    "session-persistence: {}",
+                    t(Msg::HarnessJournalWriteStopped { error: &error })
+                );
             }
         }
     }
@@ -267,7 +277,7 @@ impl JsonlStore {
             if e.kind() == fs2::lock_contended_error().kind()
                 && e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
             {
-                at(journal, "session is in use")
+                at(journal, t(Msg::HarnessJournalInUse))
             } else {
                 at(&path, e)
             }
@@ -363,14 +373,22 @@ impl JsonlStore {
         let Some(header) = value.get("header") else {
             return Ok(None);
         };
-        let header: SessionHeader = serde_json::from_value(header.clone())
-            .map_err(|e| format!("{}:1: header: {e}", path.display()))?;
-        if header.version > crate::session::SESSION_FORMAT_VERSION {
-            return Err(format!(
-                "{}: session format {} is newer than this build reads ({})",
+        let header: SessionHeader = serde_json::from_value(header.clone()).map_err(|e| {
+            format!(
+                "{}:1: {}",
                 path.display(),
-                header.version,
-                crate::session::SESSION_FORMAT_VERSION
+                t(Msg::HarnessJournalInvalidHeader {
+                    error: &e.to_string()
+                })
+            )
+        })?;
+        if header.version > crate::session::SESSION_FORMAT_VERSION {
+            return Err(at(
+                path,
+                t(Msg::HarnessJournalNewerFormat {
+                    version: header.version,
+                    supported: crate::session::SESSION_FORMAT_VERSION,
+                }),
             ));
         }
         Ok(Some(header))
@@ -482,7 +500,7 @@ impl JsonlStore {
             "json",
         ] {
             if metadata(&path.with_extension(ext))?.is_some() {
-                return Err(at(path, "session ID also belongs to the native store"));
+                return Err(at(path, t(Msg::HarnessJournalNativeConflict)));
             }
         }
         Ok(())
@@ -495,7 +513,7 @@ impl JsonlStore {
         let record: Value = serde_json::from_str(&first).map_err(|e| {
             at(
                 path,
-                format_args!("cannot identify the harness journal: {e}"),
+                format_args!("{}: {e}", t(Msg::HarnessJournalUnknownOwner)),
             )
         })?;
         let header_id = record.pointer("/header/id").and_then(Value::as_str);
@@ -510,7 +528,7 @@ impl JsonlStore {
             }
         };
         if !owns || record.get("turn_id").is_some() {
-            return Err(at(path, "cannot identify the harness journal"));
+            return Err(at(path, t(Msg::HarnessJournalUnknownOwner)));
         }
         Ok(())
     }
@@ -522,7 +540,7 @@ impl JsonlStore {
             return Ok(false);
         }
         if path != self.legacy_path(session_id) && regular(&self.legacy_path(session_id))? {
-            return Err(at(&path, "session also has a flat legacy journal"));
+            return Err(at(&path, t(Msg::HarnessJournalLegacyConflict)));
         }
         let lease = self.lease(&path)?;
         Self::check_native_namespace(&path)?;
@@ -619,6 +637,7 @@ impl SessionPersistence for JsonlStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_config::i18n::{self, Locale};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
@@ -673,6 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_journal_rejects_reads_and_writes_but_can_be_deleted() {
+        let _locale = i18n::test_lock();
         let test = TestStore::new();
         let store = &test.0;
         store.begin(&SessionHeader::new("large")).await.unwrap();
@@ -684,15 +704,23 @@ mod tests {
             .set_len(MAX_JSONL_BYTES + 1)
             .unwrap();
 
-        for error in [
-            store.header("large").await.unwrap_err(),
-            store.load("large").await.unwrap_err(),
-            store.append("large", &[event(1)]).await.unwrap_err(),
+        for (locale, text) in [
+            (Locale::En, "Session JSONL exceeds"),
+            (Locale::ZhCn, "会话 JSONL 超出"),
         ] {
-            assert!(
-                error.contains("536870912") && error.contains("large.jsonl"),
-                "{error}"
-            );
+            i18n::set_locale(locale);
+            for error in [
+                store.header("large").await.unwrap_err(),
+                store.load("large").await.unwrap_err(),
+                store.append("large", &[event(1)]).await.unwrap_err(),
+            ] {
+                assert!(error.contains(text), "{error}");
+                assert!(
+                    error.contains("536870912") && error.contains("512 MiB"),
+                    "{error}"
+                );
+                assert!(error.contains("large.jsonl"), "{error}");
+            }
         }
         assert_eq!(fs::metadata(&path).unwrap().len(), MAX_JSONL_BYTES + 1);
         assert!(store.delete("large").await.unwrap());
@@ -728,6 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_batch_leaves_no_prefix_and_stops_live_commits() {
+        let _locale = i18n::test_lock();
         let test = TestStore::new();
         let store = &test.0;
         let header = SessionHeader::new("live");
@@ -742,7 +771,17 @@ mod tests {
         journal.commit(&event(1000));
         journal.commit(&event(1));
         assert_eq!(fs::metadata(&path).unwrap().len(), len);
-        assert!(store.delete("live").await.unwrap_err().contains("in use"));
+        for (locale, text) in [
+            (Locale::En, "Session is in use"),
+            (Locale::ZhCn, "会话正在使用中"),
+        ] {
+            i18n::set_locale(locale);
+            let error = store.delete("live").await.unwrap_err();
+            assert!(
+                error.contains(text) && error.contains("live.jsonl"),
+                "{error}"
+            );
+        }
         drop(journal);
         assert!(store.delete("live").await.unwrap());
     }
@@ -772,6 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_log_keeps_its_location_and_native_data_is_not_deleted() {
+        let _locale = i18n::test_lock();
         let test = TestStore::new();
         let store = &test.0;
         fs::create_dir_all(&store.root).unwrap();
@@ -814,7 +854,7 @@ mod tests {
             .delete("native")
             .await
             .unwrap_err()
-            .contains("identify"));
+            .contains(t(Msg::HarnessJournalUnknownOwner).as_ref()));
         assert!(native.exists() && sidecar.exists());
     }
 }

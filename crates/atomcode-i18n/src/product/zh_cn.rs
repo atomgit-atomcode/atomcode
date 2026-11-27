@@ -615,6 +615,36 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("再按 Ctrl+D 确认删除「{name}」").into(),
         Msg::SessionDeleteFailed { error } =>
             format!("删除会话失败：{error}").into(),
+        Msg::HarnessJournalTooLarge { max_bytes, max_mib } =>
+            format!("会话 JSONL 超出 {max_bytes} 字节上限（{max_mib} MiB）").into(),
+        Msg::HarnessJournalExpectedFile =>
+            "需要常规文件".into(),
+        Msg::HarnessJournalExpectedDirectory =>
+            "需要目录".into(),
+        Msg::HarnessJournalChangedBeforeAppend =>
+            "会话 JSONL 在追加前已发生变化".into(),
+        Msg::HarnessJournalRollbackFailed { error, rollback } =>
+            format!("{error}。回滚追加写入失败：{rollback}").into(),
+        Msg::HarnessJournalInUse =>
+            "会话正在使用中".into(),
+        Msg::HarnessJournalNativeConflict =>
+            "此会话 ID 也归属于原生会话存储".into(),
+        Msg::HarnessJournalUnknownOwner =>
+            "无法确认日志归属于 harness 会话".into(),
+        Msg::HarnessJournalLegacyConflict =>
+            "存储根目录下存在同一会话 ID 的旧版日志".into(),
+        Msg::SessionStoreDeleteUnsupported =>
+            "此会话存储不支持删除".into(),
+        Msg::HarnessJournalWriteStopped { error } =>
+            format!("{error}。此会话后续事件将停止保存").into(),
+        Msg::HarnessJournalWriterStartFailed { error } =>
+            format!("启动会话日志写入线程失败：{error}").into(),
+        Msg::HarnessJournalWriterTerminated =>
+            "会话日志写入线程意外退出".into(),
+        Msg::HarnessJournalNewerFormat { version, supported } =>
+            format!("会话格式版本为 {version}，当前构建最高支持版本 {supported}").into(),
+        Msg::HarnessJournalInvalidHeader { error } =>
+            format!("会话日志头部无效：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 

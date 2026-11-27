@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
 use async_trait::async_trait;
+use atomcode_config::i18n::{t, Msg};
 use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -323,7 +324,12 @@ impl Plugin for SessionPersistenceJsonlPlugin {
                     journal.commit(&logged);
                 }
             })
-            .map_err(|e| format!("start session journal writer: {e}"))?;
+            .map_err(|e| {
+                t(Msg::HarnessJournalWriterStartFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned()
+            })?;
         let writers = Arc::new(Mutex::new(JournalWriters {
             active: HashMap::new(),
             queue: Some(writes),
@@ -336,7 +342,10 @@ impl Plugin for SessionPersistenceJsonlPlugin {
                 writers.active.clear();
             }
             if worker.join().is_err() {
-                eprintln!("session-persistence: journal writer terminated unexpectedly");
+                eprintln!(
+                    "session-persistence: {}",
+                    t(Msg::HarnessJournalWriterTerminated)
+                );
             }
         });
 
