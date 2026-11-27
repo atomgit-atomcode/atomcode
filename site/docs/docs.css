@@ -194,7 +194,7 @@ kbd{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 
   .sl.on::before{display:none}
 }
 @media (max-width:640px){
-  .dh{gap:8px;padding:0 12px}
+  .dh{gap:8px;padding:0 12px;--dhp:12px}
   .dh-brand small,.dh-brand em,.dh-r .txt{display:none}
   .dh-search{max-width:none;min-width:0}.dh-search span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dh-search kbd{display:none}
   .dm{padding-top:22px}
@@ -204,5 +204,18 @@ kbd{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 
   .doc-hero{padding:26px 20px}.doc-hero::after{font-size:120px}
   .pager{grid-template-columns:1fr}
   .cp{opacity:1}
+}
+/* 触屏：可点元素 ≥44px；横屏刘海避让 */
+@media (pointer:coarse){
+  .ib,.dh-search,.sb-btn{min-height:44px}.ib{min-width:44px}
+  .dh-brand{min-height:44px}
+  .sl{min-height:44px}
+  .cp{height:36px;opacity:1}
+  .df a{display:inline-flex;align-items:center;min-height:44px}
+  .crumb a{display:inline-flex;align-items:center;min-height:44px;min-width:44px}
+  .release-jump summary,.release-issues summary{display:flex;align-items:center;min-height:44px}
+}
+@supports (padding:max(0px)){
+  .dh{padding-left:max(var(--dhp,20px),env(safe-area-inset-left));padding-right:max(var(--dhp,20px),env(safe-area-inset-right))}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}html{scroll-behavior:auto}}
