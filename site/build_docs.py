@@ -36,7 +36,7 @@ def read_version():
         with open(os.path.join(ROOT, 'package.json'), encoding='utf-8') as f:
             return 'v' + json.load(f)['version']
     except Exception:
-        return 'v5.2.8'
+        return 'v5.2.9'
 
 
 VERSION = read_version()

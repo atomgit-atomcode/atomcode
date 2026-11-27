@@ -183,8 +183,27 @@ section{position:relative;padding:150px var(--pad) 0}
 .e-tl{left:22px;top:18px}.e-tl b{font:500 30px/1 var(--mono);letter-spacing:-.03em}
 .e-tr{right:22px;top:20px;text-align:right}
 .e-bl{left:22px;bottom:18px}.e-br{right:22px;bottom:18px;text-align:right}
-/* 背光巨型符号：深色剪影 + 背后的光 */
-.e-sym{position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);font:700 clamp(96px,13vw,190px)/1 var(--mono);letter-spacing:-.08em;color:var(--bg);-webkit-text-stroke:1px rgba(var(--ink-rgb),.18);text-shadow:0 0 1px rgba(var(--accent-rgb),.4)}
+/* 元素卡翻牌 */
+.e-sym{position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);font:700 clamp(52px,9.7vw,140px)/1 var(--mono);color:var(--ph)}
+.e-version{font-weight:500;font-variant-numeric:tabular-nums}
+.flap-board{display:inline-flex;align-items:center;justify-content:center;gap:.05em;white-space:nowrap;vertical-align:middle}
+.e-sym .flap-board{gap:.075em}
+.flap-cell{position:relative;display:inline-grid;place-items:center;width:.76em;height:1.16em;isolation:isolate;
+  border-radius:.09em;perspective:4em;box-shadow:0 .04em .12em rgba(0,0,0,.25)}
+.flap-cell::after{content:"";position:absolute;z-index:4;left:0;right:0;top:50%;height:1px;background:rgba(var(--ink-rgb),.27);pointer-events:none}
+.flap-face{position:absolute;inset:0;display:grid;place-items:center;width:100%;height:100%;border-radius:inherit;
+  background:linear-gradient(180deg,var(--bg3) 50%,var(--bg2) 50%);box-shadow:inset 0 0 0 1px var(--line2)}
+.flap-dot{width:.25em;text-align:center}
+.flap-half{position:absolute;left:0;right:0;height:50%;overflow:hidden;pointer-events:none}
+.flap-half .flap-face{height:200%;border-radius:.09em}
+.flap-upper{z-index:3;top:0;transform-origin:center bottom;animation:flap-out .48s var(--ease) var(--flap-delay) both}
+.flap-lower{bottom:0}
+.flap-lower .flap-face{top:-100%}
+.flap-old-bottom{z-index:1;animation:flap-cover .48s step-end var(--flap-delay) both}
+.flap-incoming{z-index:2;transform-origin:center top;animation:flap-in .48s var(--ease) var(--flap-delay) both}
+@keyframes flap-out{0%{transform:rotateX(0)}49%{opacity:1}50%,100%{transform:rotateX(-90deg);opacity:0}}
+@keyframes flap-in{0%,49%{transform:rotateX(90deg);opacity:0}50%{opacity:1}100%{transform:rotateX(0);opacity:1}}
+@keyframes flap-cover{0%{opacity:1}50%,100%{opacity:0}}
 .e-name{position:absolute;left:0;right:0;top:72%;text-align:center;font:500 15px var(--mono);color:var(--ink);letter-spacing:.02em}
 .elem-note{position:absolute;z-index:3;font:10.5px var(--mono);color:var(--fg3);display:flex;align-items:center;gap:8px;white-space:nowrap}
 .elem-note::before{content:"";width:26px;height:1px;background:var(--line3)}
@@ -574,7 +593,7 @@ footer nav a:hover{color:var(--ph)}
   .e-tl,.e-tr{top:10px}.e-bl,.e-br{bottom:10px}
   .e-tl,.e-bl{left:10px}.e-tr,.e-br{right:10px}
   .e-tl b{font-size:20px}
-  .e-sym{font-size:clamp(62px,17vw,93px)}
+  .e-sym{font-size:clamp(42px,14vw,60px)}
   .orbits{inset:0 0 auto;height:calc(100% - var(--label-space))}
   .orbit-models{position:absolute;inset:auto 0 28px;z-index:3;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
   .chip{position:static;justify-content:center;height:23px;padding:0 4px;font-size:9.5px;gap:4px;transform:none;opacity:1;will-change:auto}
@@ -683,6 +702,7 @@ footer nav a:hover{color:var(--ph)}
   .rx-rail{flex-wrap:wrap;row-gap:16px;transform:none!important}
   .rx-nav{display:none}.rx-view{-webkit-mask:none;mask:none}
   .st-term .ln,.det-term .ln{opacity:1;transform:none}
+  .flap-half{display:none}
 }
 .brand .site-mark{width:24px;height:24px;flex:none}
 .anchor-alias{position:absolute;top:0}
@@ -704,7 +724,7 @@ footer nav a:hover{color:var(--ph)}
 <div class="frame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
 <aside class="rail" id="rail" aria-label="主菜单">
   <button class="pill rail-close" id="railClose" aria-label="关闭菜单" type="button">×</button>
-  <a class="brand" href="#top"><img class="site-mark" src="assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>v5.2.8</em></a>
+  <a class="brand" href="#top"><img class="site-mark" src="assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>v5.2.9</em></a>
   <nav class="menu" id="menu">
     <a data-doc="index" href="docs/zh/index.html"><i>[1]</i><span data-i="mn1">文档</span></a>
     <a href="#surf"><i>[2]</i><span data-i="mn2">产品</span></a>
@@ -781,8 +801,8 @@ footer nav a:hover{color:var(--ph)}
       <div class="elem-glow"></div>
       <div class="elem" id="elem">
         <div class="e-c e-tl"><b>21</b><small data-i="e1">种能力</small></div>
-        <div class="e-c e-tr">5.2.8<small data-i="e2">版本</small></div>
-        <div class="e-sym" aria-hidden="true">Ac</div>
+        <div class="e-sym" aria-hidden="true"><span data-flap-board>Ac</span></div>
+        <div class="e-c e-tr"><span class="e-version" data-flap-board>5.2.9</span><small data-i="e2">版本</small></div>
         <div class="e-name">AtomCode</div>
         <div class="e-c e-bl">[Rs] 4g⁸<small data-i="e3">内核配置</small></div>
         <div class="e-c e-br">MIT<small data-i="e4">开源协议</small></div>
@@ -1075,7 +1095,7 @@ function scramble(el,text,dur=520){
 }
 
 /* ==================== 安装命令 ==================== */
-const VERSION='v5.2.8';
+const VERSION='v5.2.9';
 const RELEASE_BASE='https://atomgit.com/atomgit_atomcode/atomcode/releases/download/'+VERSION;
 const SCRIPT_BASE='https://raw.atomgit.com/atomgit_atomcode/atomcode/raw/main/scripts';
 const invitePath=location.pathname.match(/^\/invite\/([A-Za-z0-9]{8})\/?$/);
@@ -1172,6 +1192,85 @@ if(fine&&!reduce){
     elem.style.setProperty('--gx',(x*100).toFixed(1)+'%');elem.style.setProperty('--gy',(y*100).toFixed(1)+'%')});
   hero.addEventListener('pointerleave',()=>elem.style.transform='');
 }
+
+/* ==================== §01 元素翻牌 ==================== */
+function mountFlapBoards(card){
+  const tiles=[];
+  // 主符号先入位，版本号随后翻定。
+  $$('[data-flap-board]',card).forEach((board,row)=>{
+    const value=board.textContent.trim();
+    board.setAttribute('role','img');
+    board.setAttribute('aria-label',value);
+    board.classList.add('flap-board');
+    board.replaceChildren(...Array.from(value,(glyph,index)=>{
+      const cell=document.createElement('span');
+      cell.setAttribute('aria-hidden','true');
+      if(glyph==='.'){
+        cell.className='flap-dot';
+        cell.textContent=glyph;
+        return cell;
+      }
+      cell.className='flap-cell';
+      const face=document.createElement('span');
+      face.className='flap-face';
+      face.textContent=glyph;
+      cell.append(face);
+      const previous=row===0?'Rs'[index]:/^[0-9]$/.test(glyph)?String((Number(glyph)+9)%10):glyph;
+      if(previous&&previous!==glyph){
+        cell.style.setProperty('--flap-delay',(row*240+index*78)+'ms');
+        tiles.push({cell,face,previous});
+      }
+      return cell;
+    }));
+  });
+
+  const motion=matchMedia('(prefers-reduced-motion: reduce)');
+  let timer=null,inView=false;
+  const active=()=>inView&&!document.hidden&&!motion.matches;
+  const settleBoards=()=>$$('.flap-half',card).forEach(panel=>panel.remove());
+  function play(){
+    settleBoards();
+    for(const {cell,face,previous} of tiles){
+      const half=(className,text)=>{
+        const panel=document.createElement('span');
+        panel.className='flap-half '+className;
+        const surface=face.cloneNode();
+        surface.textContent=text;
+        panel.append(surface);
+        return panel;
+      };
+      const outgoing=half('flap-upper',previous);
+      const oldBottom=half('flap-lower flap-old-bottom',previous);
+      const incoming=half('flap-lower flap-incoming',face.textContent);
+      const settle=()=>{outgoing.remove();oldBottom.remove();incoming.remove()};
+      incoming.addEventListener('animationend',settle,{once:true});
+      incoming.addEventListener('animationcancel',settle,{once:true});
+      cell.append(outgoing,oldBottom,incoming);
+    }
+  }
+  function tick(){
+    timer=null;
+    if(!active())return;
+    play();
+    timer=setTimeout(tick,8000);
+  }
+  function sync(){
+    if(active()){
+      if(timer===null)tick();
+    }else{
+      clearTimeout(timer);
+      timer=null;
+      settleBoards();
+    }
+  }
+  new IntersectionObserver(([entry])=>{
+    inView=entry.isIntersecting&&entry.intersectionRatio>=.4;
+    sync();
+  },{threshold:.4}).observe(card);
+  document.addEventListener('visibilitychange',sync);
+  motion.addEventListener?.('change',sync);
+}
+mountFlapBoards(elem);
 
 /* ==================== §01 光束输入框 ==================== */
 const PDEMO=[

@@ -66,10 +66,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let git = root.path().join(".git");
         std::fs::create_dir(&git).unwrap();
-        std::fs::write(git.join("HEAD"), "ref: refs/heads/release/v5.2.8\n").unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/release/v5.2.9\n").unwrap();
         let child = root.path().join("src");
         std::fs::create_dir(&child).unwrap();
-        assert_eq!(read(&child).as_deref(), Some("release/v5.2.8"));
+        assert_eq!(read(&child).as_deref(), Some("release/v5.2.9"));
         std::fs::write(git.join("HEAD"), "0123456789abcdef\n").unwrap();
         assert_eq!(read(&child), None);
         std::fs::remove_dir_all(&git).unwrap();
