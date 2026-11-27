@@ -1389,21 +1389,22 @@ function buildRx(){
   rxScroll();
 }
 // 每个停靠点（4 张卡 + 产物）对应的横向位移
-let rxStops=[],rxMax=0,rxCur=-1;
+let rxStops=[],rxCur=-1;
 function rxLayout(){
   if(narrow()||reduce){rxTrack.style.height='';return}
-  const vw=rxSticky.clientWidth;rxMax=Math.max(0,rail.scrollWidth-vw);
-  // 竖向滚动距离 ≈ 横向位移，手感 1:1
-  rxTrack.style.height=Math.round(rxMax*1.05+innerHeight)+'px';
+  const vw=rxSticky.clientWidth,rxMax=Math.max(0,rail.scrollWidth-vw);
   const stops=[...stEls,$('.prod',rail)];
   rxStops=stops.map(el=>clamp(el.offsetLeft-(vw-el.offsetWidth)/2,0,rxMax));
   rxStops[0]=0;rxStops[rxStops.length-1]=rxMax;
+  // Give every step its own scroll interval, even when nearby cards fit on screen.
+  rxTrack.style.height=Math.round(Math.max(rxMax*1.05,(rxStops.length-1)*120)+innerHeight)+'px';
 }
 function rxSpan(){return Math.max(1,rxTrack.offsetHeight-innerHeight)}
 function rxGo(i){
-  i=clamp(i,0,rxStops.length-1);
+  const last=rxStops.length-1;
+  i=clamp(i,0,last);
   const top=rxTrack.getBoundingClientRect().top+scrollY;
-  scrollTo({top:top+(rxMax?rxStops[i]/rxMax:0)*rxSpan(),behavior:reduce?'auto':'smooth'});
+  scrollTo({top:top+i/last*rxSpan(),behavior:reduce?'auto':'smooth'});
 }
 function renderRxSteps(){
   const zh=lang==='zh';
@@ -1417,10 +1418,10 @@ $('#rxPrev').onclick=()=>rxGo(rxCur-1);$('#rxNext').onclick=()=>rxGo(rxCur+1);
 (()=>{const v=$('#rxView');let x0=null,moved=0;
   v.addEventListener('pointerdown',e=>{if(narrow()||reduce)return;x0=e.clientX;moved=0;v.setPointerCapture&&v.setPointerCapture(e.pointerId)});
   v.addEventListener('pointermove',e=>{if(x0===null)return;const dx=e.clientX-x0;x0=e.clientX;moved+=Math.abs(dx);if(moved>4)v.classList.add('drag');
-    scrollBy(0,-dx*rxSpan()/Math.max(1,rxMax))});
+    scrollBy(0,-dx)});
   const end=()=>{x0=null;v.classList.remove('drag')};v.addEventListener('pointerup',end);v.addEventListener('pointercancel',end);
   // 触控板横向滑动
-  rxSticky.addEventListener('wheel',e=>{if(narrow()||reduce)return;if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){e.preventDefault();scrollBy(0,e.deltaX*rxSpan()/Math.max(1,rxMax))}},{passive:false});
+  rxSticky.addEventListener('wheel',e=>{if(narrow()||reduce)return;if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){e.preventDefault();scrollBy(0,e.deltaX)}},{passive:false});
 })();
 addEventListener('keydown',e=>{
   if(curSec!=='rx'||narrow()||reduce)return;const t=(document.activeElement||{}).tagName;if(t==='INPUT'||t==='TEXTAREA')return;
@@ -1430,8 +1431,10 @@ function rxScroll(){
   if(narrow()||reduce){stEls.forEach(s=>{s.classList.add('on');$$('.ln',s).forEach(l=>l.classList.add('v'))});opEls.forEach(o=>o.classList.add('on'));return}
   const r=rxTrack.getBoundingClientRect(),span=rxSpan();
   const p=clamp(-r.top/span,0,1);
-  const vw=rxSticky.clientWidth,maxX=rxMax;
-  const tx=p*maxX;rail.style.transform=`translate3d(${(-tx).toFixed(1)}px,0,0)`;
+  const vw=rxSticky.clientWidth;
+  const step=p*(rxStops.length-1),whole=Math.floor(step);
+  const from=rxStops[whole],to=rxStops[whole+1]??from;
+  const tx=from+(to-from)*(step-whole);rail.style.transform=`translate3d(${(-tx).toFixed(1)}px,0,0)`;
   stEls.forEach((s,i)=>{
     const left=s.offsetLeft-tx,w=s.offsetWidth;
     const lp=clamp((vw*.8-left)/(w*.9),0,1);           // 卡片进入视口右侧后开始逐行执行
@@ -1440,10 +1443,9 @@ function rxScroll(){
     s.classList.toggle('on',lp>.05);
     if(opEls[i])opEls[i].classList.toggle('on',lp>=1);
   });
-  // 当前停靠点 = 最近的那一个
-  let k=0;rxStops.forEach((v,i)=>{if(Math.abs(v-tx)<Math.abs(rxStops[k]-tx))k=i});
+  const k=Math.round(step);
   if(k!==rxCur){rxCur=k;$$('#rxSteps button').forEach((b,i)=>{b.classList.toggle('on',i===k);b.classList.toggle('done',i<k);b.setAttribute('aria-selected',i===k)})}
-  $('#rxPrev').disabled=p<=.001;$('#rxNext').disabled=p>=.999;
+  $('#rxPrev').disabled=k===0;$('#rxNext').disabled=k===rxStops.length-1;
   $('#rxBar').style.transform=`scaleX(${p.toFixed(4)})`;
   $('#rxHint').classList.toggle('hide',p>.04);
   enLit.style.strokeDashoffset=enLen*(1-p);

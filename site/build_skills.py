@@ -128,7 +128,7 @@ def main():
     for s in skills:
         counts[s['c']] = counts.get(s['c'], 0) + 1
     data = {
-        'v': cat.get('version', ''), 'repo': REPO_WEB, 'total': len(skills),
+        'v': cat.get('version', ''), 'repo': REPO_WEB, 'marketplace': cat['name'], 'total': len(skills),
         'cats': [{'k': k, 'zh': zh, 'en': en, 'n': counts.get(k, 0)} for k, zh, en in CATS if counts.get(k)],
         'authors': sorted(authors.values(), key=lambda a: -a['k']),
         'skills': skills,

@@ -181,11 +181,13 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
 .empty.on{display:block}
 
 /* ==================== 详情抽屉 ==================== */
-.scrim{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.45);opacity:0;visibility:hidden;transition:.3s}
-.scrim.on{opacity:1;visibility:visible}
-.dw{position:fixed;z-index:81;top:0;right:0;bottom:0;width:min(560px,100vw);display:flex;flex-direction:column;background:var(--bg2);border-left:1px solid var(--line2);transform:translateX(102%);transition:transform .45s var(--ease);
+.dw{position:fixed;inset:0 0 0 auto;width:min(560px,100vw);height:100%;max-width:none;max-height:none;margin:0;overflow:hidden;
+  color:var(--fg2);background:var(--bg2);border:0;border-left:1px solid var(--line2);
   padding:calc(18px + env(safe-area-inset-top)) 0 env(safe-area-inset-bottom)}
-.dw.on{transform:none}
+.dw[open]{display:flex;flex-direction:column;animation:drawer-in .35s var(--ease)}
+.dw::backdrop{background:rgba(0,0,0,.45)}
+@keyframes drawer-in{from{transform:translateX(100%)}}
+@keyframes sheet-in{from{transform:translateY(100%)}}
 .dw-h{display:flex;align-items:center;gap:8px;padding:0 22px 14px;border-bottom:1px solid var(--line);font:11.5px var(--mono);color:var(--fg3)}
 .dw-h .sp{flex:1}
 .dw-x{display:grid;place-items:center;width:40px;height:40px;border:1px solid var(--line2);border-radius:9px;color:var(--fg2)}
@@ -228,6 +230,7 @@ footer nav{display:flex;flex-wrap:wrap;gap:6px 18px}
 footer nav a:hover{color:var(--ph)}
 .toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));z-index:95;transform:translate(-50%,14px);padding:11px 16px;border-radius:10px;background:var(--ink);color:var(--on-ink);font:13px var(--mono);opacity:0;pointer-events:none;transition:.35s var(--spring);max-width:calc(100vw - 32px)}
 .toast.on{opacity:1;transform:translate(-50%,0)}
+.dw .toast{position:absolute;max-width:calc(100% - 32px)}
 .top-btn{position:fixed;right:max(18px,env(safe-area-inset-right));bottom:calc(18px + env(safe-area-inset-bottom));z-index:45;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line2);border-radius:50%;background:rgba(var(--overlay-rgb),.8);color:var(--fg2);opacity:0;visibility:hidden;transition:.3s}
 .top-btn.on{opacity:1;visibility:visible}
 
@@ -268,7 +271,8 @@ footer nav a:hover{color:var(--ph)}
   .grid.list .el-d{grid-column:2}
   .grid.list .el .wrap-au{display:none}
   /* 抽屉在手机上变成底部弹层 */
-  .dw{top:auto;left:0;width:100%;height:min(88vh,100%);border-left:0;border-top:1px solid var(--line2);border-radius:18px 18px 0 0;transform:translateY(102%);padding-top:10px}
+  .dw{top:auto;left:0;width:100%;height:min(88vh,100%);height:min(88dvh,100%);border-left:0;border-top:1px solid var(--line2);border-radius:18px 18px 0 0;padding-top:10px}
+  .dw[open]{animation-name:sheet-in}
   .dw::before{content:"";align-self:center;width:40px;height:4px;margin-bottom:12px;border-radius:2px;background:var(--line3)}
   .dw-cell{width:96px;height:96px}.dw-cell b{font-size:42px}
   .kv{grid-template-columns:92px minmax(0,1fr)}
@@ -280,6 +284,7 @@ footer nav a:hover{color:var(--ph)}
   .spec-lg button{min-height:44px}
   .ins-t button{height:44px}
   .ins-c button{height:44px}
+  .dw-x{width:44px;height:44px}
   .tg{padding:0}.tg button{width:44px}
   footer nav a{display:inline-flex;align-items:center;justify-content:center;min-height:44px;min-width:44px}
   .el::before{display:none}
@@ -353,11 +358,10 @@ footer nav a:hover{color:var(--ph)}
 </footer>
 
 <!-- ==================== 详情抽屉 ==================== -->
-<div class="scrim" id="scrim"></div>
-<aside class="dw" id="dw" role="dialog" aria-modal="true" aria-labelledby="dwName">
-  <div class="dw-h"><span id="dwCrumb">SKILLHUB / —</span><span class="sp"></span><button class="dw-x" id="dwX" aria-label="关闭">✕</button></div>
+<dialog class="dw" id="dw" aria-labelledby="dwName">
+  <div class="dw-h"><span id="dwCrumb">SKILLHUB / —</span><span class="sp"></span><button class="dw-x" id="dwX" type="button" autofocus aria-label="关闭">✕</button></div>
   <div class="dw-b" id="dwB"></div>
-</aside>
+</dialog>
 <button class="top-btn" id="topBtn" aria-label="回到顶部">↑</button>
 <div class="toast" id="toast" role="status"></div>
 
@@ -371,14 +375,33 @@ const D=window.SKILLS_DATA||{skills:[],cats:[],authors:[],total:0};
 const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
 const fine=matchMedia('(hover:hover) and (pointer:fine)').matches;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmt=n=>n>=1e6?(n/1e6).toFixed(1).replace(/\.0$/,'')+'M':n>=1e3?(n/1e3).toFixed(n>=1e4?0:1).replace(/\.0$/,'')+'k':String(n||0);
+function safeUrl(value){
+  if(typeof value!=='string'||!value)return '';
+  try{
+    const url=new URL(value);
+    return url.protocol==='https:'&&!url.username&&!url.password?url.href:'';
+  }catch{return ''}
+}
+function fmt(value){
+  const n=Number(value);
+  if(!Number.isFinite(n)||n<=0)return '0';
+  if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
+  if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1).replace(/\.0$/,'')+'k';
+  return String(n);
+}
 const num=i=>String(i+1).padStart(3,'0');
 let toastT;
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('on'),1900)}
 function copy(text){
   const ok=()=>toast(L('已复制 ✓','Copied ✓'));
   if(navigator.clipboard&&isSecureContext){navigator.clipboard.writeText(text).then(ok,()=>fallback())}else fallback();
-  function fallback(){const a=document.createElement('textarea');a.value=text;a.style.cssText='position:fixed;opacity:0';document.body.appendChild(a);a.select();try{document.execCommand('copy');ok()}catch(e){toast(text)}a.remove()}
+  function fallback(){
+    const a=document.createElement('textarea'),previous=document.activeElement;
+    a.value=text;a.style.cssText='position:fixed;opacity:0';
+    ($('#dw[open]')||document.body).appendChild(a);a.select();
+    try{document.execCommand('copy')?ok():toast(text)}catch{toast(text)}
+    a.remove();previous?.focus({preventScroll:true});
+  }
 }
 
 /* ==================== 国际化：中文取自 DOM，英文查表 ==================== */
@@ -402,7 +425,7 @@ function applyLang(){
   const dl=`../docs/${lang==='zh'?'zh':'en'}/plugins.html`;$('#docLink').href=dl;$('#docLink2').href=dl;
   document.title=L('SkillHub · AtomCode 技能元素库','SkillHub · AtomCode skill library');
   renderStats();renderSpec();renderAuthors();render(true);
-  if(cur)openSkill(cur,true);
+  if(cur)openSkill(cur);
 }
 $('#langBtn').addEventListener('click',()=>{lang=lang==='zh'?'en':'zh';try{localStorage.setItem('ac-lang',lang);localStorage.setItem('atomcode_lang',lang)}catch(e){}applyLang();syncTheme()});
 
@@ -440,9 +463,9 @@ function renderStats(){
 function renderSpec(){
   /* 触屏上光谱条太细不便点，只作展示，筛选交给下方图例 */
   const tag=fine?'button':'span';
-  $('#specBar').innerHTML=D.cats.map(c=>`<${tag} class="c-${c.k}${st.c===c.k?' on':''}" style="--n:${c.n}" data-c="${c.k}" title="${esc(catName(c.k))} · ${c.n}"${fine?` aria-label="${esc(catName(c.k))}"`:' aria-hidden="true"'}></${tag}>`).join('');
+  $('#specBar').innerHTML=D.cats.map(c=>`<${tag} class="c-${esc(c.k)}${st.c===c.k?' on':''}" style="--n:${c.n}" data-c="${esc(c.k)}" title="${esc(catName(c.k))} · ${c.n}"${fine?` aria-label="${esc(catName(c.k))}"`:' aria-hidden="true"'}></${tag}>`).join('');
   $('#specLg').innerHTML=`<button class="${st.c?'':'on'}" data-c="" style="--sc:var(--ink)"><i></i>${L('全部','All')}<em>${D.total}</em></button>`+
-    D.cats.map(c=>`<button class="c-${c.k}${st.c===c.k?' on':''}" data-c="${c.k}"><i></i>${esc(catName(c.k))}<em>${c.n}</em></button>`).join('');
+    D.cats.map(c=>`<button class="c-${esc(c.k)}${st.c===c.k?' on':''}" data-c="${esc(c.k)}"><i></i>${esc(catName(c.k))}<em>${c.n}</em></button>`).join('');
   $('#spec').classList.toggle('f',!!st.c);
   $('#specNow').textContent=st.c?catName(st.c).toUpperCase():L('全部系列','ALL SERIES');
 }
@@ -465,7 +488,7 @@ $('#qClr').addEventListener('click',()=>{q.value='';st.q='';$('#search').classLi
 const focusSearch=()=>{$('#bar').scrollIntoView({behavior:reduce?'auto':'smooth',block:'start'});setTimeout(()=>q.focus({preventScroll:true}),reduce?0:300)};
 $('#kBtn').addEventListener('click',focusSearch);
 addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&cur){closeSkill();return}
+  if($('#dw').open)return;
   const typing=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
   if((e.key==='/'&&!typing)||((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k')){e.preventDefault();focusSearch()}
 });
@@ -486,9 +509,19 @@ function filtered(){
 
 /* ==================== 渲染：分批追加，滚到底自动续 ==================== */
 const PAGE=36;let list=[],shown=0;
-const avatar=(s)=>{const a=s.av||(AU[s.a]&&AU[s.a].av);return a?`<span class="av"><img src="${esc(a)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.textContent='${esc(auName(s.a)[0]||'?').toUpperCase()}'"></span>`:`<span class="av">${esc((auName(s.a)[0]||'?').toUpperCase())}</span>`};
+function avatar(s){
+  const photo=safeUrl(s.av)||safeUrl(AU[s.a]?.av);
+  const initial=esc((auName(s.a)[0]||'?').toUpperCase());
+  return `<span class="av"><span${photo?' hidden':''}>${initial}</span>${photo?`<img src="${esc(photo)}" alt="" loading="lazy" referrerpolicy="no-referrer">`:''}</span>`;
+}
+document.addEventListener('error',e=>{
+  const img=e.target;
+  if(!img.matches?.('.av img'))return;
+  img.previousElementSibling.hidden=false;
+  img.remove();
+},true);
 function card(s,k){
-  return `<button class="el c-${s.c}" data-n="${esc(s.n)}" style="--i:${k%PAGE}">
+  return `<button class="el c-${esc(s.c)}" data-n="${esc(s.n)}" style="--i:${k%PAGE}">
     <span class="el-top"><span>#${num(s.i)}</span><span class="ct"><i></i>${esc(catName(s.c))}</span></span>
     <span class="el-sym">${esc(s.sy)}</span>
     <span class="el-n">${esc(s.n)}</span>
@@ -519,17 +552,24 @@ if(fine&&!reduce){
   let raf=0,ev=null;
   $('#grid').addEventListener('pointermove',e=>{ev=e;if(raf)return;raf=requestAnimationFrame(()=>{raf=0;const el=ev.target.closest('.el');if(!el)return;const r=el.getBoundingClientRect();el.style.setProperty('--mx',(ev.clientX-r.left)+'px');el.style.setProperty('--my',(ev.clientY-r.top)+'px')})});
 }
-$('#grid').addEventListener('click',e=>{const el=e.target.closest('.el');if(el)openSkill(el.dataset.n)});
+$('#grid').addEventListener('click',e=>{const el=e.target.closest('.el');if(el)openSkill(el.dataset.n,el)});
 
 /* ==================== 详情抽屉 ==================== */
-let insMode='tui',lastFocus=null;
-const cmds=s=>({tui:`/plugin install ${s.n}@atomcode`,cli:`atomcode plugin install ${s.n}`});
-function openSkill(name,silent){
+let insMode='tui',opener=null;
+const dw=$('#dw');
+// Use the same identifiers as marketplace registration and plugin lookup.
+const installName=value=>value.replace(/[^A-Za-z0-9_-]/gu,'-');
+const cmds=s=>{
+  const plugin=installName(s.n);
+  const spec=D.marketplace?`${plugin}@${installName(D.marketplace)}`:plugin;
+  return {tui:`/plugin install ${spec}`,cli:`atomcode plugin install ${spec}`};
+};
+function openSkill(name,trigger=null){
   const s=S.find(x=>x.n===name);if(!s){cur=null;writeHash();return}
   cur=name;writeHash();
-  const dw=$('#dw');dw.className='dw on c-'+s.c;
+  dw.className='dw c-'+s.c;
   $('#dwCrumb').textContent=`SKILLHUB / ${catName(s.c).toUpperCase()} / #${num(s.i)}`;
-  const c=cmds(s);
+  const c=cmds(s),homepage=safeUrl(s.h),upstream=safeUrl(s.gh);
   $('#dwB').innerHTML=`
     <div class="dw-cell"><span>#${num(s.i)}</span><b>${esc(s.sy)}</b><em>${esc(s.v||'')}</em></div>
     <h2 id="dwName">${esc(s.n)}</h2>
@@ -549,27 +589,55 @@ function openSkill(name,silent){
       <dt>${L('来源','Source')}</dt><dd>${esc((s.src||'').replace(/^https?:\/\//,''))}</dd>
     </dl>
     <div class="links">
-      ${s.h?`<a class="btn btn-p" href="${esc(s.h)}" target="_blank" rel="noopener">${L('在 AtomGit 查看','View on AtomGit')} ↗</a>`:''}
-      ${s.gh?`<a class="btn btn-g" href="${esc(s.gh)}" target="_blank" rel="noopener">GitHub ↗</a>`:''}
+      ${homepage?`<a class="btn btn-p" href="${esc(homepage)}" target="_blank" rel="noopener">${L('项目主页','Project homepage')} ↗</a>`:''}
+      ${upstream?`<a class="btn btn-g" href="${esc(upstream)}" target="_blank" rel="noopener">${L('上游仓库','Upstream repository')} ↗</a>`:''}
       <button class="btn btn-g" id="shareBtn">${L('复制链接','Copy link')}</button>
     </div>
     ${s.ok?'':`<p class="warn"><b>${L('社区技能','Community skill')}</b> · ${L('收录时由维护者审查过固定版本；作者后续推送的代码不在审查范围内，安装前请先阅读源码。','A maintainer reviewed the pinned revision when it was listed; later pushes by the author are not audited. Read the source before installing.')}</p>`}`;
-  $$('.ins-t button',dw).forEach(b=>b.addEventListener('click',()=>{insMode=b.dataset.m;openSkill(name,true)}));
+  $('#dwX').setAttribute('aria-label',L('关闭','Close'));
+  $$('.ins-t button',dw).forEach(b=>b.addEventListener('click',()=>{
+    insMode=b.dataset.m;
+    openSkill(name);
+    $(`.ins-t button[data-m="${insMode}"]`).focus({preventScroll:true});
+  }));
   $('#insCp').addEventListener('click',()=>copy(c[insMode]));
   $('#shareBtn').addEventListener('click',()=>copy(location.href));
-  if(!silent){lastFocus=document.activeElement;$('#dwB').scrollTop=0}
-  $('#scrim').classList.add('on');document.body.classList.add('lock');
-  if(!silent)setTimeout(()=>$('#dwX').focus({preventScroll:true}),60);
+  if(!dw.open){
+    opener=trigger;
+    $('#dwB').scrollTop=0;
+    dw.appendChild($('#toast'));
+    document.body.classList.add('lock');
+    dw.showModal();
+  }
 }
 function closeSkill(){
-  cur=null;writeHash();$('#dw').classList.remove('on');$('#scrim').classList.remove('on');document.body.classList.remove('lock');
-  if(lastFocus&&lastFocus.focus)lastFocus.focus({preventScroll:true});
+  cur=null;
+  writeHash();
+  dw.close();
+  document.body.classList.remove('lock');
+  document.body.appendChild($('#toast'));
+  if(opener?.isConnected)opener.focus({preventScroll:true});
+  opener=null;
 }
-$('#dwX').addEventListener('click',closeSkill);$('#scrim').addEventListener('click',closeSkill);
+$('#dwX').addEventListener('click',closeSkill);
+dw.addEventListener('cancel',e=>{e.preventDefault();closeSkill()});
+dw.addEventListener('click',e=>{
+  if(e.target!==dw)return;
+  const r=dw.getBoundingClientRect();
+  if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)closeSkill();
+});
 /* 手机底部弹层：下滑关闭 */
-(()=>{let y0=null;const dw=$('#dw');
-  dw.addEventListener('touchstart',e=>{y0=$('#dwB').scrollTop<=0?e.touches[0].clientY:null},{passive:true});
-  dw.addEventListener('touchend',e=>{if(y0!=null&&e.changedTouches[0].clientY-y0>90&&innerWidth<=760)closeSkill();y0=null},{passive:true});
+(()=>{
+  const sheet=matchMedia('(max-width:760px), (max-height:500px) and (orientation:landscape)');
+  let y0=null;
+  dw.addEventListener('touchstart',e=>{
+    y0=sheet.matches&&e.touches.length===1&&$('#dwB').scrollTop<=0?e.touches[0].clientY:null;
+  },{passive:true});
+  dw.addEventListener('touchend',e=>{
+    if(sheet.matches&&y0!==null&&e.changedTouches[0].clientY-y0>90)closeSkill();
+    y0=null;
+  },{passive:true});
+  dw.addEventListener('touchcancel',()=>{y0=null},{passive:true});
 })();
 
 /* ==================== 顶栏 / 回到顶部 ==================== */
