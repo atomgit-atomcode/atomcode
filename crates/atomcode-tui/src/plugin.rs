@@ -1939,6 +1939,14 @@ pub struct Tui {
     /// switch ends the run. (An empty window is a successful answer — it
     /// clears the badge — not a failure.)
     failed_generation: Arc<AtomicU64>,
+    /// The generation of the figures that last landed: a pre-failure reply is
+    /// only the freshest data in hand while it is newer than what the row
+    /// already shows. A landing reply moves it.
+    allowance_figures_generation: Arc<AtomicU64>,
+    /// Whether an idle-heartbeat ask is still in flight. Idle asks ride the
+    /// current generation instead of bumping it, so while one is out another
+    /// would be its out-of-order twin: the beat skips until the ask lands.
+    allowance_idle_ask_out: Arc<AtomicBool>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -6963,9 +6971,11 @@ impl Tui {
                 .as_ref()
                 .is_some_and(|left| crate::modules::status::badge_visible(left, m.now))
         };
-        if badge_on_row {
+        if badge_on_row && !self.allowance_idle_ask_out.load(Ordering::SeqCst) {
             // The idle ask is the ask itself: it rides the current generation
-            // (see check_allowance), so a slow reply still lands.
+            // (see check_allowance), so a slow reply still lands. While one is
+            // out, the beat holds off — a second would be its same-generation
+            // out-of-order twin.
             self.check_allowance(false, true);
         }
     }
@@ -7008,15 +7018,32 @@ impl Tui {
                 self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
             }
         };
+        // One idle ask in flight at a time: two would be same-generation
+        // out-of-order twins. The marker clears when the ask's task ends —
+        // landed, failed, stale or superseded.
+        if idle {
+            self.allowance_idle_ask_out.store(true, Ordering::SeqCst);
+        }
+        let idle_ask_out = self.allowance_idle_ask_out.clone();
+        // Clears the idle-in-flight marker whenever the spawned task ends, so
+        // the next idle beat can ask again whatever path the task takes.
+        struct IdleAskDone(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for IdleAskDone {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
         let failed_generation = self.failed_generation.clone();
+        let allowance_figures_generation = self.allowance_figures_generation.clone();
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
+            let _idle_ask_done = IdleAskDone(idle_ask_out);
             // The cheap form — the windows and nothing else. The plan behind
             // them and what has been spent are two more round trips, and
             // neither is on this row.
@@ -7066,12 +7093,18 @@ impl Tui {
                 let mut m = host.moment.write().expect("moment poisoned");
                 let current = allowance_generation.load(Ordering::SeqCst);
                 let failed = failed_generation.load(Ordering::SeqCst);
-                let retired = generation != current && !(failed != 0 && generation < failed);
+                let figures = allowance_figures_generation.load(Ordering::SeqCst);
+                // The pre-failure exemption covers only a reply newer than
+                // what the row already shows: an older one would write stale
+                // data over fresh.
+                let retired = generation != current
+                    && !(failed != 0 && generation < failed && generation >= figures);
                 if retired {
                     return;
                 }
                 // Fresh data in hand: the run of failed asks it outlived is over.
                 failed_generation.store(0, Ordering::SeqCst);
+                allowance_figures_generation.store(generation, Ordering::SeqCst);
                 let warning = crate::moment::Allowance::exhausted(&windows)
                     .filter(|_| !nudged.swap(true, Ordering::SeqCst))
                     .map(|spent| {
@@ -12769,6 +12802,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             allowance_checked: Mutex::new(None),
             allowance_generation: Arc::new(AtomicU64::new(0)),
             failed_generation: Arc::new(AtomicU64::new(0)),
+            allowance_figures_generation: Arc::new(AtomicU64::new(0)),
+            allowance_idle_ask_out: Arc::new(AtomicBool::new(false)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -20053,6 +20088,69 @@ mod allowance_switch_tests {
         assert!(
             pending.try_recv().is_err(),
             "a row without a badge must not be asked about"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_idle_reply_slower_than_the_throttle_still_lands() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        tui.idle_beat();
+        let answer = pending.recv().await.unwrap();
+        // The reply takes longer than the throttle: the next beat fires while
+        // the first ask is still out — and must not ask a second time.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "one idle ask in flight at a time — a second would be its \
+             same-generation out-of-order twin"
+        );
+        // The slow reply is NOT retired: the idle ask rides the current
+        // generation, so the badge follows it however long it takes.
+        let refreshed = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(90),
+            calls_used: None,
+            call_limit: None,
+        }];
+        answer.send(reply(refreshed)).unwrap();
+        tokio::task::yield_now().await;
+        let allowance = host.moment.read().unwrap().allowance.clone().unwrap();
+        assert_eq!(
+            allowance.percent, 90,
+            "a slow idle reply still lands — the idle ask does not retire it"
+        );
+        // The ask is done: the next beat asks again.
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_ok(),
+            "the in-flight marker cleared with the ask"
         );
     }
 

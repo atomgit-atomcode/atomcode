@@ -648,15 +648,6 @@ const ALLOWANCE_NEAR: u8 = 80;
 /// From here on it is not a warning any more.
 const ALLOWANCE_SPENT: u8 = 95;
 
-/// What the row says about the allowance, or `None` when it says nothing.
-///
-/// Its own function, and pure, so the whole decision — *whether* to speak, and
-/// what with — is judged without a host, a network or a frame.
-///
-/// `now` is the screen's clock: a countdown is what is left of it now, not what
-/// was left when the host answered. Past it the window has turned over and the
-/// figure is about a window that no longer exists, so the row says nothing
-/// rather than "90%" of an allowance that is back to full.
 /// Whether the badge is on the row right now — the cheap form of
 /// [`allowance_badge`], for callers that only need the visibility judgment
 /// and would otherwise build a string every heartbeat just to ask.
@@ -667,6 +658,15 @@ pub(crate) fn badge_visible(
     left.percent >= ALLOWANCE_NEAR && !left.resets_by.is_some_and(|by| by <= now)
 }
 
+/// What the row says about the allowance, or `None` when it says nothing.
+///
+/// Its own function, and pure, so the whole decision — *whether* to speak, and
+/// what with — is judged without a host, a network or a frame.
+///
+/// `now` is the screen's clock: a countdown is what is left of it now, not what
+/// was left when the host answered. Past it the window has turned over and the
+/// figure is about a window that no longer exists, so the row says nothing
+/// rather than "90%" of an allowance that is back to full.
 pub(crate) fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
