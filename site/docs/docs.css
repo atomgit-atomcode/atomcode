@@ -213,6 +213,7 @@ kbd{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 
   .cp{height:36px;opacity:1}
   .df a{display:inline-flex;align-items:center;min-height:44px}
   .crumb a{display:inline-flex;align-items:center;min-height:44px;min-width:44px}
+  .release-jump summary,.release-issues summary{display:flex;align-items:center;min-height:44px}
 }
 @supports (padding:max(0px)){
   .dh{padding-left:max(var(--dhp,20px),env(safe-area-inset-left));padding-right:max(var(--dhp,20px),env(safe-area-inset-right))}
