@@ -1845,7 +1845,9 @@ pub enum Msg<'a> {
     StopInternalError,
     StopMaxContinuations,
     /// A turn the model ended on its own while the task list it kept still had
-    /// open items: not a failure, and not a finish either.
+    /// open items: not a failure, and not a finish either. Only the fact: it
+    /// stays in the transcript, while whether to say "continue" depends on what
+    /// is still running afterwards — the composer's offer says that, live.
     StopWithOpenItems {
         count: usize,
     },

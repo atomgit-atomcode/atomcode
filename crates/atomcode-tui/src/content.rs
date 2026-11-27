@@ -3734,7 +3734,11 @@ fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Gly
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
         // The model stopped on its own with the list still open: said as a stop,
-        // with the count and what to do about it — never a celebratory verb.
+        // with the count — never a celebratory verb. What to do about it is not
+        // written here: this line stays in the transcript, and a turn that ended
+        // to wait on background work is woken by its result, not by "继续". The
+        // composer offers to continue only when nothing is on its way
+        // (`offer_current_todo`).
         Stopped if open_items > 0 => (
             Glyph::Interrupted,
             t(Msg::StopWithOpenItems { count: open_items }).into_owned(),

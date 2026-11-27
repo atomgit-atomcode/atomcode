@@ -7477,10 +7477,16 @@ impl Tui {
 
         {
             let m = self.host.moment.read().expect("moment poisoned");
+            // Work this conversation started is still running: the turn ended to
+            // wait for it, and its result starts the next turn on its own (the
+            // live line says `等待 N 个…完成`). Telling the person to continue
+            // would have them restart what is already coming.
             if m.suggestion.is_some()
                 || !m.input.is_empty()
                 || m.secret.is_some()
                 || m.autonomy.is_some()
+                || m.working_members() > 0
+                || m.bg.working_for(&m.lead) > 0
             {
                 return false;
             }
@@ -13304,6 +13310,72 @@ mod suggestion_tests {
             viewing: session.into(),
             ..Moment::default()
         })
+    }
+
+    /// A turn that stopped to wait for work it started — a member, a background
+    /// review — is woken by that work's result; the composer does not tell the
+    /// person to continue it.
+    #[test]
+    fn no_offer_to_continue_while_work_this_conversation_started_is_running() {
+        use atomcode_kernel::event::{AgentEvent, StopReason};
+        use atomcode_kernel::session::{Committed, SessionEvent};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        tui.client.follow("lead");
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+            m.members = vec![crate::moment::MemberNow {
+                activity: crate::moment::Activity::Working,
+                session: "lead/reviewer".into(),
+                ..Default::default()
+            }];
+        }
+        let facts = [
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 0,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "todo-1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"add tests","status":"pending"}]}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 0,
+                call_id: "todo-1".into(),
+                content: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        ];
+        for (index, event) in facts.into_iter().enumerate() {
+            tui.on_event(AgentEvent::Fact(Box::new(Committed {
+                session: "lead".into(),
+                seq: index as u64 + 1,
+                at: 0,
+                event,
+            })));
+        }
+        host.moment.write().unwrap().turn_open = true;
+        tui.on_event(AgentEvent::TurnComplete {
+            reason: StopReason::Stopped,
+            turn: Some(1),
+            provider_failure: None,
+        });
+        assert!(host.moment.read().unwrap().suggestion.is_none());
     }
 
     #[test]

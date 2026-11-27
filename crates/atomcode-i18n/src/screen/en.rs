@@ -1228,10 +1228,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "Internal error".into(),
         Msg::StopInvariantViolated => "stopped · an internal invariant was broken; this session should not be carried on".into(),
         Msg::StopMaxContinuations => "stopped · the automatic continuations ran out".into(),
-        Msg::StopWithOpenItems { count } => format!(
-            "stopped · {count} item(s) on the task list are still open — send \"continue\" to pick them up"
-        )
-        .into(),
+        Msg::StopWithOpenItems { count } => {
+            format!("stopped · {count} item(s) on the task list are still open").into()
+        }
         Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
