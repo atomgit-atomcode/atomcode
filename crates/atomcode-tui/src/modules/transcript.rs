@@ -917,9 +917,9 @@ impl Producer for Transcript {
                 // Asked only of a turn the model ended on its own (every other
                 // stop already says it was cut short), that worked the list this
                 // turn, and that did not end on a question to the person — the
-                // same conditions the runtime nudges under, so the line never
-                // tells someone to send "继续" when they owe an answer, or on a
-                // turn about something else.
+                // same conditions the runtime nudges under, so a turn that asked
+                // the person something, or was about something else, closes as
+                // a finish rather than `— 停下`.
                 let open_items = if matches!(stop, atomcode_harness::seams::StopReason::Stopped)
                     && open.touched_plan
                     && !atomcode_capabilities::tools::todo::ends_on_a_question(&open.last_reply)
@@ -2344,19 +2344,19 @@ mod tests {
             })
             .collect();
         assert_eq!(ends.len(), 3, "{ends:?}");
-        assert!(ends[0].contains("还有 2 项没完成"), "{:?}", ends[0]);
+        assert!(ends[0].contains("停下"), "{:?}", ends[0]);
         assert!(!ends[0].contains("Done"), "{:?}", ends[0]);
         // The open stop did not spend a rotation slot: the first clean finish is `Done`.
         assert!(ends[1].contains("Done"), "{:?}", ends[1]);
         assert!(
-            ends[2].contains("还有 2 项没完成"),
+            ends[2].contains("停下"),
             "undo reopens the list: {:?}",
             ends[2]
         );
     }
 
     /// Two stops that leave the list open and are not the model walking away
-    /// from it, so the line does not tell the person to send "继续": a reply
+    /// from it, so the line closes as a finish, not `— 停下`: a reply
     /// that ends on a question (the person owes an answer), and a later turn
     /// that never touched the list (a question about something else, answered).
     /// The same two conditions keep the runtime from nudging those stops.
@@ -2410,7 +2410,7 @@ mod tests {
             .collect();
         assert_eq!(ends.len(), 2, "{ends:?}");
         for end in &ends {
-            assert!(!end.contains("没完成"), "{end:?}");
+            assert!(!end.contains("停下"), "{end:?}");
         }
     }
 

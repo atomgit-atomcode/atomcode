@@ -1165,9 +1165,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "内部错误".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
-        Msg::StopWithOpenItems { count } => {
-            format!("已停下 · 任务清单还有 {count} 项没完成").into()
-        }
         Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
