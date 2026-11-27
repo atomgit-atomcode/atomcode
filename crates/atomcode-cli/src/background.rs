@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_capabilities::session::manager::SessionOrigin;
@@ -32,7 +33,7 @@ use atomcode_host_api::{
     HostError, HostEvent, HostReply, LoggedFact, ProviderUnavailableReason,
 };
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+use atomcode_kernel::session::{InjectionOrigin, LoggedEvent, SessionEvent};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
@@ -433,7 +434,7 @@ pub struct Background {
     /// 事件到达时与 10 秒一次的兜底扫描([`Self::settle_waiting`])都只看它:命中
     /// 一条就标 [`Mark::Home`] 并摘除,
     /// 不再有每条投递一个 10 分钟的全量轮询(issue #1821 #14 / #9)。
-    settling: Mutex<HashMap<String, SettleEntry>>,
+    settling: Mutex<HashMap<String, Arc<SettleEntry>>>,
     /// The sessions stopped because the screen went away, in slot order — what
     /// the launcher prints a `resume` line for after the terminal is back.
     left: Mutex<Vec<String>>,
@@ -443,27 +444,23 @@ pub struct Background {
     exit_front: Mutex<Option<Option<String>>>,
 }
 
-/// 一次「结果已排队、等 home 收下」的投递。
+/// One delivery observed until the receiving session commits its report.
 struct SettleEntry {
     mark: Arc<Mutex<Mark>>,
-    /// 发起它的那段对话的 runtime,用来读它的日志。
     home: Arc<RuntimeControl>,
-    /// 投递前 home 日志的末 seq。只有**之后**的 `Injected{Peer{from}}` 才算这次
-    /// 收下了 —— 同一段对话第二次委派时,第一次的旧注入事实不能把它提前标成
-    /// [`Mark::Home`](issue #1821 #1)。
+    home_id: u64,
+    home_session: String,
+    report: String,
     baseline_seq: u64,
-    /// 上一次检查时 home 日志的末 seq。事件到达时先比这一条:日志没有新事实,就
-    /// 不必从 `baseline_seq` 反向扫一遍(issue #1821 #13)。
-    seen_seq: u64,
-    /// 到这个时刻(unix 毫秒)还没收下就放弃:结果没投进,会话仍该可恢复。
-    deadline: u64,
+    cursor: Mutex<LogCursor>,
+    deadline: tokio::time::Instant,
 }
 
-/// 被丢进 home 的注可能只落日志、不产生事件,所以除了事件到达时的检查,还有一条
-/// 低频兜底:每 10 秒借日志的 `seq` 看一次,不做全量克隆。
-const SETTLE_SWEEP: std::time::Duration = std::time::Duration::from_secs(10);
-/// 一次投递最多等这么久。过了就不再等 —— 没投进去的结果仍在 `/bg` 里。
-const SETTLE_BUDGET_MS: u64 = 10 * 60 * 1000;
+/// The home may have no active subscription. Check its committed log as a fallback.
+const SETTLE_SWEEP: Duration = Duration::from_secs(10);
+const SETTLE_BUDGET: Duration = Duration::from_secs(10 * 60);
+const DELIVERY_RETRY: Duration = Duration::from_millis(500);
+const DELIVERY_TRIES: u32 = 10;
 
 /// [`crate::host::connect`],外加后台会话。
 pub fn connect(
@@ -523,8 +520,8 @@ pub fn connect(
             }
         });
     }
-    // 注可能只落 home 的日志、不产生事件。低频借一次 seq 兜底;平时
-    // `settle_waiting` 在事件到达时就关掉了。
+    // 注可能只落 home 的日志、不产生事件。低频读增量兜底，平时由
+    // `settle_fact` 直接确认已入账的报告。
     {
         let weak = Arc::downgrade(&background);
         tokio::spawn(async move {
@@ -710,9 +707,12 @@ fn in_turn(live: &Live) -> bool {
 }
 
 fn session_log(control: &RuntimeControl) -> Option<Arc<SessionLog>> {
-    let session = control.session_id();
+    session_log_for(control, &control.session_id())
+}
+
+fn session_log_for(control: &RuntimeControl, session: &str) -> Option<Arc<SessionLog>> {
     let app = control.front_end().app()?;
-    Feed::find(&app, &session).map(|agent| agent.session())
+    Feed::find(&app, session).map(|agent| agent.session())
 }
 
 fn read_log<R>(control: &RuntimeControl, read: impl FnOnce(&[LoggedEvent]) -> R) -> R {
@@ -1122,31 +1122,44 @@ fn take_up(mark: &Mutex<Mark>, session: &str) {
     }
 }
 
-/// The result of `session` is in `home`'s log: `home` took the note in, *after*
-/// this delivery began. Facts at or before `baseline_seq` belong to an earlier
-/// delegation of the same session and must not count (issue #1821 #1).
-fn holds_note_from(events: &[LoggedEvent], session: &str, baseline_seq: u64) -> bool {
-    use atomcode_kernel::session::InjectionOrigin;
-    events
-        .iter()
-        .rev()
-        .take_while(|logged| logged.seq > baseline_seq)
-        .any(|logged| {
-            matches!(
-                &logged.event,
-                SessionEvent::Injected {
-                    origin: InjectionOrigin::Peer { from, .. },
+/// Only an external report is evidence of a background delivery.
+fn external_report(event: &SessionEvent) -> Option<(&str, &str)> {
+    match event {
+        SessionEvent::Injected {
+            origin:
+                InjectionOrigin::Peer {
+                    from,
+                    outside: true,
                     ..
-                } if from == session
-            )
-        })
+                },
+            text,
+            ..
+        } => Some((from, text)),
+        _ => None,
+    }
+}
+
+/// A replacement log may contain the same history. Recheck from the original
+/// baseline when that happens, and scan only new facts on the same live log.
+fn report_in_log(
+    log: &Arc<SessionLog>,
+    cursor: &mut LogCursor,
+    baseline_seq: u64,
+    sender: &str,
+    report: &str,
+) -> bool {
+    cursor.read_new(log, |_, events| {
+        let start = events.partition_point(|logged| logged.seq <= baseline_seq);
+        events[start..]
+            .iter()
+            .any(|logged| external_report(&logged.event) == Some((sender, report)))
+    })
 }
 
 /// The result of `session` reached the conversation it worked for: mark it on
 /// disk as that conversation's, not one of the person's own. Only from
 /// [`Mark::Pending`] — one a person took up in the meantime stays theirs.
-fn came_home_now(mark: &Mutex<Mark>, session: &str) {
-    let mut mark = mark.lock().expect("mark poisoned");
+fn came_home_now(mark: &mut Mark, session: &str) {
     let Mark::Pending(dir) = &*mark else {
         return;
     };
@@ -1225,18 +1238,8 @@ impl Background {
 
     /// 一个 runtime 的事件到了。
     fn arrived(&self, id: u64, event: AgentEvent, changed: bool) {
-        // 结果被 home 收下这件事,通常伴随 home 的一条事件(回合开始、被接受、
-        // 上下文加入、回合结束)。借这一刻把注册表里等待的那几条关掉;真正只落日志
-        // 的那种由 10 秒兜底扫描接住。
-        if matches!(
-            &event,
-            AgentEvent::TurnStarted { .. }
-                | AgentEvent::TurnComplete { .. }
-                | AgentEvent::Accepted { .. }
-                | AgentEvent::ContextAdded { .. }
-                | AgentEvent::Fact(_)
-        ) {
-            self.settle_waiting();
+        if let AgentEvent::Fact(fact) = &event {
+            self.settle_fact(id, fact);
         }
         // 替别的会话干活的那个,干完了把结果投回去 —— 内容落在发起它的那段对话里。
         // 这是"结果回来了"在那段对话里的形状。**只投内容**:要不要接着逐条核实,是那段
@@ -1307,172 +1310,172 @@ impl Background {
                     .iter()
                     .find(|slot| slot.control.session_id() == origin)
             };
-            live.map(|live| live.control.clone())
+            live.map(|live| (live.id, live.control.clone()))
         };
-        let Some(home) = handle else { return };
-        // 投递前 home 日志的末 seq:只有它之后的事实才算这一次收下了。同一段对话
-        // 第二次委派时,第一次的旧注入事实不能把它提前标成 `Mark::Home`(#1)。
-        //
-        // 日志此刻读不到(App 正在重建、`Feed` 还没找到这个会话)就**不登记**:下界
-        // 退化成 0 会把整份 home 日志放进匹配范围,上一次委派留下的旧注入事实会被
-        // 算作这次「收下了」,会话随即被隐藏。宁可在退出/恢复里多留一条,也不把没
-        // 确认收下的结果标成 `Mark::Home`。
-        match session_log(&home).map(|log| log.last_seq()) {
-            Some(baseline_seq) => {
-                if matches!(*mark.lock().expect("mark poisoned"), Mark::Pending(_)) {
-                    let mut settling = self.settling.lock().expect("settling poisoned");
-                    settling.insert(
-                        sender.clone(),
-                        SettleEntry {
-                            mark: mark.clone(),
-                            home: home.clone(),
-                            baseline_seq,
-                            seen_seq: baseline_seq,
-                            deadline: now_ms().saturating_add(SETTLE_BUDGET_MS),
-                        },
-                    );
-                }
-            }
-            None => tracing::debug!(
-                origin = %origin,
-                from = %sender,
-                "home log unreadable at delivery: not watching for a settle"
-            ),
-        }
-        let handle = home.runtime().clone();
+        let Some((home_id, home)) = handle else {
+            return;
+        };
         let me = self.me.clone();
         tokio::spawn(async move {
-            // 一条注,不是一次用户提交:日志里说话的是那个后台会话,不是人。屏上的内容
-            // 一字不少 —— 变的只是**谁说的**。
-            //
-            // `Busy` 是那段对话正在收尾一次取消或一次策略介入,过一会儿就收得下:等一等
-            // 再投,而不是把结果扔了。别的拒绝(runtime 没了、换了代)不重试 —— 那时
-            // 这个 handle 背后未必还是发起它的那段对话;结果仍在 /bg 面板里。
-            // 选中接收方以后仍可能切会话;由 runtime owner 在投递时再核对原会话。
-            const TRIES: u32 = 10;
-            let mut delivered = false;
-            for attempt in 1..=TRIES {
-                match handle
+            let mut entry = None;
+            for attempt in 1..=DELIVERY_TRIES {
+                let Some(background) = me.upgrade() else {
+                    return;
+                };
+                if home.session_id() != origin || home.runtime().is_stopped() {
+                    break;
+                }
+
+                // Capture the baseline before sending. If the home is rebuilding,
+                // retry both together so an accepted report always has a watch.
+                let candidate = if entry.is_none() {
+                    let Some(log) = session_log_for(&home, &origin) else {
+                        if attempt < DELIVERY_TRIES {
+                            drop(background);
+                            tokio::time::sleep(DELIVERY_RETRY).await;
+                        }
+                        continue;
+                    };
+                    let baseline_seq = log.last_seq();
+                    Some(Arc::new(SettleEntry {
+                        mark: mark.clone(),
+                        home: home.clone(),
+                        home_id,
+                        home_session: origin.clone(),
+                        report: frame.clone(),
+                        baseline_seq,
+                        cursor: Mutex::new(LogCursor {
+                            log: Arc::downgrade(&log),
+                            seen: baseline_seq,
+                        }),
+                        deadline: tokio::time::Instant::now() + SETTLE_BUDGET,
+                    }))
+                } else {
+                    None
+                };
+                {
+                    let state = background.state.lock().expect("background poisoned");
+                    if !state.slots.iter().any(|slot| slot.id == id) {
+                        // The job was removed or taken to the foreground while
+                        // the receiver was busy. Do not start another delivery.
+                        break;
+                    }
+                    if let Some(candidate) = candidate {
+                        let mark = mark.lock().expect("mark poisoned");
+                        if matches!(*mark, Mark::Pending(_)) {
+                            background
+                                .settling
+                                .lock()
+                                .expect("settling poisoned")
+                                .insert(sender.clone(), candidate.clone());
+                        }
+                        entry = Some(candidate);
+                    }
+                }
+                drop(background);
+
+                match home
+                    .runtime()
                     .note_to_session(origin.clone(), sender.clone(), frame.clone())
                     .await
                 {
                     Ok(_) => {
-                        delivered = true;
-                        break;
+                        if let (Some(background), Some(entry)) = (me.upgrade(), &entry) {
+                            background.settle_sender(&sender, entry);
+                        }
+                        return;
                     }
-                    Err(atomcode_coding::RuntimeError::Busy) if attempt < TRIES => {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Err(atomcode_coding::RuntimeError::Busy) if attempt < DELIVERY_TRIES => {
+                        tokio::time::sleep(DELIVERY_RETRY).await;
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            origin = %origin,
-                            from = %sender,
-                            %error,
-                            "background result not delivered to the conversation that started it; it is still in /bg"
-                        );
+                        tracing::warn!(origin = %origin, from = %sender, %error,
+                            "background result not delivered; it is still in /bg");
                         break;
                     }
                 }
             }
-            let Some(background) = me.upgrade() else {
-                return;
-            };
-            if !delivered {
-                // 重试耗尽:什么都没进 home,不再等。
-                background.remove_settle(&sender);
-                return;
+            if let (Some(background), Some(entry)) = (me.upgrade(), entry) {
+                background.finish_settle(&sender, &entry, false);
+            } else {
+                tracing::debug!(origin = %origin, from = %sender,
+                    "background result delivery stopped before queueing; it is still in /bg");
             }
-            // 排上队不等于收下了:home 正忙时这是一次 steer。事件到达与兜底扫描会
-            // 在它真进了日志之后再标;这里先看一眼,免得事件在登记前就到了。
-            background.settle_sender(&sender);
         });
     }
 
-    /// Settle, before the exit reads them, the background sessions whose result
-    /// was taken in by the conversation they worked for but not yet marked.
-    ///
-    /// 用的是每次投递自己的 baseline:没有登记的(结果根本没排上队)不在这里结算。
-    fn settle_before_exit(&self) {
-        let senders: Vec<String> = {
-            let settling = self.settling.lock().expect("settling poisoned");
-            settling.keys().cloned().collect()
-        };
-        for sender in senders {
-            self.settle_sender(&sender);
-        }
-    }
-
-    /// 把注册表里等待的那几条检查一遍。
-    ///
-    /// 两个触发点共用这一个函数体:home 的一条事件到了([`Self::arrived`]),或 10 秒
-    /// 一次的兜底扫描。检查本身只看 `seen_seq` 之后的新事实,所以多问几次不贵 ——
-    /// 而少问一次就可能漏掉只落日志、不产生事件的注(issue #1821 #14)。
-    fn settle_waiting(&self) {
-        let senders: Vec<String> = {
-            let settling = self.settling.lock().expect("settling poisoned");
-            if settling.is_empty() {
-                return;
-            }
-            settling.keys().cloned().collect()
-        };
-        for sender in senders {
-            self.settle_sender(&sender);
-        }
-    }
-
-    /// 一条投递现在收下了没有。收下 → 标 [`Mark::Home`] 并摘除;home 没了或预算
-    /// 耗尽 → 摘除,结果仍可恢复。
-    fn settle_sender(&self, sender: &str) {
-        let (mark, home, baseline_seq, seen_seq) = {
-            let mut settling = self.settling.lock().expect("settling poisoned");
-            let Some(entry) = settling.get(sender) else {
-                return;
-            };
-            if now_ms() >= entry.deadline {
-                settling.remove(sender);
-                return;
-            }
-            (
-                entry.mark.clone(),
-                entry.home.clone(),
-                entry.baseline_seq,
-                entry.seen_seq,
-            )
-        };
-        let Some(log) = session_log(&home) else {
-            // A retired home cannot add another fact: stop watching, leave the result
-            // recoverable rather than marking an undelivered one as received.
-            if home.runtime().is_stopped() || home.front_end().app().is_none() {
-                self.remove_settle(sender);
-            }
+    fn settle_fact(&self, home_id: u64, fact: &atomcode_kernel::session::Committed) {
+        let Some((sender, report)) = external_report(&fact.event) else {
             return;
         };
-        let last = log.last_seq();
-        // 日志没有新事实就不必反向扫:事件到达时每条登记项只是比一次 seq,与等待的
-        // 条数和日志长度都无关(issue #1821 #13)。
-        if last > seen_seq
-            && log.read_events(|events| holds_note_from(events, sender, baseline_seq))
-        {
-            came_home_now(&mark, sender);
-            self.remove_settle(sender);
-            return;
-        }
-        if let Some(entry) = self
+        let entry = self
             .settling
             .lock()
             .expect("settling poisoned")
-            .get_mut(sender)
-        {
-            entry.seen_seq = entry.seen_seq.max(last);
-        }
-        // 退役的 home 不会再添事实:停止观察,结果仍可恢复。
-        if home.runtime().is_stopped() {
-            self.remove_settle(sender);
+            .get(sender)
+            .cloned();
+        if let Some(entry) = entry {
+            if entry.home_id == home_id
+                && entry.home_session == fact.session
+                && fact.seq > entry.baseline_seq
+                && report == entry.report
+            {
+                self.finish_settle(sender, &entry, true);
+            }
         }
     }
 
-    /// Drop a watch. Every give-up path goes through here: stopped home, exhausted
-    /// budget, exhausted delivery retries, delivery error, take-up, drop.
+    /// Check pending reports periodically and once more before exit.
+    fn settle_waiting(&self) {
+        let waiting: Vec<_> = self
+            .settling
+            .lock()
+            .expect("settling poisoned")
+            .iter()
+            .map(|(sender, entry)| (sender.clone(), entry.clone()))
+            .collect();
+        for (sender, entry) in waiting {
+            self.settle_sender(&sender, &entry);
+        }
+    }
+
+    fn settle_sender(&self, sender: &str, entry: &Arc<SettleEntry>) {
+        if tokio::time::Instant::now() >= entry.deadline
+            || entry.home.session_id() != entry.home_session
+        {
+            self.finish_settle(sender, entry, false);
+            return;
+        }
+        let received = session_log_for(&entry.home, &entry.home_session).is_some_and(|log| {
+            let mut cursor = entry.cursor.lock().expect("settle cursor poisoned");
+            report_in_log(&log, &mut cursor, entry.baseline_seq, sender, &entry.report)
+        });
+        if received {
+            self.finish_settle(sender, entry, true);
+            return;
+        }
+        if entry.home.runtime().is_stopped() {
+            self.finish_settle(sender, entry, false);
+        }
+    }
+
+    fn finish_settle(&self, sender: &str, entry: &Arc<SettleEntry>, received: bool) {
+        // Same order as registration. An old delivery cannot mark a newer
+        // watch as settled, and a person taking over owns the final mark.
+        let mut mark = entry.mark.lock().expect("mark poisoned");
+        let removed = {
+            let mut waiting = self.settling.lock().expect("settling poisoned");
+            waiting
+                .get(sender)
+                .is_some_and(|current| Arc::ptr_eq(current, entry))
+                && waiting.remove(sender).is_some()
+        };
+        if received && removed && tokio::time::Instant::now() < entry.deadline {
+            came_home_now(&mut mark, sender);
+        }
+    }
+
+    /// Stop watching after a person takes over or drops the background job.
     fn remove_settle(&self, sender: &str) {
         self.settling
             .lock()
@@ -1650,7 +1653,7 @@ impl Background {
                 // Which session is in front, read **before** the stop goes out:
                 // after it the App is gone and its log with it.
                 self.record_exit_front();
-                self.settle_before_exit();
+                self.settle_waiting();
                 let front = self.front_commands();
                 let _ = front.send(command);
                 if let Some(me) = self.me.upgrade() {
@@ -1679,7 +1682,7 @@ impl Background {
         // A screen that closed without saying so never sent the stop; the
         // front is still up, so it can still be read here.
         self.record_exit_front();
-        self.settle_before_exit();
+        self.settle_waiting();
         let slots = std::mem::take(&mut self.state.lock().expect("background poisoned").slots);
         // Work done for another conversation whose result is there leaves
         // nothing to come back to (and is not offered in /resume); one still
@@ -3187,29 +3190,45 @@ mod tests {
 
     /// #1: 同一段对话第二次委派时,第一次留下的注入事实不能算作第二次「收下了」。
     #[test]
-    fn a_home_note_counts_only_after_this_deliverys_baseline() {
-        use atomcode_kernel::session::InjectionOrigin;
-        let note = |seq, from: &str| LoggedEvent {
-            seq,
-            at: 0,
-            event: SessionEvent::Injected {
-                turn: 1,
-                text: "done".into(),
-                origin: InjectionOrigin::Peer {
-                    from: from.into(),
-                    source_turn: None,
-                    outside: true,
-                },
+    fn settlement_matches_only_this_report_and_advances_its_log_cursor() {
+        let note = |from: &str, text: &str, outside| SessionEvent::Injected {
+            turn: 1,
+            text: text.into(),
+            origin: InjectionOrigin::Peer {
+                from: from.into(),
+                source_turn: None,
+                outside,
             },
         };
-        // 第一次投递留下的事实不能算作第二次「收下了」:baseline 就是它。
-        let first = vec![note(3, "review-a")];
-        assert!(!holds_note_from(&first, "review-a", 3));
-        // 第二次投递之后新增的那条才成立;再往后看又不再算这一条。
-        let both = vec![note(3, "review-a"), note(9, "review-a"), note(10, "other")];
-        assert!(holds_note_from(&both, "review-a", 3));
-        assert!(!holds_note_from(&both, "review-a", 9));
-        assert!(!holds_note_from(&both, "review-b", 0));
+        let home = stamped_log("home");
+        home.append(note("review-a", "same report", true));
+        let baseline = home.last_seq();
+        let mut cursor = LogCursor::default();
+        let check = |log: &Arc<SessionLog>, cursor: &mut LogCursor| {
+            report_in_log(log, cursor, baseline, "review-a", "same report")
+        };
+        assert!(!check(&home, &mut cursor), "a previous delivery");
+        for fact in [
+            note("review-a", "different report", true),
+            note("review-b", "same report", true),
+            note("review-a", "same report", false),
+        ] {
+            home.append(fact);
+        }
+        assert!(!check(&home, &mut cursor));
+        assert_eq!(cursor.seen, home.last_seq());
+
+        home.append(note("review-a", "same report", true));
+        assert!(check(&home, &mut cursor));
+        assert!(!check(&home, &mut cursor), "do not rescan checked facts");
+
+        let rebuilt = stamped_log("home");
+        rebuilt.append(note("review-a", "same report", true));
+        rebuilt.append(note("review-a", "same report", true));
+        assert!(
+            check(&rebuilt, &mut cursor),
+            "read past the original baseline after rebuild"
+        );
     }
 
     /// #12: 全量 seed 与逐条增量必须得出同一份投影。
