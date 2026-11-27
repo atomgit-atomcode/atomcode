@@ -24,6 +24,33 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.9 (2026-11-26)
+
+### Overview
+
+This release is about teamwork, long-session stability and everyday controls. Team members can hand work over to each other under an explicit authorization instead of routing everything through the lead; members can opt into request budgets and task cost accounting. Sessions gain cross-project browsing and resume, previews and cleanup of old sessions, and a write guard — an existing file the session never touched is no longer overwritten. The review text from before a compaction can be expanded again.
+
+The terminal and the web page were reworked together: `/provider` is now a list → detail pair, and the WebUI Git panel follows the VSCode source-control layout with read-only access to team members' conversations. On the security side, failed local API authentication is rate-limited and token comparison is constant-time. On the performance side, streamed replies are appended in place and rendered incrementally, session history and event logs are read incrementally, and file-index filtering no longer lowercases every entry.
+
+### Changes
+
+- **Authorized handovers between team members**: Members can hand tasks and conclusions directly to each other under an authorization instead of routing everything through the lead. `tell_parent` requires the delivered content to actually reach the report, a read-only member is told at once how to deliver, a member that stops after a progress report wakes the lead, and a member reporting completion reminds the lead to check it before stopping it. Members can opt into request budgets and task cost accounting, roles can look up read-only MCP tools by duty and verify the results, and delivery checks distinguish members with and without a shell.
+- **Write guard for files**: `write_file` no longer overwrites an existing file this session never touched. Loop detection counts per session, compaction and overflow guards compute the window from the current agent's model, repeated retries of malformed tool calls are bounded, long-thinking models lose fewer useless rounds and share one streaming timeout.
+- **Browse and resume sessions across projects**: The TUI can browse and resume sessions across working directories and preview and clean up old sessions. `/agents` lists one-shot task sub-agents, with the header carrying a sub-agent label. Background tasks read the session event log incrementally, history loading is faster and merges session preview requests, and the session start notice is de-duplicated while the SSE stream is consumed.
+- **Review text from before a compaction**: Recall can expand the review text from before a compaction; team member sessions can be compacted too, and a delegation kept after a member's compaction is marked as a historical message; compaction discloses the user requirements dropped in favor of an alternative.
+- **`/provider` is now a list → detail pair**: Enter / Ctrl+E / Ctrl+D behave the same throughout, forms use fixed key meanings and drop `^o` / `^f` and the Key field; the detail page offers "add and use" when no model is available, and the qualification is single and can be explicitly withdrawn.
+- **WebUI source control follows VSCode**: The Git panel follows the VSCode source-control layout, with the discard and commit scope, read-only rendering and empty-repository loading fixed; a session goal status bar with live timing was added, team members' conversations can be viewed read-only, the attachment menu is no longer cut off on small screens, and larger images can be pasted in live chat.
+- **Local API authentication hardened and rate-limited**: Failed local API requests are rate-limited by count, valid tokens stay usable during a block, token comparison is constant-time, Windows sets and verifies a user-only ACL for credential files, and panic telemetry is scrubbed while WebUI SSE events are size-limited.
+- **Streamed replies append in place**: The TUI no longer copies the whole reply for every delta — it appends in place and renders incrementally, and buffered deltas survive a view switch. Unchanged render rows are reused, but only after the amended text is checked; generation speed excludes burst frames so the number is no longer inflated.
+- **file-index filtering is faster**: Filtering no longer lowercases every entry and keeps only the top 30 — the selection is bounded and totally ordered, non-ASCII needles reuse one lowercase buffer, ASCII needles skip folding, and candidate clones and comparisons are bounded.
+- **Terminal interaction fixes**: The `@` mention menu no longer pops up again after Esc, rejected tokens are identified by offset and text, the browse state keeps the rejection record, editing and cursor tracking are correct, a late receipt no longer closes the strength selector, Esc during a turn no longer discards the background-task completion notice, short screens no longer trade the command line for the panel's footer, narrow screens drop the timer before the badge state, the approval panel keeps a separating line between legend and status bar, and approvals on routes with no answer are hidden.
+- **The `/goal` badge shows its running time**: It counts up while running and freezes when paused, using only its own samples. The status bar shows the current member's worktree branch, and the footer reminder is rechecked immediately after a quota recovery.
+- **Captured process output is bounded**: Captured process output has a cap, truncated foreground output keeps its encoding, and the TUI live cache is capped as well.
+- **AI inline completion (ghost text)**: The editor extension and the daemon side support AI inline completion, expired completion requests are cancelled and the originally inserted text is preserved.
+- **VS Code chat focus recovery**: Alt+Tab back restores the chat input focus and intercepts a lone Alt, with the focus-recovery condition tightened.
+- **Session and runtime consistency**: The running state is synchronized and history loading blocks less; repeated tool checks are fewer and tasks end in time; background reviews keep their single-execution limit, and the peak whole-document copy in long-session requests and subscription catch-up is reduced.
+- **Site and docs rework**: The bilingual changelog is shown with unified branding, the footer wordmark becomes a permanently lit "fluorescent horizon"; the site and the docs pages were visually reworked, and the mobile installation experience improved with the docs calibrated.
+
 ## v5.2.8 (2026-11-20)
 
 ### Overview
