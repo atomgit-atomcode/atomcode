@@ -3403,29 +3403,72 @@ async fn a_shell_less_member_hands_unverified_edits_to_the_lead_in_its_report() 
     }
 }
 
+/// Set on the child that [`docs_mcp_server`] runs in.
+const DOCS_MCP_SERVER: &str = "ATOMCODE_TEST_DOCS_MCP_SERVER";
+
+/// A stdio MCP server with one read-only `search_docs` tool, for the tests
+/// that need a real transport. It is this test binary run again with
+/// `--exact docs_mcp_server` and [`DOCS_MCP_SERVER`] set — so it runs on every
+/// platform the suite does, where the `sh` script it replaces left Windows
+/// with no check of the member-query path at all. In an ordinary run the
+/// variable is unset and it returns at once. Lines the test harness prints
+/// around it are not JSON, and the client skips them.
+#[test]
+fn docs_mcp_server() {
+    use std::io::{BufRead, Write};
+    if std::env::var_os(DOCS_MCP_SERVER).is_none() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let result = match request["method"].as_str() {
+            Some("initialize") => serde_json::json!({"protocolVersion":"2025-11-05",
+                "capabilities":{"tools":{}},"serverInfo":{"name":"docs","version":"1"}}),
+            Some("tools/list") => serde_json::json!({"tools":[{"name":"search_docs",
+                "inputSchema":{"type":"object","properties":{"query":{"type":"string"}}},
+                "annotations":{"readOnlyHint":true}}]}),
+            Some("tools/call") => {
+                serde_json::json!({"content":[{"type":"text","text":"contract from docs"}]})
+            }
+            _ => serde_json::json!({}),
+        };
+        let reply = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
+        if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+            break;
+        }
+    }
+    // Not back into the harness: its summary would follow on a closed pipe.
+    std::process::exit(0);
+}
+
+/// The `mcpServers` entry that starts [`docs_mcp_server`].
+fn docs_mcp_entry() -> serde_json::Value {
+    let exe = std::env::current_exe().unwrap();
+    serde_json::json!({
+        "command": exe,
+        "args": ["--exact", "docs_mcp_server", "--nocapture", "--test-threads", "1"],
+        "env": {DOCS_MCP_SERVER: "1"},
+    })
+}
+
 /// A real MCP transport and member turn. The lead can reopen an immutable
 /// result from a fresh runtime without sending the original query again.
-#[cfg(unix)]
 #[tokio::test]
 async fn team_query_evidence_survives_resume() {
     use serde_json::json;
     let dir = scratch("team-evidence");
     let home = scratch("team-evidence-user");
     let sessions = scratch("team-evidence-sessions");
-    let server = home.join("server.sh");
-    std::fs::write(&server, r#"while IFS= read -r line; do
-id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-case "$line" in
-*'"method":"initialize"'*) result='{"protocolVersion":"2025-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"docs","version":"1"}}';;
-*'"method":"tools/list"'*) result='{"tools":[{"name":"search_docs","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}},"annotations":{"readOnlyHint":true}}]}';;
-*'"method":"tools/call"'*) result='{"content":[{"type":"text","text":"contract from docs"}]}';;
-*'"id":'*) result='{}';;
-*) continue;;
-esac
-printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
-done"#).unwrap();
-    let config = json!({"mcpServers":{"docs":{"command":"sh","args":[server],
-        "teamReadOnlyTools":{"research":["search_docs"]}}}});
+    let mut docs = docs_mcp_entry();
+    docs["teamReadOnlyTools"] = json!({"research":["search_docs"]});
+    let config = json!({"mcpServers":{"docs":docs}});
     std::fs::write(home.join("mcp.json"), config.to_string()).unwrap();
     let role = "---\npermission: explore\ndifficulty: simple\ntools: mcp__docs__search_docs\n---\nLook up the contract.";
     write_role(&dir, "research",
