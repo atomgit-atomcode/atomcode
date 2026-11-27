@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -5611,16 +5611,17 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
-    let mut file = file;
-    // Windows: `access_mode` above replaces the `FILE_APPEND_DATA` that
-    // `append(true)` maps to, so the handle's cursor starts at 0 and a plain
-    // write overwrites the head of the log instead of appending. Seek to the
-    // end so the name and the semantics agree on every caller — including
-    // test constructors of torn tails. (Writes that need a different position
-    // seek first, and Unix `O_APPEND` ignores the cursor for writes anyway.)
     #[cfg(windows)]
-    file.seek(SeekFrom::End(0))
-        .map_err(|error| io_at(path, error))?;
+    let file = {
+        use std::io::{Seek, SeekFrom};
+
+        // The access mode above replaces FILE_APPEND_DATA. Position the
+        // cursor at the end so the first write appends instead of overwriting.
+        let mut file = file;
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| io_at(path, error))?;
+        file
+    };
     Ok(file)
 }
 
