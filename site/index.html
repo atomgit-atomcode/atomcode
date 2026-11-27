@@ -317,6 +317,7 @@ section{position:relative;padding:150px var(--pad) 0}
 .iso-b .iso-lab{justify-content:flex-end;text-align:right}
 .iso-lab .cellm{position:relative;display:grid;place-items:center;width:52px;height:52px;border-radius:9px;border:1px solid var(--line3);font:700 20px var(--mono);color:var(--ink)}
 .iso-a .cellm{border-color:rgba(var(--accent-rgb),.55);color:var(--ph);box-shadow:0 0 24px rgba(var(--accent-rgb),.2)}
+.iso-lab .cellm img{width:30px;height:30px;object-fit:contain}
 .iso-lab .cellm sup{position:absolute;left:4px;top:2px;font:8px var(--mono);color:var(--fg3)}
 .iso-lab b{display:block;font:600 17px var(--sans);color:var(--ink)}
 .iso-lab span{font:11.5px var(--mono);color:var(--fg3)}
@@ -426,7 +427,7 @@ section{position:relative;padding:150px var(--pad) 0}
 .ide-car::after{content:"";position:absolute;left:0;top:50%;width:260px;height:110px;transform:translateY(-50%);mix-blend-mode:screen;background:radial-gradient(ellipse 100% 70% at 0 50%,rgba(var(--accent-rgb),.28),transparent 72%);clip-path:polygon(0 45%,100% 0,100% 100%,0 55%);filter:blur(3px)}
 .ide-gh{background:linear-gradient(90deg,#f6ffd9,var(--ph) 30%,rgba(var(--accent-rgb),.25));-webkit-background-clip:text;background-clip:text;color:transparent}
 .ide-side{display:flex;flex-direction:column;gap:7px;padding:12px 8px;border:1px solid var(--line);border-bottom:0;background:var(--bg)}
-.mini2{display:grid;place-items:center;width:24px;height:24px;border-radius:5px;border:1px solid rgba(var(--accent-rgb),.5);font:700 10px var(--mono);color:var(--ph)}
+.mini2{width:22px;height:22px;object-fit:contain}
 .ide-side p{height:14px;border-radius:4px;background:var(--bg3)}.ide-side p.me{background:rgba(var(--accent-rgb),.18);margin-left:25%}
 .sync{display:flex;align-items:center;gap:12px;max-width:1360px;margin:18px auto 0;font-size:13.5px;color:var(--fg3)}
 .sync i{flex:none;width:8px;height:8px;border-radius:50%;background:var(--ph);box-shadow:0 0 0 4px rgba(var(--accent-rgb),.12),0 0 12px var(--ph);animation:breathe 2.4s ease-in-out infinite}
@@ -542,7 +543,7 @@ footer nav a:hover{color:var(--ph)}
   .stage{max-width:380px}
   .syn{grid-template-columns:minmax(0,1fr);grid-template-areas:"controls" "route"}
 }
-@media (max-width:760px){
+@media (max-width:760px),(max-height:500px) and (orientation:landscape){
   :root{--fr:0px;--pad:clamp(16px,5vw,32px);--mobile-nav:calc(60px + env(safe-area-inset-top))}
   html{scroll-padding-top:calc(var(--mobile-nav) + 12px);scroll-padding-bottom:24px}
   .frame,.hud-bl,.hud-br,.hud-tr .kb{display:none}
@@ -645,7 +646,35 @@ footer nav a:hover{color:var(--ph)}
   .hud-primary .site-mark{width:20px;height:20px}
   .flask-f .btn{width:100%}
 }
-@media (max-height:760px) and (min-width:761px){.st p{display:none}.st-term{min-height:120px}.energy{height:90px}.rx-sticky{gap:18px}}
+@media (max-height:760px) and (min-height:501px) and (min-width:761px){.st p{display:none}.st-term{min-height:120px}.energy{height:90px}.rx-sticky{gap:18px}}
+
+/* ==================== 横屏手机 / 触屏补充适配 ==================== */
+/* 横屏矮屏：首屏元素卡缩小居中 */
+@media (max-height:500px) and (orientation:landscape){
+  .stage{max-width:420px;margin:0 auto}
+}
+/* 横屏刘海：内容左右避开 safe-area */
+@media (max-height:500px) and (orientation:landscape){
+  :root{--pad:max(clamp(16px,5vw,32px),calc(env(safe-area-inset-left) + 16px),calc(env(safe-area-inset-right) + 16px))}
+}
+/* 触屏：所有可点元素 ≥44px（按指针类型判断，平板横屏同样生效） */
+@media (pointer:coarse){
+  .pill{height:44px}
+  .menu-btn{width:44px}
+  .hud-tr .pill{min-width:44px;justify-content:center}
+  .menu a,.rail-ft a,.rail .brand{min-height:44px}
+  .btn.sm,.split .caret,.mini-ins .tabs button,.mini-ins .cp,.tasks button,.legend button,.flask-h button,.rx-steps button{min-height:44px}
+  .split .caret{min-width:44px}
+  .rx-ctl button{width:44px;height:44px}
+  .lnk,footer nav a{display:inline-flex;align-items:center;min-height:44px}
+  footer nav a{min-width:44px;justify-content:center}
+  footer nav{gap:0 12px}
+}
+/* 手机：功能性小字不低于 11px（封面里的示意代码保持原样） */
+@media (max-width:760px),(max-height:500px) and (orientation:landscape){
+  .e-c small,.det-card .k,.cell .k,.op small{font-size:11px}
+  .chip{font-size:11px}
+}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
@@ -818,7 +847,7 @@ footer nav a:hover{color:var(--ph)}
 <i>14</i>    session::<span class="f">set_cookie</span>(&amp;user, <span class="s">"/auth"</span>)<b class="ide-car"></b><span class="ide-gh" data-i="u.gh">;  // Ac: 前缀已修复 ✓</span>
 <i>15</i>    <span class="t">Response</span>::<span class="f">redirect</span>(<span class="s">"/"</span>)
 <i>16</i>}</pre>
-        <div class="ide-side"><span class="mini2">Ac</span><p></p><p class="me"></p><p></p></div>
+        <div class="ide-side"><img class="mini2" src="assets/atomgit-mark.svg" alt=""><p></p><p class="me"></p><p></p></div>
       </div>
       <div class="sf-b">
         <div class="sf-hd"><span class="sf-z">Ij</span><h3 data-i="u.n4">IDE 插件</h3><em>VS Code · JetBrains</em></div>
@@ -895,7 +924,7 @@ footer nav a:hover{color:var(--ph)}
     <div class="tasks" id="tasks"></div>
     <div class="iso" id="isoBox">
       <div class="iso-l iso-a">
-        <div class="iso-lab"><span class="cellm"><sup>21</sup>Ac</span><div><b>AtomCode</b><span data-i="i.a">小步快跑 · 每步验证</span></div></div>
+        <div class="iso-lab"><span class="cellm"><img src="assets/atomgit-mark.svg" alt=""></span><div><b>AtomCode</b><span data-i="i.a">小步快跑 · 每步验证</span></div></div>
         <div class="blocks" id="blkA"></div>
         <div class="iso-ax"><span>t₀</span><span data-i="i.t">时间 →</span></div>
       </div>
@@ -1000,7 +1029,7 @@ footer nav a:hover{color:var(--ph)}
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
 const fine=matchMedia('(hover:hover) and (pointer:fine)').matches;
-const narrow=()=>innerWidth<=760;
+const narrow=()=>innerWidth<=760||(innerHeight<=500&&innerWidth>innerHeight);
 const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const smooth=()=>reduce?'auto':'smooth';
