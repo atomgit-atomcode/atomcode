@@ -96,6 +96,12 @@ pub async fn handle_list_sessions(
             // Background work done for another conversation, not one of its own.
             continue;
         }
+        if entry.message_count == 0 {
+            // Opened and closed with nothing said: nothing to go back to, and
+            // with no title it is a row of bare ids — the screen's `/resume`
+            // leaves these out too. A live one is listed above from the table.
+            continue;
+        }
         let title = (!entry.name.is_empty()
             && !SessionMeta::name_needs_fallback(&entry.name, &entry.id))
         .then_some(entry.name);
@@ -336,6 +342,31 @@ mod tests {
         // The live entry picks up the catalog title.
         assert_eq!(resp.sessions[0].title.as_deref(), Some("Live titled"));
         assert_eq!(resp.sessions[1].title.as_deref(), Some("Closed session"));
+    }
+
+    /// A closed session nothing was said in is not history to resume; a live
+    /// one that has said nothing yet is still listed.
+    #[tokio::test]
+    async fn list_leaves_out_closed_sessions_with_no_messages() {
+        let sessions = sessions_with(vec![("acp-1", "/a")]);
+        let empty = |id: &str| CatalogEntry {
+            message_count: 0,
+            turn_count: 0,
+            ..catalog_entry(id, &format!("session-{id}"), "/a")
+        };
+        let scan = CatalogScan {
+            entries: vec![empty("1"), empty("2"), catalog_entry("3", "Talked", "/a")],
+            diagnostics: Vec::new(),
+        };
+        let resp = handle_list_sessions(&sessions, &ListSessionsRequest::new(), &scan)
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp
+            .sessions
+            .iter()
+            .map(|s| s.session_id.0.to_string())
+            .collect();
+        assert_eq!(ids, vec!["acp-1", "acp-3"]);
     }
 
     #[tokio::test]

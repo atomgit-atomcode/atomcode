@@ -662,7 +662,8 @@ pub(crate) mod test_support {
     }
 
     /// A native catalog entry for a session `id` (same shape the
-    /// `SessionManager` catalog scan produces), used by the list/delete tests.
+    /// `SessionManager` catalog scan produces), used by the list/delete tests:
+    /// a closed session with something in it.
     pub(crate) fn catalog_entry(id: &str, name: &str, cwd: &str) -> CatalogEntry {
         CatalogEntry {
             id: id.to_string(),
@@ -672,8 +673,8 @@ pub(crate) mod test_support {
             working_dir: std::path::PathBuf::from(cwd),
             created_at_ms: 0,
             updated_at_ms: 0,
-            message_count: 0,
-            turn_count: 0,
+            message_count: 2,
+            turn_count: 1,
             presence: CatalogPresence::NativeOnly,
             needs_newer_version: false,
             origin: Default::default(),

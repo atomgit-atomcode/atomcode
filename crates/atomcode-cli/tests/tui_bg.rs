@@ -2046,17 +2046,20 @@ async fn resume_tab_browses_other_projects_before_enter_switches_the_runtime() {
     let rig = Rig::new().await;
     let (project, target) = a_foreign_project_session().await;
     let live = rig.client.root();
+    // Its name is the untouched placeholder, so the picker row reads its first
+    // prompt, not `session-<id>`.
+    let row = "FOREIGN PROJECT HISTORY";
     rig.term.type_line("/resume");
     rig.until_screen("Tab").await;
-    assert!(!rig.term.text().contains(target));
+    assert!(!rig.term.text().contains(row));
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen(target).await;
+    rig.until_screen(row).await;
     assert_eq!(rig.client.root(), live);
 
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen_lacks(target).await;
+    rig.until_screen_lacks(row).await;
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen(target).await;
+    rig.until_screen(row).await;
     rig.term.press(KeyPress::plain(Key::Enter));
     rig.until("the global selection is foreground", |rig| {
         rig.client.root() == target
