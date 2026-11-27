@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -5596,16 +5596,14 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
     // transcript append below would fail with ERROR_ACCESS_DENIED (os error 5).
     // Note: `write(true)` is IGNORED when `append(true)` is set (Rust std), so
-    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
-    // semantics are unchanged.
+    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here.
     options.create(true).append(true).read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
         // the end of the file but cannot truncate it; cutting off a torn tail
-        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
-        // by the append flag, so writes keep landing at the end of the file.
+        // (`set_len`) needs write access as well.
         options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
     }
     set_private_create_mode(&mut options);
@@ -5613,6 +5611,16 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
+    let mut file = file;
+    // Windows: `access_mode` above replaces the `FILE_APPEND_DATA` that
+    // `append(true)` maps to, so the handle's cursor starts at 0 and a plain
+    // write overwrites the head of the log instead of appending. Seek to the
+    // end so the name and the semantics agree on every caller — including
+    // test constructors of torn tails. (Writes that need a different position
+    // seek first, and Unix `O_APPEND` ignores the cursor for writes anyway.)
+    #[cfg(windows)]
+    file.seek(SeekFrom::End(0))
+        .map_err(|error| io_at(path, error))?;
     Ok(file)
 }
 
