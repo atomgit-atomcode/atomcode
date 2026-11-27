@@ -247,15 +247,13 @@ impl fmt::Display for SessionStoreError {
                 // collections. The overflow sentinels report actual == limit,
                 // where "(over by 0)" would contradict "over budget".
                 if over > 0 {
+                    // No unit: some kinds count bytes, others items or lines.
                     write!(
                         f,
                         "{kind} over budget: limit {limit}, got {actual} (over by {over})"
                     )
                 } else {
-                    write!(
-                        f,
-                        "{kind} at the configured limit: limit {limit}, got {actual}"
-                    )
+                    write!(f, "{kind} size exceeds the addressable range: got {actual}")
                 }
             }
             Self::FutureSchema {
@@ -6608,8 +6606,7 @@ mod tests {
             }
             .to_string(),
             format!(
-                "session file at the configured limit: limit {}, got {}",
-                usize::MAX,
+                "session file size exceeds the addressable range: got {}",
                 usize::MAX
             )
         );
