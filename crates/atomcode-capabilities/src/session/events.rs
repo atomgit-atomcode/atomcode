@@ -164,6 +164,11 @@ fn trim_reference_payload(value: &mut serde_json::Value, clipped: &mut bool, que
     }
 }
 
+/// The `TooLarge` kind the reference projector reports when the retained text
+/// does not fit the attachment budget. Shared so the projector and the
+/// reference resolver cannot drift apart over a label.
+pub(super) const REFERENCE_PROJECTION_KIND: &str = "reference projection";
+
 impl SessionManager {
     /// Whether `id` is stored as an event log. The index is the commit point of
     /// such a session, so it is what decides.
@@ -1138,7 +1143,7 @@ impl SessionManager {
                 .saturating_add(64);
             if retained > retained_limit {
                 return Err(SessionStoreError::TooLarge {
-                    kind: "reference projection",
+                    kind: REFERENCE_PROJECTION_KIND,
                     limit: retained_limit,
                     actual: retained,
                 });

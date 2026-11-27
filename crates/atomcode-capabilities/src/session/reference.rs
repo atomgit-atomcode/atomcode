@@ -4,7 +4,7 @@ use std::path::Path;
 
 use atomcode_kernel::message::Role;
 
-use super::SessionManager;
+use super::{SessionManager, SessionStoreError};
 
 pub const MAX_REFERENCES: usize = 4;
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
@@ -125,6 +125,22 @@ fn parsed(text: &str) -> Result<(Vec<SessionReference>, Vec<std::ops::Range<usiz
     Ok((result, ranges))
 }
 
+/// Human-readable failure for the one oversize case a person can actually fix:
+/// the referenced session's committed events exceed the projection scan
+/// budget. Say what is over, by how much, and the honest way back — compaction
+/// does not remove committed events, so the log will not shrink; open the
+/// session directly to work with its turns instead of referencing the session
+/// wholesale.
+fn projection_too_large_message(id: &str, limit: usize, actual: usize) -> String {
+    let over = actual.saturating_sub(limit);
+    format!(
+        "Cannot reference session {id}: reading the committed events takes {actual} bytes, \
+         over the {limit}-byte projection budget by {over}. Compaction does not remove \
+         committed events, so the log will not shrink — open that session directly to \
+         work with its turns; an excerpt attaches at most {EXCERPT_CHARS} characters."
+    )
+}
+
 /// Read strict native aggregates, using the existing committed event projection.
 /// Keep only visible user/assistant text. JSON framing escapes source text so a
 /// source cannot forge another excerpt's metadata or closing delimiters.
@@ -146,7 +162,14 @@ pub fn resolve(root: &Path, references: &[SessionReference]) -> Result<String, S
         }
         let (meta, projected, clipped, captured_through_seq) = SessionManager::with_root(folder)
             .reference_projection(&reference.id, MAX_RETAINED_BYTES)
-            .map_err(|e| format!("Cannot reference session {}: {e}", reference.id))?;
+            .map_err(|e| match &e {
+                SessionStoreError::TooLarge {
+                    kind: super::events::REFERENCE_PROJECTION_KIND,
+                    limit,
+                    actual,
+                } => projection_too_large_message(&reference.id, *limit, *actual),
+                _ => format!("Cannot reference session {}: {e}", reference.id),
+            })?;
         if meta.parent.is_some() || meta.origin == super::manager::SessionOrigin::Delegated {
             return Err("A delegated session cannot be referenced independently".into());
         }
@@ -331,6 +354,53 @@ pub fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_too_large_message_says_what_over_by_how_much_and_the_way_back() {
+        assert_eq!(
+            projection_too_large_message("fe2558bb", 8_388_608, 8_388_630),
+            "Cannot reference session fe2558bb: reading the committed events takes 8388630 \
+             bytes, over the 8388608-byte projection budget by 22. Compaction does not \
+             remove committed events, so the log will not shrink — open that session \
+             directly to work with its turns; an excerpt attaches at most 8000 characters."
+        );
+    }
+
+    #[test]
+    fn resolve_reports_an_oversized_projection_with_the_way_back() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, reference) = seed(
+            root.path(),
+            vec![atomcode_kernel::message::Message::user("hello")],
+        );
+        // One turn carrying more than the 8 MiB scan budget: shedding cannot
+        // help when the newest turn alone is over, so resolve must fail with
+        // the actionable projection wording end to end.
+        let path = manager.events_path(&reference.id).unwrap();
+        let seq = std::fs::read_to_string(&path).unwrap().lines().count() as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let text = "x".repeat(8000);
+        for n in 1..=1100 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"seq": seq + n, "at": 0, "event": {
+                    "kind": "user_message", "turn": 2, "text": text, "images": []
+                }})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let err = resolve(root.path(), std::slice::from_ref(&reference)).unwrap_err();
+        assert!(err.contains(&reference.id), "{err}");
+        assert!(err.contains("8388608"), "{err}");
+        assert!(err.contains("committed events"), "{err}");
+    }
+
     #[test]
     fn references_are_explicit_stable_and_deduplicated() {
         let r = SessionReference {

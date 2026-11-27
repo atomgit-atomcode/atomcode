@@ -242,7 +242,19 @@ impl fmt::Display for SessionStoreError {
                 limit,
                 actual,
             } => {
-                write!(f, "{kind} exceeds {limit} bytes/items (actual {actual})")
+                let over = actual.saturating_sub(*limit);
+                // No "the {kind} is" phrasing: many kinds are plural
+                // collections. The overflow sentinels report actual == limit,
+                // where "(over by 0)" would contradict "over budget".
+                if over > 0 {
+                    // No unit: some kinds count bytes, others items or lines.
+                    write!(
+                        f,
+                        "{kind} over budget: limit {limit}, got {actual} (over by {over})"
+                    )
+                } else {
+                    write!(f, "{kind} size exceeds the addressable range: got {actual}")
+                }
             }
             Self::FutureSchema {
                 kind,
@@ -6561,6 +6573,43 @@ mod tests {
                 actual: 9
             })
         ));
+    }
+
+    #[test]
+    fn too_large_display_says_what_over_by_how_much() {
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "reference projection",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "reference projection over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // Plural kinds must not read as a singular subject–verb pair.
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session events",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "session events over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // The overflow sentinels report actual == limit: "over by 0" would
+        // contradict "over budget".
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session file",
+                limit: usize::MAX,
+                actual: usize::MAX,
+            }
+            .to_string(),
+            format!(
+                "session file size exceeds the addressable range: got {}",
+                usize::MAX
+            )
+        );
     }
 
     #[test]
