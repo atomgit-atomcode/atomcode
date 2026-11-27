@@ -2019,12 +2019,27 @@ impl Host {
             .is_some_and(|rect| rect.h == 1 && rect.contains(x, y))
     }
 
+    /// A press on the task list. Folded, any of its rows opens it — the
+    /// header that says `点击展开`, an item, and the `+N 更多` row, which is the
+    /// one that most says there is more to see and was the one that did
+    /// nothing. Open, only the header folds it again: the rows under it are
+    /// what the wheel scrolls, and a press while reading one should not take
+    /// the list away. The margin above the header is not the panel.
     pub fn toggle_todo_at(&self, x: u16, y: u16) -> bool {
-        let rect = self.hits.lock().expect("hits poisoned").todo;
-        if !rect.is_some_and(|rect| rect.contains(x, y) && y == rect.y + u16::from(rect.h >= 2)) {
+        let Some(rect) = self.hits.lock().expect("hits poisoned").todo else {
+            return false;
+        };
+        let header = rect.y + u16::from(rect.h >= 2);
+        let mut moment = self.moment.write().expect("moment poisoned");
+        let hit = rect.contains(x, y)
+            && if moment.todo_expanded {
+                y == header
+            } else {
+                y >= header
+            };
+        if !hit {
             return false;
         }
-        let mut moment = self.moment.write().expect("moment poisoned");
         moment.todo_expanded = !moment.todo_expanded;
         moment.todo_offset = 0;
         true
@@ -11418,6 +11433,23 @@ mod tests {
         assert_eq!(h.moment.read().unwrap().todo_offset, 0);
         assert!(h.toggle_todo_at(3, 4));
         assert!(!h.todo_wheel(3, 6, 1));
+    }
+
+    /// Folded, the `+N 更多` row (and any item) opens the list; open, a press on
+    /// an item is not a fold — only the header folds it.
+    #[test]
+    fn the_more_row_opens_the_folded_todo_list() {
+        let h = host_with_real_todo();
+        h.hits.lock().unwrap().todo = Some(Rect::new(2, 3, 60, 6));
+        // Margin at 3, header at 4, three items at 5..=7, `+N 更多` at 8.
+        assert!(h.toggle_todo_at(3, 8), "the more row opens it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(!h.toggle_todo_at(3, 6), "an item does not fold it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 4), "the header does");
+        assert!(!h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 6), "folded, an item opens it too");
+        assert!(!h.toggle_todo_at(3, 3), "the margin is not the panel");
     }
 
     fn host_with_real_todo() -> Host {
