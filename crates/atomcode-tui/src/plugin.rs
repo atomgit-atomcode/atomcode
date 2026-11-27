@@ -1943,10 +1943,11 @@ pub struct Tui {
     /// only the freshest data in hand while it is newer than what the row
     /// already shows. A landing reply moves it.
     allowance_figures_generation: Arc<AtomicU64>,
-    /// Whether an idle-heartbeat ask is still in flight. Idle asks ride the
-    /// current generation instead of bumping it, so while one is out another
-    /// would be its out-of-order twin: the beat skips until the ask lands.
-    allowance_idle_ask_out: Arc<AtomicBool>,
+    /// How many allowance asks are in flight. Idle asks ride the current
+    /// generation instead of bumping it, so a second ask of the same
+    /// generation — an idle beat racing a turn-end ask — could land out of
+    /// order: the beat holds off until every in-flight ask is done.
+    allowance_asks_out: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -6971,11 +6972,11 @@ impl Tui {
                 .as_ref()
                 .is_some_and(|left| crate::modules::status::badge_visible(left, m.now))
         };
-        if badge_on_row && !self.allowance_idle_ask_out.load(Ordering::SeqCst) {
+        if badge_on_row && self.allowance_asks_out.load(Ordering::SeqCst) == 0 {
             // The idle ask is the ask itself: it rides the current generation
-            // (see check_allowance), so a slow reply still lands. While one is
-            // out, the beat holds off — a second would be its same-generation
-            // out-of-order twin.
+            // (see check_allowance), so a slow reply still lands. While any
+            // ask is out the beat holds off — a second of the same
+            // generation would be its out-of-order twin.
             self.check_allowance(false, true);
         }
     }
@@ -7018,19 +7019,18 @@ impl Tui {
                 self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
             }
         };
-        // One idle ask in flight at a time: two would be same-generation
-        // out-of-order twins. The marker clears when the ask's task ends —
-        // landed, failed, stale or superseded.
-        if idle {
-            self.allowance_idle_ask_out.store(true, Ordering::SeqCst);
-        }
-        let idle_ask_out = self.allowance_idle_ask_out.clone();
-        // Clears the idle-in-flight marker whenever the spawned task ends, so
-        // the next idle beat can ask again whatever path the task takes.
-        struct IdleAskDone(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for IdleAskDone {
+        // Count every ask in flight: an idle ask rides the CURRENT
+        // generation, so a second ask of that same generation — the beat
+        // racing a turn-end ask — could land out of order. The count clears
+        // when the ask's task ends — landed, failed, stale or superseded.
+        self.allowance_asks_out.fetch_add(1, Ordering::SeqCst);
+        let ask_out = self.allowance_asks_out.clone();
+        // Drops the in-flight count whenever the spawned task ends, so the
+        // next idle beat can ask again whatever path the task takes.
+        struct AskDone(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        impl Drop for AskDone {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
+                self.0.fetch_sub(1, Ordering::SeqCst);
             }
         }
         let session = self.client.session();
@@ -7043,7 +7043,7 @@ impl Tui {
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
-            let _idle_ask_done = IdleAskDone(idle_ask_out);
+            let _ask_done = AskDone(ask_out);
             // The cheap form — the windows and nothing else. The plan behind
             // them and what has been spent are two more round trips, and
             // neither is on this row.
@@ -7095,8 +7095,9 @@ impl Tui {
                 let failed = failed_generation.load(Ordering::SeqCst);
                 let figures = allowance_figures_generation.load(Ordering::SeqCst);
                 // The pre-failure exemption covers only a reply newer than
-                // what the row already shows: an older one would write stale
-                // data over fresh.
+                // the recorded mark: standing figures after a landing, or the
+                // switch's own generation after a model switch — a reply
+                // older than THAT is about the previous provider.
                 let retired = generation != current
                     && !(failed != 0 && generation < failed && generation >= figures);
                 if retired {
@@ -8121,6 +8122,14 @@ impl Tui {
                     if refresh_allowance {
                         self.allowance_generation.fetch_add(1, Ordering::SeqCst);
                         self.failed_generation.store(0, Ordering::SeqCst);
+                        // The failed-run exemption must not reach across a
+                        // model switch: a pre-switch reply is about the
+                        // previous provider. Recording the switch's own
+                        // generation as the figures mark blocks replies older
+                        // than the switch while still letting post-switch
+                        // pre-run replies through.
+                        self.allowance_figures_generation
+                            .store(self.allowance_generation.load(Ordering::SeqCst), Ordering::SeqCst);
                     }
                     moment.ctx_window = window;
                     moment.model = model;
@@ -12803,7 +12812,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             allowance_generation: Arc::new(AtomicU64::new(0)),
             failed_generation: Arc::new(AtomicU64::new(0)),
             allowance_figures_generation: Arc::new(AtomicU64::new(0)),
-            allowance_idle_ask_out: Arc::new(AtomicBool::new(false)),
+            allowance_asks_out: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -20263,6 +20272,71 @@ mod allowance_switch_tests {
         assert!(
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prereply_from_the_previous_provider_never_lands_across_a_switch() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // A pre-switch ask is in flight: its reply is about the previous
+        // provider and has not landed yet.
+        tui.check_allowance(false, false);
+        let pre = pending.recv().await.unwrap();
+        // The model switches: the row is cleared and the failed-run
+        // exemption must not reach across the switch.
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead".into(),
+                model: Some("same-wire-name".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        // A post-switch ask fails: the run of failed asks begins at the new
+        // generation.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.check_allowance(false, false);
+        pending
+            .recv()
+            .await
+            .unwrap()
+            .send(HostReply::Usage {
+                windows: vec![],
+                unavailable: Some("host refused".into()),
+                plan: None,
+                stats: None,
+                stats_unavailable: None,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        // The pre-switch reply finally arrives. It is older than the
+        // switch's own generation — the exemption's reach ends at the
+        // switch, so it must NOT write the previous provider's quota.
+        pre.send(reply(windows)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment.read().unwrap().allowance.is_none(),
+            "a pre-switch reply must not land across a model switch"
         );
     }
 }
