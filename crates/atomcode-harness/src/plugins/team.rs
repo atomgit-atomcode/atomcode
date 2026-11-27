@@ -642,6 +642,9 @@ struct ReportReceipt {
     /// The last thing told was only progress: the turn ending after it is the
     /// member going idle with the task unreported, which the lead must hear.
     progress: bool,
+    /// The last thing told was a final report (`kind: "done"`, the default) —
+    /// not progress, not blocked.
+    done: bool,
     note_key: Option<String>,
 }
 
@@ -680,6 +683,12 @@ struct Member {
     /// has undone takes its members with it; a member brought back by a resume
     /// has none.
     delegated_in: Option<u64>,
+    /// When it ended a turn on a final report and went idle; cleared when the
+    /// lead tells it more. A full team makes room by stopping the member that
+    /// has been finished longest (`TeamTool::make_room`). `None` for a member
+    /// still working, one that stopped without reporting done, or one brought
+    /// back by a resume — none of those is known to be finished.
+    done_since: Mutex<Option<std::time::Instant>>,
     /// Its pump. Dropped with the member, which stops the pump and any turn
     /// it is running.
     _driven: super::handle::Driven,
@@ -881,6 +890,7 @@ impl Tool for TellParent {
             let mut receipt = self.told.lock().expect("told poisoned");
             receipt.sent = true;
             receipt.progress = progress;
+            receipt.done = done;
             if let Some(note) = note.filter(|n| Some(&n.key) != receipt.note_key.as_ref()) {
                 append_report_note(&mut report, Some(&note));
                 receipt.note_key = Some(note.key);
@@ -1072,6 +1082,9 @@ impl TeamTool {
                  relative to the workspace (for example `src/auth/**`)"
             ));
         }
+        let made_room = self
+            .make_room(lead, &lead_session, &name, args.to.as_deref())
+            .await?;
         let peer_target = {
             let all = self.members.by_lead.lock().expect("members poisoned");
             let mine = all.get(&lead_session);
@@ -1093,9 +1106,11 @@ impl TeamTool {
                     })
                     .unwrap_or_default();
                 return Err(format!(
-                    "the team is full ({} members: {names}). A member keeps its place until \
-                     stopped, idle or not — places never free up on their own. Use `status` to \
-                     see which are idle, `stop` one whose work is done, then delegate again.",
+                    "the team is full ({} members: {names}), and none is idle on a finished \
+                     task, which a new delegation would stop to make room. A member that is \
+                     working, or stopped without reporting done, keeps its place until you \
+                     stop it. Use `status` to see which are idle, `stop` one whose work is \
+                     done, then delegate again.",
                     self.max_members
                 ));
             }
@@ -1225,8 +1240,17 @@ impl TeamTool {
         } else {
             ""
         };
+        // The member stopped to seat this one, said where the lead reads it.
+        let made_room = made_room
+            .map(|old| {
+                format!(
+                    " The team was full, so `{old}` — idle since it reported its task done, \
+                     the longest of those — was stopped to make room."
+                )
+            })
+            .unwrap_or_default();
         let report = format!(
-            "delegated to `{name}` ({}{}{read_only}){}.{direct_handoff} It will report through `tell_parent`. {follow_up}",
+            "delegated to `{name}` ({}{}{read_only}){}.{direct_handoff}{made_room} It will report through `tell_parent`. {follow_up}",
             role.id,
             match &named {
                 Some(model) => format!(" on {model}"),
@@ -1681,6 +1705,7 @@ impl TeamTool {
                     last_write_refusal_turn: None,
                     scope,
                     delegated_in: (!resuming).then(|| lead.session().current_turn()),
+                    done_since: Mutex::new(None),
                     _driven: driven,
                 },
             );
@@ -1747,6 +1772,52 @@ impl TeamTool {
                 .join(", "),
             None => "none — `delegate` to start one".into(),
         }
+    }
+
+    /// A full team makes room for `name` by stopping the member that has been
+    /// idle on a final report the longest. Only such a member: one still
+    /// working, one that stopped without reporting done (its task may be
+    /// unfinished) or one handing off to the new member (`to`) is never taken,
+    /// and with none of those the delegation is refused as full, as before.
+    /// Stopping is the lead's own `stop`, so its log ends saying it was stopped.
+    ///
+    /// Not a timer: an idle member costs no model calls, only a place, and
+    /// stopping it on a clock would throw away context the lead may still
+    /// `tell` more to. The place is taken back when it is needed.
+    async fn make_room(
+        &self,
+        lead: &Arc<Agent>,
+        lead_session: &str,
+        name: &str,
+        to: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let oldest = {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            let Some(mine) = all.get(lead_session) else {
+                return Ok(None);
+            };
+            // A name already taken is refused as such, not seated by evicting.
+            if mine.len() < self.max_members || mine.contains_key(name) {
+                return Ok(None);
+            }
+            mine.iter()
+                .filter(|(member, m)| {
+                    !m.stopping
+                        && Some(member.as_str()) != to
+                        && m.agent.status() == crate::agent::AgentStatus::Idle
+                })
+                .filter_map(|(member, m)| {
+                    let since = (*m.done_since.lock().expect("done poisoned"))?;
+                    Some((since, member.clone()))
+                })
+                .min()
+                .map(|(_, member)| member)
+        };
+        let Some(old) = oldest else {
+            return Ok(None);
+        };
+        self.stop(lead, Some(&old)).await?;
+        Ok(Some(old))
     }
 
     fn with_member<R>(
@@ -2005,8 +2076,9 @@ impl Tool for TeamTool {
          between live members. Grants expire when either member stops or the team is restored.\n\
          \n\
          Lifecycle: a member that has finished stays on the team, idle, and keeps one of \
-         the team's places until you stop it — places never free up on their own. When a \
-         member's report covers its task and you have no follow-up for it, `stop` it. \
+         the team's places until you stop it. When the team is full, a new `delegate` stops \
+         the member idle longest on a final report to make room; nothing else frees a place. \
+         When a member's report covers its task and you have no follow-up for it, `stop` it. \
          Before you give the user your final answer, stop the members you no longer need. \
          Keep a member only while you still mean to `tell` it more.\n\
          \n\
@@ -2105,6 +2177,7 @@ impl Tool for TeamTool {
                 } else {
                     self.with_member(&lead, name, |m| {
                         *m.told.lock().expect("told poisoned") = ReportReceipt::default();
+                        *m.done_since.lock().expect("done poisoned") = None;
                         m.agent.send_from(text, lead.team_message_origin());
                     })
                     .map(|_| format!("told `{name}`"))
@@ -2496,6 +2569,8 @@ impl Plugin for TeamPlugin {
                     return;
                 };
                 let told = std::mem::take(&mut *m.told.lock().expect("told poisoned"));
+                *m.done_since.lock().expect("done poisoned") =
+                    (told.sent && told.done).then(std::time::Instant::now);
                 (m.agent.clone(), told)
             };
             let budget_stop = *stop == atomcode_kernel::event::StopReason::StoppedByPolicy

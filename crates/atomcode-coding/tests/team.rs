@@ -2963,6 +2963,52 @@ async fn a_full_team_says_which_members_hold_the_places_and_how_to_free_one() {
     );
 }
 
+/// A full team makes room by stopping the member that has been idle on a final
+/// report the longest — a place is taken back when it is needed, not on a
+/// timer — and the lead is told which one.
+#[tokio::test]
+async fn a_full_team_stops_the_longest_finished_member_to_seat_a_new_one() {
+    let dir = scratch("full-team-room");
+    let reported = r#"{ text = "", calls = [ { name = "tell_parent", args = { text = "found it" } } ] }, { text = "reported" }"#;
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        &[reported; 7].join(", "),
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let member = |name: &str| agents.by_session(&format!("{}/{name}", lead.session_id()));
+    run_turn(&app, "go").await.unwrap();
+    until_idle(&member("scout").unwrap()).await;
+    // One at a time, so each finishes before the next starts and `scout` has
+    // been finished longest.
+    for name in ["m1", "m2", "m3", "m4", "m5"] {
+        let made = as_lead(
+            &app,
+            &lead,
+            &format!(r#"{{"action":"delegate","name":"{name}","role":"explorer","task":"look"}}"#),
+        )
+        .await;
+        assert!(!made.is_error, "{}", made.content);
+        until_idle(&member(name).unwrap()).await;
+    }
+    let seated = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"m6","role":"explorer","task":"look"}"#,
+    )
+    .await;
+    assert!(!seated.is_error, "{}", seated.content);
+    assert!(
+        seated.content.contains("`scout`") && seated.content.contains("make room"),
+        "the lead is told which member gave up its place: {}",
+        seated.content
+    );
+    assert!(member("scout").is_none(), "scout was stopped");
+    assert!(member("m1").is_some() && member("m6").is_some());
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_stopping_member_keeps_its_name_until_its_agent_is_removed() {
     let dir = scratch("stop-recreate");
