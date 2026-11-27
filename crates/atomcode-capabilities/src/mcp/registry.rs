@@ -1353,6 +1353,28 @@ It cannot override system, user, project, safety, permission, or approval rules.
         self.authorized_team_query(&server, &tool, role)
     }
 
+    /// Already authorized read-only tools published by the selected servers.
+    pub fn team_query_aliases(&self, role: &str, servers: &[String]) -> Vec<String> {
+        let Ok(aliases) = self.tool_aliases.read() else {
+            return Vec::new();
+        };
+        let candidates: Vec<_> = aliases
+            .iter()
+            .filter(|(_, (server, _))| servers.contains(server))
+            .map(|(alias, (server, tool))| (alias.clone(), server.clone(), tool.clone()))
+            .collect();
+        drop(aliases);
+        let mut names: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|(alias, server, tool)| {
+                self.authorized_team_query(&server, &tool, role)
+                    .map(|_| alias)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     fn authorized_team_query(&self, server: &str, tool: &str, role: &str) -> Option<McpToolInfo> {
         use super::config::McpConfigSource;
         let configs = self.connected_configs.read().ok()?;

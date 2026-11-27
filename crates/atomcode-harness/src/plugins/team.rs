@@ -72,6 +72,8 @@ struct Role {
     when: String,
     /// An explicit tool list, instead of the permission's default set.
     tools: Option<Vec<String>>,
+    denied_tools: Vec<String>,
+    allowed_mcp_servers: Option<Vec<String>>,
     /// A selection id this role should run on, overriding `difficulty`.
     ///
     /// `difficulty` says "cheap or the conversation's", which is all a generic
@@ -112,6 +114,8 @@ fn built_in(
         persona: persona.into(),
         when: when.into(),
         tools: None,
+        denied_tools: Vec::new(),
+        allowed_mcp_servers: None,
         // Built-in roles name no model: which models exist is a fact about the
         // deployment, and a shipped default naming one would be wrong everywhere
         // but where it was written.
@@ -323,6 +327,8 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     let mut difficulty_said = false;
     let mut when = String::new();
     let mut tools: Option<Vec<String>> = None;
+    let mut denied_tools = None;
+    let mut allowed_mcp_servers = None;
     let mut model = None;
     let mut body = String::new();
     let mut in_front = true;
@@ -377,15 +383,30 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
                 // file is read at mount. An id that is not on offer fails at
                 // `delegate`, with the list of what is.
                 "model" => model = Some(value.to_string()).filter(|m: &String| !m.is_empty()),
-                "tools" => {
-                    tools = Some(
-                        value
-                            .trim_matches(|c| c == '[' || c == ']')
-                            .split(',')
-                            .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                            .filter(|t| !t.is_empty())
-                            .collect(),
-                    )
+                key @ ("tools" | "allowed_tools" | "denied_tools" | "allowed_mcp_servers") => {
+                    let slot = match key {
+                        "denied_tools" => &mut denied_tools,
+                        "allowed_mcp_servers" => &mut allowed_mcp_servers,
+                        _ => &mut tools,
+                    };
+                    if slot.is_some() {
+                        problems.push(format!(
+                            "duplicate `{key}` list (tools and allowed_tools are aliases)"
+                        ));
+                    } else if key != "tools" && !(value.starts_with('[') && value.ends_with(']')) {
+                        problems.push(format!("`{key}` must be an inline list, such as []"));
+                    } else {
+                        *slot = Some(
+                            value
+                                .trim_matches(|c| c == '[' || c == ']')
+                                .split(',')
+                                .map(|t| {
+                                    t.trim().trim_matches(|c| c == '"' || c == '\'').to_string()
+                                })
+                                .filter(|t| !t.is_empty())
+                                .collect(),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -446,6 +467,8 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
         persona,
         when,
         tools,
+        denied_tools: denied_tools.unwrap_or_default(),
+        allowed_mcp_servers,
         model,
         from_project: false,
         effort,
@@ -584,10 +607,31 @@ fn default_tools(permission: Permission) -> Vec<String> {
 }
 
 fn tools_for(role: &Role) -> Vec<String> {
-    match &role.tools {
+    let mut tools = match &role.tools {
         Some(explicit) => explicit.clone(),
         None => default_tools(role.permission),
+    };
+    tools.retain(|tool| {
+        !role.denied_tools.contains(tool)
+            && !(role.allowed_mcp_servers.is_some() && query::is_query_name(tool))
+    });
+    tools
+}
+
+fn auto_model(models: &dyn crate::seams::Models, difficulty: Difficulty) -> Option<String> {
+    let current = models.current()?;
+    let ranked: Vec<_> = crate::seams::delegatable(models)
+        .into_iter()
+        .filter(|model| model.capable_rank.is_some())
+        .collect();
+    if ranked.len() < 2 || !ranked.iter().any(|model| model.id == current) {
+        return None;
     }
+    let selected = match difficulty {
+        Difficulty::Simple => ranked.first(),
+        Difficulty::Hard => ranked.last(),
+    }?;
+    Some(selected.id.clone())
 }
 
 // ---- the members ----------------------------------------------------------
@@ -1124,26 +1168,29 @@ impl TeamTool {
             vec!["**".to_string()]
         };
 
-        // A writing member gets a checkout of its own, so two members never
-        // edit the same tree and the lead merges branches, not diffs.
-        let worktree = if self.worktrees && role.permission == Permission::Worker {
-            Some(self.make_worktree(lead, &name).await?)
-        } else {
-            None
-        };
         // `args.model` the model produced this turn; `role.model` a person wrote
         // into their own `agents/<role>.md` before the run and is theirs to point
         // wherever they like — including at their own second account. A role that
         // came with the project is held to what the model may pick.
-        let (named, chose) = match args
+        let requested_model = args
             .model
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
+            .filter(|m| !m.is_empty());
+        if let Some(mode @ ("inherit" | "auto")) = role.model.as_deref() {
+            if requested_model.is_some() {
+                return Err(format!(
+                    "Role `{}` uses model: {mode}; omit the delegation model override.",
+                    role.id
+                ));
+            }
+        }
+        let (named, chose) = match requested_model {
             Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
             None => (
-                role.model.clone(),
+                role.model
+                    .clone()
+                    .filter(|model| !matches!(model.as_str(), "inherit" | "auto")),
                 if role.from_project {
                     crate::seams::Chose::Model
                 } else {
@@ -1157,6 +1204,11 @@ impl TeamTool {
             .map(str::trim)
             .filter(|e| !e.is_empty())
             .map(str::to_string);
+        let worktree = if self.worktrees && role.permission == Permission::Worker {
+            Some(self.make_worktree(lead, &name).await?)
+        } else {
+            None
+        };
         let follow_up = if self.headless_wait {
             "Use `wait` with a bounded timeout when you need its result before this one-shot run ends."
         } else {
@@ -1352,7 +1404,30 @@ impl TeamTool {
             .service::<ToolsSvc>()
             .ok_or("the lead has no tool catalog")?;
         let restricted = Arc::new(ToolBox::new());
-        for tool_name in tools_for(&role) {
+        let mut tool_names = tools_for(&role);
+        if let (Some(servers), Some(registry)) = (
+            &role.allowed_mcp_servers,
+            lead.ctx().service::<crate::seams::McpSvc>(),
+        ) {
+            let listed_queries = role
+                .tools
+                .iter()
+                .flatten()
+                .any(|name| query::is_query_name(name));
+            tool_names.extend(
+                registry
+                    .team_query_aliases(&role.id, servers)
+                    .into_iter()
+                    .filter(|name| {
+                        (!listed_queries
+                            || role.tools.iter().flatten().any(|listed| listed == name))
+                            && !role.denied_tools.contains(name)
+                            && parent_tools.get(name).is_some()
+                    }),
+            );
+        }
+        let has_queries = tool_names.iter().any(|name| query::is_query_name(name));
+        for tool_name in tool_names {
             if query::is_query_name(&tool_name) {
                 let registry = lead
                     .ctx()
@@ -1370,6 +1445,7 @@ impl TeamTool {
                         .unwrap_or_else(|| format!("Read-only query {tool_name}")),
                     name: tool_name,
                     role: role.id.clone(),
+                    allowed_servers: role.allowed_mcp_servers.clone(),
                     member: name.clone(),
                     registry,
                     catalog: Arc::downgrade(&parent_tools),
@@ -1418,27 +1494,41 @@ impl TeamTool {
         // to the next rule: silently demoting a member the person asked to run on
         // a specific model is the failure nobody would see. The effort is
         // validated against the model it will actually run on.
+        let models = self.ctx.service::<crate::seams::ModelsSvc>();
+        let auto = if named.is_none() && role.model.as_deref() == Some("auto") {
+            models
+                .as_ref()
+                .and_then(|models| auto_model(models.as_ref(), role.difficulty))
+        } else {
+            None
+        };
+        let selected = named.as_deref().or(auto.as_deref());
         let effort_override = super::subagent::resolve_child_effort(
-            self.ctx.service::<crate::seams::ModelsSvc>().as_ref(),
-            named.as_deref(),
+            models.as_ref(),
+            selected,
             asked_effort.as_deref(),
         )?;
-        let chosen =
-            super::subagent::resolve_child_model(&self.ctx, named.as_deref(), chose).await?;
-        let utility = match (chosen, role.difficulty) {
-            (Some(model), _) => Some(model),
-            (None, Difficulty::Simple) => self.ctx.service::<LlmUtilitySvc>(),
+        let chosen = super::subagent::resolve_child_model(
+            &self.ctx,
+            selected,
+            if auto.is_some() {
+                crate::seams::Chose::Model
+            } else {
+                chose
+            },
+        )
+        .await?;
+        let utility = match (chosen, role.difficulty, role.model.as_deref()) {
+            (Some(model), _, _) => Some(model),
+            (None, Difficulty::Simple, None) => self.ctx.service::<LlmUtilitySvc>(),
             // The conversation's model — as the host's delegated provider when
             // it keeps a member's spend apart, else inherited by lookup.
-            (None, Difficulty::Hard) => self.ctx.service::<crate::seams::DelegatedLlmSvc>(),
+            (None, _, _) => self.ctx.service::<crate::seams::DelegatedLlmSvc>(),
         };
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
         let role_effort = effort_override.or(role.effort);
-        if tools_for(&role)
-            .iter()
-            .any(|name| query::is_query_name(name))
-        {
+        if has_queries {
             prompts.contribute("team-query-evidence", 0, "Include the Team evidence reference in your report so the lead can inspect the original query and result.".to_owned());
         }
         if role.permission == Permission::Explore {
@@ -1685,8 +1775,14 @@ impl TeamTool {
         mine.iter()
             .map(|(name, m)| {
                 let log = m.agent.session();
+                let model = m
+                    .agent
+                    .ctx()
+                    .service::<LlmSvc>()
+                    .map(|provider| format!(", model {}", provider.model_name()))
+                    .unwrap_or_default();
                 format!(
-                    "{name} ({}): {:?}, turn {}, {} event(s){}{}{}",
+                    "{name} ({}): {:?}, turn {}, {} event(s){model}{}{}{}",
                     m.role,
                     m.agent.status(),
                     log.current_turn(),
@@ -2484,6 +2580,53 @@ impl Plugin for TeamPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_routes_only_with_ranked_models_in_the_delegatable_catalog() {
+        use crate::seams::{ModelInfo, Models};
+        struct Catalog(Vec<ModelInfo>);
+        #[async_trait]
+        impl Models for Catalog {
+            fn list(&self) -> Vec<ModelInfo> {
+                self.0.clone()
+            }
+            fn current(&self) -> Option<String> {
+                Some("main".into())
+            }
+            async fn provider(
+                &self,
+                _: &str,
+            ) -> Result<Arc<dyn atomcode_kernel::provider::LlmProvider>, String> {
+                unreachable!("routing does not build a provider")
+            }
+        }
+        let model = |id: &str, account: &str, rank| ModelInfo {
+            id: id.into(),
+            account: account.into(),
+            capable_rank: rank,
+            display_name: id.into(),
+            context_window: 0,
+            supports_vision: false,
+            effort_levels: vec![],
+            note: None,
+        };
+        let mut catalog = Catalog(vec![
+            model("main", "mine", Some(5)),
+            model("fast", "mine", Some(2)),
+            model("other-account", "other", Some(0)),
+            model("above-ceiling", "mine", Some(10)),
+        ]);
+        assert_eq!(
+            auto_model(&catalog, Difficulty::Simple).as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            auto_model(&catalog, Difficulty::Hard).as_deref(),
+            Some("main")
+        );
+        catalog.0[0].capable_rank = None;
+        assert_eq!(auto_model(&catalog, Difficulty::Simple), None);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir =

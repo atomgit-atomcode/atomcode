@@ -89,7 +89,7 @@
       <h2 id="how-they-run">How they run</h2>
       <ul>
         <li>Subagents run in parallel, up to <code>max_concurrent</code> at a time, each in an isolated context.</li>
-        <li>Each subtask carries a difficulty: <code>simple</code> routes to your <strong>fast</strong> model, <code>hard</code> routes to your <strong>capable</strong> model — chosen by the <code>capable_model</code> rank across your configured providers. With a single provider, the subagent uses the current model.</li>
+        <li>The native <code>task</code> accepts a model selection ID on each call. When omitted, it uses the current session's model. Only models available for delegation in this session can be named.</li>
         <li>The main agent reviews each result before continuing — a subagent proposes, the main agent decides.</li>
       </ul>
 
@@ -144,15 +144,19 @@ You design. Read the existing code first, then propose a design and its trade-of
           <tr><td><code>permission</code></td><td>yes</td><td><code>explore</code> (read-only investigation) or <code>worker</code> (scoped writes)</td></tr>
           <tr><td><code>difficulty</code></td><td>yes</td><td><code>simple</code> (fast model) or <code>hard</code> (strong model)</td></tr>
           <tr><td><code>effort</code></td><td>no</td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code></td></tr>
-          <tr><td><code>model</code></td><td>no</td><td>A model selection id; without it, chosen by <code>difficulty</code></td></tr>
+          <tr><td><code>model</code></td><td>no</td><td><code>inherit</code> uses the parent model, <code>auto</code> chooses by difficulty from eligible ranked models, or supply a model selection ID. Omission keeps legacy difficulty routing.</td></tr>
           <tr><td><code>when</code></td><td>no</td><td>One line on when to hand this role work</td></tr>
           <tr><td><code>tools</code></td><td>no</td><td>Comma-separated tool names, selected from permitted built-ins and read-only MCP queries granted to this role</td></tr>
+          <tr><td><code>allowed_tools</code></td><td>no</td><td>Inline array alias for <code>tools</code>. Omit for role defaults, or use <code>[]</code> to clear this list.</td></tr>
+          <tr><td><code>denied_tools</code></td><td>no</td><td>Inline array of tool names to remove, even if also allowed.</td></tr>
+          <tr><td><code>allowed_mcp_servers</code></td><td>no</td><td>Inline array of servers. Only previously granted read-only queries are eligible. Omit to keep the existing per-tool behavior, or use <code>[]</code> to disable MCP for the role.</td></tr>
         </tbody>
       </table></div>
+      <p>Use a build that supports these fields when sharing role files. Older builds ignore the new tool-list fields. For a role shared with older builds, keep using the <code>tools:</code> allowlist they understand.</p>
       <p>Two things to note:</p>
       <ul>
         <li>This <code>permission</code> is not the CLI's <code>--permission-mode</code> (<code>plan</code> / <code>accept_edits</code> / <code>auto</code>); they only share a name. This one decides whether the member may change anything; that one is how the whole session asks for approval.</li>
-        <li>This is not Claude Code's agent file format. <code>name</code>, <code>description</code>, <code>allowed_tools</code> and <code>user_invocable</code> are not read: the role's name is the file name, and its tools are limited with <code>tools</code>.</li>
+        <li>This is not Claude Code's agent file format. <code>name</code>, <code>description</code> and <code>user_invocable</code> are not read: the role's name is the file name, and its tools are limited with <code>tools</code>.</li>
       </ul>
       <p>A role file that does not parse is skipped and the session starts anyway. You are told once per session which file was skipped and everything that is missing or wrong in it; a file named like a built-in role leaves the built-in in use.</p>
 

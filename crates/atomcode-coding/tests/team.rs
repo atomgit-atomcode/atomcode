@@ -3277,6 +3277,46 @@ async fn member_budget_closes_once_and_a_failed_followup_does_not_report_old_tex
 #[path = "team_cost/replay.rs"]
 mod cost_replay;
 
+#[tokio::test]
+async fn explicit_inherit_and_tool_lists_resolve_in_the_member_realm() {
+    use atomcode_harness::seams::LlmSvc;
+
+    let dir = scratch("role-options");
+    write_role(&dir, "research",
+        "---\npermission: explore\ndifficulty: simple\nmodel: inherit\nallowed_tools: [read_file, grep]\ndenied_tools: [grep]\nallowed_mcp_servers: []\n---\nRead the code.");
+    write_role(&dir, "empty",
+        "---\npermission: explore\ndifficulty: simple\nmodel: inherit\nallowed_tools: []\n---\nListen.");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "lead" }, { text = "next" }"#,
+        r#"{ text = "utility" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let lead_model = lead.ctx().service::<LlmSvc>().unwrap();
+    for (role, read_allowed) in [("research", true), ("empty", false)] {
+        let args =
+            serde_json::json!({"action":"delegate","name":role,"role":role,"task":"inspect"});
+        let result = as_lead(&app, &lead, &args.to_string()).await;
+        assert!(!result.is_error, "{}", result.content);
+        let member = app
+            .context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session(&format!("{}/{role}", lead.session_id()))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &lead_model,
+            &member.ctx().service::<LlmSvc>().unwrap()
+        ));
+        let tools = member.ctx().service::<ToolsSvc>().unwrap();
+        assert_eq!(tools.get("read_file").is_some(), read_allowed);
+        assert!(tools.get("grep").is_none());
+        assert!(tools.get("tell_parent").is_some());
+        until_idle(&member).await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_shell_less_member_hands_unverified_edits_to_the_lead_in_its_report() {
     let write = r#"{ calls = [{ name = "write_file", args = {file_path = "main.rs", content = "fn main() {}" } }] }"#;
@@ -3388,7 +3428,8 @@ done"#).unwrap();
         "teamReadOnlyTools":{"research":["search_docs"]}}}});
     std::fs::write(home.join("mcp.json"), config.to_string()).unwrap();
     let role = "---\npermission: explore\ndifficulty: simple\ntools: mcp__docs__search_docs\n---\nLook up the contract.";
-    write_role(&dir, "research", role);
+    write_role(&dir, "research",
+        "---\npermission: explore\ndifficulty: simple\nallowed_tools: []\nallowed_mcp_servers: [docs]\n---\nLook up the contract.");
     write_role(&dir, "other", role);
     let build = |resume: bool| {
         let mut layers = layers_with(
