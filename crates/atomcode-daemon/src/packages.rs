@@ -293,6 +293,19 @@ pub struct InstallRequest {
 /// A bundle larger than this is refused instead of filling the disk.
 const MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The most a single entry may unpack to. A shared library is the largest thing
+/// a bundle legitimately carries; anything past this is a decompression bomb.
+const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The most a whole bundle may unpack to, summed over every entry.
+///
+/// The compressed bundle is capped at `MAX_BUNDLE_BYTES`, but that bound says
+/// nothing about what it expands to — gzip turns a few megabytes into tens of
+/// gigabytes, and on a phone that fills `filesDir` and takes the daemon down
+/// with it. This is a ratio bound rather than a promise: four times the
+/// compressed cap, which every shipped bundle (CPython, numpy, node) is under.
+const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// GET /packages
 pub(crate) async fn list_packages() -> impl IntoResponse {
     match scan() {
@@ -447,6 +460,16 @@ fn record_data_dirs(manifest: &Manifest) {
         return;
     }
     registry.insert(manifest.name.clone(), manifest.data_dirs.clone());
+    let _ = write_data_dirs_registry(&registry);
+}
+
+/// Drop a package's data-dir registration, so a rolled-back install does not
+/// leave a name behind that no package on disk answers for.
+fn forget_data_dirs(name: &str) {
+    let mut registry = read_data_dirs_registry();
+    if registry.remove(name).is_none() {
+        return;
+    }
     let _ = write_data_dirs_registry(&registry);
 }
 
@@ -865,6 +888,26 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
     }
 }
 
+/// Installs are serialized.
+///
+/// The staging tree is private (a UUID), but `destination` and
+/// `.previous-<name>` are **shared per package name**. Two concurrent installs
+/// of the same package would then move and delete each other's trees: the
+/// second one's `remove_dir_all(previous)` + rename displaces the first one's
+/// fresh install, and whichever finishes last restores over the other. A lock
+/// is the simple correct answer — installs are rare and run on a blocking
+/// thread, so holding it costs nothing that matters.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold it for the whole install. A panic while holding it must not make every
+/// later install fail: the lock orders the work, it does not guard an invariant
+/// that a panic could leave broken, so poison is ignored.
+fn install_guard() -> std::sync::MutexGuard<'static, ()> {
+    INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Install a bundle that is already in memory. Split out so tests can drive the
 /// whole unpack/validate/move path without a network.
 pub fn install_bytes(bundle: &[u8]) -> Result<PackageRecord, String> {
@@ -881,6 +924,11 @@ pub fn install_bytes_with(
     bundle: &[u8],
     on_stage: &mut dyn FnMut(InstallStage) -> bool,
 ) -> Result<PackageRecord, String> {
+    // One install at a time: the destination and `.previous-<name>` directories
+    // are shared per package name, so two concurrent installs would displace
+    // each other's trees. Held for the whole call — this is sync code on a
+    // blocking thread, so no lock is held across an await.
+    let _serialized = install_guard();
     let root = packages_root();
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
@@ -984,16 +1032,16 @@ pub fn install_bytes_with(
         }
     }
     if let Err(error) = install_alias_links(&manifest) {
-        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
+        restore_previous(&manifest, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     if let Err(error) = install_python_links(&manifest, &destination) {
-        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
+        restore_previous(&manifest, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     if let Err(error) = install_data_links(&manifest, &destination) {
         remove_python_links(&manifest);
-        restore_previous(&manifest.name, &destination, &previous, outgoing.as_ref());
+        restore_previous(&manifest, &destination, &previous, outgoing.as_ref());
         return Err(error);
     }
     // Remember what this package claims outside its own tree *before* the
@@ -1018,11 +1066,25 @@ pub fn install_bytes_with(
 /// the caller is on an error path and the error being returned is the important
 /// half.
 fn restore_previous(
-    name: &str,
+    installed: &Manifest,
     destination: &std::path::Path,
     previous: &std::path::Path,
     outgoing: Option<&Manifest>,
 ) {
+    let name = installed.name.as_str();
+    // Whatever the failed install got as far as writing has to go first:
+    // `install_alias_links` may have created some of its links before the one
+    // that failed, and `install_python_links`/`install_data_links` leave
+    // registry entries behind. Without this a fresh install (no previous)
+    // leaves shims pointing at `pluginhost` for a package that is not there,
+    // and the command later fails with "no package provides …".
+    //
+    // Removing only what *this* manifest claims, so nothing another package
+    // holds is touched.
+    remove_alias_links(installed);
+    remove_python_links(installed);
+    remove_data_links(installed);
+    forget_data_dirs(&installed.name);
     // The new tree is unusable by construction; clear it so the rename has a free
     // target even if the failure left a partial tree behind.
     let _ = std::fs::remove_dir_all(destination);
@@ -1281,12 +1343,13 @@ fn install_data_links(manifest: &Manifest, package_dir: &Path) -> Result<(), Str
     }
     write_data_links(&registry)?;
 
-    // zig 只认环境变量；装完立即生效（daemon 的进程环境会传给 bash 工具起的子进程），
-    // 不用等下一次重启。
+    // zig 只认环境变量；装完立即生效。登记在 capabilities 的子进程环境表里，
+    // 而不是 `std::env::set_var`——daemon 是多线程的，改进程环境会与正在
+    // `Command::spawn` 的线程竞争；那个表在每次 spawn 时被套用。
     if manifest.links.contains_key("zig") {
         let lib = linked_library_dir(&product, "zig");
         if lib.is_dir() {
-            std::env::set_var("ZIG_LIB_DIR", &lib);
+            atomcode_capabilities::process_env::set("ZIG_LIB_DIR", &lib);
         }
     }
     let _ = created;
@@ -1328,6 +1391,11 @@ fn remove_data_links(manifest: &Manifest) {
         registry.remove(name);
     }
     let _ = write_data_links(&registry);
+    // The variable named the link that just went away; leaving it set would
+    // point zig at a directory that no longer exists.
+    if mine.iter().any(|name| name == "zig") {
+        atomcode_capabilities::process_env::remove("ZIG_LIB_DIR");
+    }
 }
 
 /// Read a local bundle in chunks, reporting progress as it goes.
@@ -1499,6 +1567,7 @@ fn unpack_tar_gz(
         .entries()
         .map_err(|error| format!("bundle is not a valid .tar.gz: {error}"))?;
     let mut files = 0u64;
+    let mut unpacked = 0u64;
     let mut next_report = UNPACK_STEP;
     for entry in entries {
         let mut entry = entry.map_err(|error| format!("corrupt bundle entry: {error}"))?;
@@ -1521,7 +1590,8 @@ fn unpack_tar_gz(
             }
         };
         let target = destination.join(&relative);
-        if entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
             std::fs::create_dir_all(&target)
                 .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
             continue;
@@ -1530,12 +1600,94 @@ fn unpack_tar_gz(
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
+        // A symlink is written as a symlink, not as a text file whose contents
+        // happen to be its target (`libfoo.so.1 -> libfoo.so.1.2.3` is how a
+        // shared library ships). The target is still constrained: it may point
+        // anywhere inside the package, never out of it and never at an absolute
+        // path.
+        if entry_type.is_symlink() {
+            let link = entry
+                .link_name()
+                .map_err(|error| format!("corrupt bundle symlink: {error}"))?
+                .ok_or_else(|| format!("bundle symlink {} has no target", path.display()))?
+                .into_owned();
+            let Some(resolved) = resolve_link_target(&relative, &link) else {
+                return Err(format!(
+                    "bundle symlink escapes the package root: {} -> {}",
+                    path.display(),
+                    link.display()
+                ));
+            };
+            if let Err(error) = write_symlink(&link, &target) {
+                if error.kind() != std::io::ErrorKind::Unsupported {
+                    return Err(format!(
+                        "cannot create symlink {}: {error}",
+                        target.display()
+                    ));
+                }
+                // Windows has no symlinks. Copying the link's target keeps the
+                // bundle installable there; a link with nothing to copy is a
+                // clear error rather than a dangling shim.
+                std::fs::copy(destination.join(&resolved), &target).map_err(|copy_error| {
+                    format!(
+                        "cannot resolve symlink {} -> {} without symlink support: {copy_error}",
+                        path.display(),
+                        link.display()
+                    )
+                })?;
+            }
+            files += 1;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(format!(
+                "bundle entry {} is not a regular file, directory or symlink",
+                path.display()
+            ));
+        }
+        // Bound the single entry and the running total: the compressed bundle is
+        // capped, but gzip expands, so that cap alone does not bound the disk.
+        // `entry.size()` is what the header claims — the real limit is the
+        // `take` below, which holds even when the header understates it.
+        let declared = entry.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "bundle entry {} is {declared} bytes, over the {MAX_ENTRY_BYTES} byte limit",
+                path.display()
+            ));
+        }
+        let remaining = MAX_UNPACKED_BYTES.saturating_sub(unpacked);
+        if declared > remaining {
+            return Err(format!(
+                "bundle unpacks to more than {MAX_UNPACKED_BYTES} bytes"
+            ));
+        }
+        let cap = MAX_ENTRY_BYTES.min(remaining);
+        // Keep the executable bit: a bundle's scripts lose `+x` otherwise.
+        #[cfg(unix)]
+        let mode = entry.header().mode().unwrap_or(0o644);
         let mut body = Vec::new();
         entry
+            .by_ref()
+            .take(cap + 1)
             .read_to_end(&mut body)
             .map_err(|error| format!("cannot read bundle entry: {error}"))?;
+        if body.len() as u64 > cap {
+            return Err(format!(
+                "bundle entry {} unpacks past the {cap} byte limit",
+                path.display()
+            ));
+        }
+        unpacked += body.len() as u64;
         std::fs::write(&target, &body)
             .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if mode & 0o111 != 0 {
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+            }
+        }
         files += 1;
         // Report on whichever comes first: 200 files, or 4 MB of bundle
         // consumed. File counts alone cannot drive a percentage, and a single
@@ -1617,6 +1769,33 @@ fn classify(path: &Path) -> Relative {
     } else {
         Relative::RootDir
     }
+}
+
+/// Where a symlink entry points, resolved against the entry that carries it.
+///
+/// Returns the in-package path the link lands on, or `None` when it leaves the
+/// package — an absolute target, or more `..` than the entry has depth. Cutting
+/// the link itself still uses its original target, so relative links keep
+/// working after the tree moves; this is only the boundary check (and the copy
+/// source on platforms without symlinks).
+fn resolve_link_target(relative: &Path, link: &Path) -> Option<PathBuf> {
+    let mut out = relative.parent()?.to_path_buf();
+    let mut depth = out.components().count();
+    for component in link.components() {
+        match component {
+            Component::Normal(part) => {
+                out.push(part);
+                depth += 1;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth = depth.checked_sub(1)?;
+                out.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 fn read_manifest(dir: &Path) -> Result<Manifest, String> {
@@ -1842,9 +2021,31 @@ pub fn is_package_name(name: &str) -> bool {
         Some(first) if first.is_ascii_alphanumeric() => {}
         _ => return false,
     }
-    name.chars()
+    if !name
+        .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-        && !name.contains("..")
+        || name.contains("..")
+    {
+        return false;
+    }
+    // A trailing dot or space is silently dropped by Windows, so two different
+    // ids would land on the same directory — and a device name there opens the
+    // device instead of a file. The daemon runs on Windows too, so the id has
+    // to be a usable directory name on every platform.
+    !name.ends_with('.') && !name.ends_with(' ') && !is_windows_device_name(name)
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL` and `COM1`–`COM9`/`LPT1`–`LPT9`, which Windows
+/// reserves regardless of extension (`nul.txt` is still the device).
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    if matches!(stem.as_str(), "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (stem.starts_with("com") || stem.starts_with("lpt"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 fn is_symbol(symbol: &str) -> bool {
@@ -1870,17 +2071,44 @@ fn launcher_available() -> bool {
     bin_dir().join("pluginhost").exists()
 }
 
+/// Commands the host provides and depends on to run the agent.
+///
+/// A package taking over `python3` is the intended design — that is how the
+/// bundled CPython becomes the interpreter. These are different: `<product>/bin`
+/// is on `PATH`, so a package claiming `git` would receive the agent's own git
+/// calls, and one claiming `bash` would receive every shell the bash tool
+/// starts. The bundle digest only says the package was not tampered with; it
+/// says nothing about whether the package should own these.
+const RESERVED_COMMANDS: &[&str] = &[
+    "pluginhost",
+    "git",
+    "git-remote-https",
+    "git-remote-http",
+    "git-upload-pack",
+    "git-receive-pack",
+    "git-credential-store",
+    "bash",
+    "sh",
+];
+
 /// Refuse only what cannot be restored.
 ///
 /// A package may take over a command name the host already provides — that is
 /// how a CPython package becomes `python3`. What it may not do is replace a real
-/// file on disk, because there would be nothing to put back.
+/// file on disk, because there would be nothing to put back, or take a
+/// [`RESERVED_COMMANDS`] name, because the host would then be running the
+/// package's code as itself.
 fn check_aliases(manifest: &Manifest) -> Result<(), String> {
     if !launcher_available() {
         return Ok(());
     }
     let bin = bin_dir();
     for name in command_names(manifest) {
+        if RESERVED_COMMANDS.contains(&name.as_str()) {
+            return Err(format!(
+                "`{name}` is a command the host itself provides and cannot be taken over by a package"
+            ));
+        }
         // A name another package already took over stays theirs. Both packages
         // would otherwise point the same link at `pluginhost`, and the one that
         // was uninstalled first would take the other's command down with it.
@@ -2528,6 +2756,28 @@ mod tests {
             std::fs::create_dir_all(&bin).unwrap();
             // The launcher must look present for name checking to run at all.
             std::fs::write(bin.join("pluginhost"), b"stub").unwrap();
+            // A real file the host owns: the name is not on the reserved list, so
+            // this exercises the "cannot be restored" refusal rather than that one.
+            std::fs::write(bin.join("demo-tool"), b"stub").unwrap();
+
+            let bundle = bundle_with(
+                r#"{"name":"demo","version":"1","entry":"lib/demo.so","aliases":["demo-tool"]}"#,
+                &[("lib/demo.so", b"\x7fELF")],
+            );
+            let error = install_bytes(&bundle).unwrap_err();
+            assert!(error.contains("already exists"), "{error}");
+        });
+    }
+
+    // The host's own commands cannot be taken over at all: `<product>/bin` is on
+    // `PATH`, so a package claiming `git` would receive the agent's git calls.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_command_name_is_never_taken_over() {
+        with_temp_root(|| {
+            let bin = bin_dir();
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("pluginhost"), b"stub").unwrap();
             std::fs::write(bin.join("git"), b"stub").unwrap();
 
             let bundle = bundle_with(
@@ -2535,7 +2785,7 @@ mod tests {
                 &[("lib/demo.so", b"\x7fELF")],
             );
             let error = install_bytes(&bundle).unwrap_err();
-            assert!(error.contains("already exists"), "{error}");
+            assert!(error.contains("cannot be taken over"), "{error}");
         });
     }
 

@@ -86,6 +86,10 @@ fn apply_non_interactive_env(cmd: &mut tokio::process::Command) {
     for (key, value) in non_interactive_env_vars() {
         cmd.env(key, value);
     }
+    // Runtime packages that need a fixed path (`ZIG_LIB_DIR` for zig) register
+    // the variable instead of writing it into the daemon's own environment —
+    // `set_var` would race with every other thread that spawns a child.
+    crate::process_env::apply_async(cmd);
     #[cfg(unix)]
     let interactive = crate::askpass::current_env().is_some();
     #[cfg(not(unix))]

@@ -74,6 +74,7 @@ pub mod compaction;
 pub mod product_dirs;
 pub use product_dirs::ProductDirs;
 
+pub mod process_env;
 /// Shared L1 process utilities (console-window suppression, `shell_command`,
 /// UTF-8 locale, `is_running_as_admin`) — used here and by the CLI/TUI drivers, so
 /// `capabilities` owns them without depending on `core`. `shell_command` +
