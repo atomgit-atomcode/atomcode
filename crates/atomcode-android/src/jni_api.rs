@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::jstring;
+use jni::sys::{jint, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use crate::host::{AgentServer, HostOptions};
@@ -306,11 +306,11 @@ pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativeLastError(
 pub extern "system" fn Java_com_atomcode_app_NativeAgent_nativePort(
     _env: JNIEnv<'_>,
     _class: JClass<'_>,
-) -> j16 {
+) -> jint {
     let Ok(slot) = SERVER.lock() else {
         return 0;
     };
     slot.as_ref()
-        .map(|server| server.port() as j16)
+        .map(|server| server.port() as jint)
         .unwrap_or(0)
 }

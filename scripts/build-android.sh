@@ -80,6 +80,29 @@ echo "→ target $TARGET (API $API, profile $PROFILE)"
 echo "  NDK:    $ndk"
 echo "  linker: $linker"
 
+# The daemon embeds `webui/dist/` with rust-embed **at compile time**, and
+# `#[allow_missing]` means a stale or absent dist compiles fine — it just shows
+# up on the phone as an old UI (or a blank page), which is exactly how the 5.2.9
+# frontend went missing from an APK. So build it here, before the Rust build,
+# and refuse to package without one.
+#
+# `ATOMCODE_ANDROID_WEBUI=0` skips the rebuild for someone who has already built
+# the frontend and only wants to re-link the Rust side.
+if [ "${ATOMCODE_ANDROID_WEBUI:-1}" = "1" ]; then
+  echo "→ webui dist"
+  # Install only when the tree is missing: `npm ci` deletes `node_modules` and
+  # refetches, which fails outright on an offline machine that already has them.
+  if [ ! -d webui/node_modules ]; then
+    ( cd webui && npm ci --no-audit --no-fund )
+  fi
+  ( cd webui && npm run build )
+fi
+if [ ! -f webui/dist/index.html ]; then
+  echo "error: webui/dist/index.html is missing — the APK would embed no UI." >&2
+  echo "       Run 'cd webui && npm run build' first." >&2
+  exit 1
+fi
+
 # Gateway signing is ON by default: the overlay in this tree is the real
 # implementation (HKDF/HMAC `sign_v1`, not the public stub), and without it every
 # gateway request is refused — the app looks logged in but no turn can run. That
