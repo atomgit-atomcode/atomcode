@@ -372,7 +372,19 @@ async fn a_refused_budget_raise_falls_back_to_the_original_budget() {
     );
     assert!(options[1].max_tokens > options[0].max_tokens);
     assert_eq!(options[2].max_tokens, options[0].max_tokens);
+    let refused = options[1].max_tokens.unwrap();
     drop(options);
+    // The notice that announced the raise must not stand alone: the person is
+    // told the endpoint refused it, so the screen stops claiming that budget.
+    let events = app.context().only_session().unwrap().events();
+    assert!(
+        events.iter().any(|fact| matches!(
+            &fact.event,
+            atomcode_harness::session::SessionEvent::Notice { detail, retry: None, .. }
+                if detail.contains(&refused.to_string()) && detail.contains("退回原预算")
+        )),
+        "the refused raise is reported: {events:?}"
+    );
     app.stop();
     std::fs::remove_dir_all(root).unwrap();
 }

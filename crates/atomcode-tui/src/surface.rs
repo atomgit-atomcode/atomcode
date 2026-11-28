@@ -844,7 +844,7 @@ pub struct Terminal {
     // X11 owns clipboard data in the writing process. Keep its event loop alive
     // until this terminal is dropped rather than losing the selection on return.
     #[cfg(target_os = "linux")]
-    clipboard: Mutex<Option<crate::clipboard::Clipboard>>,
+    clipboard: Mutex<Option<system_clipboard::Clipboard>>,
     /// Whether `/raw` has stepped out onto the terminal's own screen
     /// ([`Surface::show_transcript`]): while it has, nothing is written.
     away: std::sync::atomic::AtomicBool,
@@ -1777,7 +1777,6 @@ fn give_back_stderr(_held: &StderrHeld) {}
 /// same-sized screenshots whose top and bottom chrome match, and keeps a look
 /// at a 4K picture to a couple of KB of hashing. `atomcode-tuix`'s, kept.
 #[cfg(any(not(windows), test))]
-#[cfg(not(windows))]
 fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     const SAMPLES: usize = 16;
@@ -1868,11 +1867,7 @@ fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(windows)]
     let _guard = windows_clipboard_guard();
-    // Android has no clipboard to read an image from (see `crate::clipboard`), so the
-    // whole arboard road is compiled out there rather than stubbed with an image
-    // type that module would then have to carry.
-    #[cfg(not(target_os = "android"))]
-    let from_arboard = clipboard_diagnostic("arboard_open", crate::clipboard::Clipboard::new)
+    let from_arboard = clipboard_diagnostic("arboard_open", system_clipboard::Clipboard::new)
         .ok()
         .and_then(|mut clipboard| {
             let image = clipboard_diagnostic("arboard_get_image", || clipboard.get_image()).ok();
@@ -1880,8 +1875,6 @@ fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
             image
         })
         .map(|img| (img.width, img.height, img.bytes.into_owned()));
-    #[cfg(target_os = "android")]
-    let from_arboard: Option<(usize, usize, Vec<u8>)> = None;
     #[cfg(windows)]
     {
         from_arboard.or_else(|| {
@@ -1895,6 +1888,39 @@ fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(not(windows))]
     {
         from_arboard
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+use arboard as system_clipboard;
+
+/// `arboard` has no Android backend. Termux reaches its clipboard only through
+/// `termux-clipboard-get`/`-set` (the Termux:API add-on), so here the platform
+/// clipboard is always unavailable: copying falls through to the helper
+/// commands below, and pasting is the terminal's own.
+#[cfg(target_os = "android")]
+mod system_clipboard {
+    #[derive(Debug)]
+    pub struct Error;
+
+    pub struct ImageData {
+        pub width: usize,
+        pub height: usize,
+        pub bytes: std::borrow::Cow<'static, [u8]>,
+    }
+
+    pub struct Clipboard;
+
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            Err(Error)
+        }
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            Err(Error)
+        }
+        pub fn get_image(&mut self) -> Result<ImageData, Error> {
+            Err(Error)
+        }
     }
 }
 
@@ -1957,7 +1983,7 @@ pub fn run_clipboard_helper_if_requested() -> bool {
             out.write_all(&rgba).ok()?;
             Some(())
         }),
-        "text" => crate::clipboard::Clipboard::new()
+        "text" => system_clipboard::Clipboard::new()
             .ok()
             .and_then(|mut clipboard| clipboard.get_text().ok())
             .and_then(|text| std::io::stdout().lock().write_all(text.as_bytes()).ok()),
@@ -2058,7 +2084,7 @@ fn read_clipboard_text() -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut clipboard = crate::clipboard::Clipboard::new().ok()?;
+        let mut clipboard = system_clipboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
         (!text.is_empty()).then_some(text)
     }
@@ -2080,7 +2106,7 @@ fn local_clipboard(text: &str) -> bool {
     // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
     // garbled; it stays as the fallback.
     #[cfg(windows)]
-    if crate::clipboard::Clipboard::new()
+    if system_clipboard::Clipboard::new()
         .and_then(|mut board| board.set_text(text.to_string()))
         .is_ok()
     {
@@ -2090,6 +2116,9 @@ fn local_clipboard(text: &str) -> bool {
         &[("pbcopy", &[])]
     } else if cfg!(windows) {
         &[("clip", &[])]
+    } else if cfg!(target_os = "android") {
+        // Termux, with the Termux:API add-on installed.
+        &[("termux-clipboard-set", &[])]
     } else {
         &[
             ("wl-copy", &["--type", "text/plain;charset=utf-8"]),
@@ -2739,7 +2768,7 @@ impl Surface for Terminal {
             }
             let mut owner = self.clipboard.lock().expect("clipboard poisoned");
             if owner.is_none() {
-                *owner = crate::clipboard::Clipboard::new().ok();
+                *owner = system_clipboard::Clipboard::new().ok();
             }
             if owner
                 .as_mut()

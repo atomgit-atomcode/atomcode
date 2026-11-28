@@ -44,7 +44,6 @@ pub mod block;
 mod browser_terminal;
 pub mod caps;
 pub mod clip_hint;
-pub mod clipboard;
 pub mod command;
 pub mod commands;
 pub mod conformance;

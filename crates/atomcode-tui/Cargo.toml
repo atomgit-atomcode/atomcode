@@ -42,14 +42,6 @@ zeroize = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 tracing = "0.1"
-# Reading the clipboard. The surface is the only row allowed to talk to the
-# terminal, and the clipboard is the terminal's — so the platform lives here,
-# behind `Surface::clipboard_image`, and everything above it sees an
-# `ImageContent` and nothing else.
-#
-# Not on Android: arboard has no backend there and its platform module does not
-# compile (`platform::Clear` missing). `src/clipboard.rs` substitutes a stub that
-# reports "unavailable", which is the truth on a phone anyway.
 # Anonymous input files keep clipboard helpers from blocking on a full pipe.
 tempfile = "3"
 # arboard hands back raw RGBA; every provider wants an encoded image, so the
@@ -71,6 +63,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
+# Reading the clipboard. The surface is the only row allowed to talk to the
+# terminal, and the clipboard is the terminal's — so the platform lives here,
+# behind `Surface::clipboard_image`, and everything above it sees an
+# `ImageContent` and nothing else. `arboard` has no Android backend; there the
+# surface uses `system_clipboard`'s stand-in and copies through helper commands.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3"
+
 # Unix terminal restoration, signal/job control and stderr descriptor handling.
 # Colour queries use crossterm's shared input reader instead of direct tty reads.
 [target.'cfg(unix)'.dependencies]
@@ -79,9 +79,6 @@ libc = "0.2"
 # The raw `CF_DIB` behind a Windows clipboard picture, for the screenshots
 # `arboard` cannot decode (the Snipping Tool's and Qt tools' V5 headers). The
 # same crate `arboard` already uses there, so nothing new is built.
-[target.'cfg(not(target_os = "android"))'.dependencies]
-arboard = "3"
-
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 

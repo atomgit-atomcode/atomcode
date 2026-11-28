@@ -456,7 +456,11 @@ export async function getTodoSources(project: string, session: string, signal: A
 
 export interface DisplayHistoryCursor { session: string; before: number; digest: string }
 
-export interface SessionDetail {
+export interface TodoSnapshot {
+  todo_state?: import('./lib/todoState').TodoItem[];
+}
+
+export interface SessionDetail extends TodoSnapshot {
   history_seed?: SessionMessage[];
   history_older?: DisplayHistoryCursor;
   summary_count?: number;
@@ -1252,7 +1256,7 @@ export interface LiveLoopProgress {
 export type LiveWireEvent =
   | { type: 'context_compacting'; active: boolean; diagnostic?: string }
   | { type: 'context_summary'; count: number; record: boolean }
-  | { type: 'snapshot'; history_seed?: SessionMessage[]; history_older?: DisplayHistoryCursor; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null }
+  | (TodoSnapshot & { type: 'snapshot'; history_seed?: SessionMessage[]; history_older?: DisplayHistoryCursor; summary_count?: number; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; model?: string | null; mode: ApprovalMode; goal?: LiveGoalProgress | null; loop_progress?: LiveLoopProgress | null })
   | ({ type: 'goal_changed' } & LiveGoalProgress)
   | ({ type: 'loop_changed' } & LiveLoopProgress)
   | { type: 'provider'; provider: string; model?: string | null }

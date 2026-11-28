@@ -820,10 +820,14 @@ pub struct Moment {
     ///
     /// Polled rather than pushed, and that is forced: an allowance moves on the
     /// account's clock, not on anything this session does, so there is nothing
-    /// to subscribe to. The check is made after a turn ends and no more often
-    /// than [`crate::plugin::ALLOWANCE_EVERY`] — a question asked on the
-    /// account costs a round trip, and the answer only matters at the rate a
-    /// person can spend it.
+    /// to subscribe to. The check fires after a turn ends, and on the idle
+    /// beat while a badge is actually on the row, held to no more often than
+    /// [`crate::plugin::ALLOWANCE_EVERY`] — a question asked on the account
+    /// costs a round trip. The throttle is reset — the next ask fires at
+    /// once — by the model/_provider switch (`AgentEvent::Described`'s
+    /// refresh: the cached figure is dropped as no longer about this
+    /// provider), and one immediate recheck is allowed while the row's 100%
+    /// badge signals an early reset.
     ///
     /// Kept whatever the figure is, so the decision about *when it is worth
     /// saying* stays in the drawing, where it can be judged without a network

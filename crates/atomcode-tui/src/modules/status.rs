@@ -641,6 +641,18 @@ const ALLOWANCE_NEAR: u8 = 80;
 /// From here on it is not a warning any more.
 const ALLOWANCE_SPENT: u8 = 95;
 
+/// Whether the badge is on the row right now — the cheap form of
+/// [`allowance_badge`], for callers that only need the visibility judgment
+/// and would otherwise build a string every heartbeat just to ask. The row's
+/// render draws through [`allowance_badge`], which keys on this exact
+/// predicate, so "visible here" and "drawn there" cannot disagree.
+pub(crate) fn badge_visible(
+    left: &crate::moment::Allowance,
+    now: crate::moment::Timestamp,
+) -> bool {
+    left.percent >= ALLOWANCE_NEAR && !left.resets_by.is_some_and(|by| by <= now)
+}
+
 /// What the row says about the allowance, or `None` when it says nothing.
 ///
 /// Its own function, and pure, so the whole decision — *whether* to speak, and
@@ -650,15 +662,14 @@ const ALLOWANCE_SPENT: u8 = 95;
 /// was left when the host answered. Past it the window has turned over and the
 /// figure is about a window that no longer exists, so the row says nothing
 /// rather than "90%" of an allowance that is back to full.
-fn allowance_badge(
+pub(crate) fn allowance_badge(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
 ) -> Option<String> {
-    if left.percent < ALLOWANCE_NEAR {
+    if !badge_visible(left, now) {
         return None;
     }
     let remaining = match left.resets_by {
-        Some(by) if by <= now => return None,
         Some(by) => (by.as_millis() - now.as_millis()).div_ceil(1000),
         None => 0,
     };
@@ -1081,6 +1092,27 @@ mod tests {
             "a countdown is still something to say about when"
         );
 
+        // The boundary: the instant the window turns over the figure is about
+        // a window that no longer exists, so the row says nothing — exactly
+        // `resets_by == now`, not just past it.
+        let boundary = crate::moment::Allowance {
+            label: "5 小时".into(),
+            percent: 90,
+            resets_at: String::new(),
+            resets_by: Some(crate::moment::Timestamp::millis(3_600_000)),
+        };
+        let at_the_instant = crate::moment::Timestamp::millis(3_600_000);
+        assert_eq!(
+            allowance_badge(&boundary, at_the_instant),
+            None,
+            "resets_by == now is a window already gone"
+        );
+        let one_milli_left = crate::moment::Timestamp::millis(3_599_999);
+        assert!(
+            allowance_badge(&boundary, one_milli_left).is_some(),
+            "one milli before the boundary the badge is still on the row"
+        );
+
         // Spent is still said — it is the one figure that changes what happens
         // next. The colour is the row's business; the words are the same.
         assert_eq!(
@@ -1102,6 +1134,31 @@ mod tests {
             !row.contains("滚动窗口") && !row.contains("窗口结束"),
             "{row}"
         );
+    }
+
+    /// The cheap visibility judgment and the badge it feeds must agree on
+    /// every input: the heartbeat asks `badge_visible`, the draw asks
+    /// `allowance_badge` — if the two ever disagreed, the row would say
+    /// "nothing to see" while drawing a badge, or the other way round.
+    #[test]
+    fn badge_visible_and_allowance_badge_never_disagree() {
+        let now = crate::moment::Timestamp::millis(0);
+        let left = |percent, resets_at: &str| crate::moment::Allowance {
+            label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
+            percent,
+            resets_at: resets_at.into(),
+            resets_by: None,
+        };
+        for percent in [0, 1, ALLOWANCE_NEAR - 1, ALLOWANCE_NEAR, 50, 99, 100] {
+            for resets_at in ["", "17:51"] {
+                let allowance = left(percent, resets_at);
+                assert_eq!(
+                    badge_visible(&allowance, now),
+                    allowance_badge(&allowance, now).is_some(),
+                    "visibility judgment and drawn badge must agree at {percent}% / {resets_at}"
+                );
+            }
+        }
     }
 
     /// A countdown is counted from when the host said it, not frozen at it: the

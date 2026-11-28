@@ -789,7 +789,8 @@ pub fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+// Termux ships `xdg-open` (termux-tools), handing the URL to Android.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)
@@ -857,7 +858,12 @@ pub fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows"
+)))]
 pub fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }

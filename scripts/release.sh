@@ -244,6 +244,7 @@ emit_entry() {
         "linux-x64:atomcode-${VERSION}-linux-x64" \
         "linux-arm64:atomcode-${VERSION}-linux-arm64" \
         "ohos-arm64:atomcode-${VERSION}-ohos-arm64" \
+        "android-arm64:atomcode-${VERSION}-android-arm64" \
         "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
         "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
     do

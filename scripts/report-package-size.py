@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 
-TARGETS = r"darwin-arm64|darwin-x64|linux-arm64|linux-x64|ohos-arm64|windows-arm64|windows-x64"
+TARGETS = r"android-arm64|darwin-arm64|darwin-x64|linux-arm64|linux-x64|ohos-arm64|windows-arm64|windows-x64"
 ARTIFACT = re.compile(rf"^atomcode-v[0-9].*-({TARGETS})(\.exe)?$")
 
 

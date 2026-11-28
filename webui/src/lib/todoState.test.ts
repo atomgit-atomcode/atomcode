@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { applyTodoCall, projectTodoCalls } from './todoState.ts';
+import { applyTodoCall, projectTodoCalls, restoreTodoProjection } from './todoState.ts';
 
 test('full TodoWrite plans replace the current list and decode repaired string arrays', () => {
   const next = applyTodoCall(
@@ -100,4 +100,24 @@ test('failed and malformed calls do not make a hidden prior plan applicable', ()
   assert.equal(projectTodoCalls(base, [
     { id: 'malformed', name: 'todowrite', args: '{"todos":[{"content":"","status":"pending"}]}' },
   ]).hasApplicable, false);
+});
+
+test('snapshot restores compacted todos without replaying old calls or resurrecting a clear', () => {
+  const saved = [{ content: 'retained task', status: 'in_progress' as const }];
+  const calls = [
+    { id: 'old-add', name: 'todowrite', args: '{"action":"add","content":"old task"}', success: true },
+    { id: 'old-preview', name: 'todowrite', args: '{"action":"add","content":"old preview"}' },
+  ];
+  const restored = restoreTodoProjection(calls, saved);
+  assert.deepEqual(restored.committed, saved);
+  assert.deepEqual(restored.preview, saved);
+  assert.equal(restored.hasUnresolved, false);
+  const cleared = restoreTodoProjection(calls, []);
+  assert.deepEqual(cleared.committed, []);
+  assert.deepEqual(cleared.preview, []);
+  assert.equal(cleared.hasUnresolved, false);
+  assert.equal(restoreTodoProjection(calls).preview.length, 2);
+  assert.deepEqual(projectTodoCalls(restored.committed, [{
+    id: 'new-update', name: 'todowrite', args: '{"action":"update","id":1,"status":"completed"}', success: true,
+  }]).committed, [{ content: 'retained task', status: 'completed' }]);
 });

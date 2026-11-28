@@ -1311,10 +1311,19 @@ async fn answer_prompts(
 
 /// The least time between two questions about the allowance.
 ///
-/// The figure only moves when a turn spends something, and the question costs a
-/// round trip on the account — so it is asked after a turn and then held off
-/// for this long. The number is the one `atomcode-tuix` settled on.
+/// The question costs a round trip on the account, so it is asked after a
+/// turn — or, on an idle heartbeat, while the row actually shows a badge at
+/// or past the near threshold (the idle re-ask that lets a mid-window
+/// refresh reach the row). The one immediate recheck a turn can trigger
+/// fires while the row already shows a badge that has hit 100% (the first
+/// sign of an early reset), not for a fresh or unrendered figure. The
+/// throttle is also RESET — the next ask fires at once — when the model or
+/// provider changes: the cached figure is dropped, so it cannot answer for
+/// the new provider. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Give slow host replies time to land beyond one polling interval.
+const ALLOWANCE_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Where a key goes while an approval or question panel waits: the panel, or —
 /// when the composer is still on screen AND holds text the person was
@@ -1920,10 +1929,30 @@ pub struct Tui {
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// When the allowance was last asked about and whether it was a forced
-    /// refresh after a successful turn with a full quota badge.
+    /// refresh after a successful turn with a full quota badge. The idle
+    /// heartbeat's re-ask (while a badge is on the row) goes through the
+    /// same throttle, so this timestamp covers both askers.
     allowance_checked: Mutex<Option<(tokio::time::Instant, bool)>>,
     /// Invalidates replies from replaced models and superseded quota requests.
     allowance_generation: Arc<AtomicU64>,
+    /// The oldest ask in the current run of failed asks: every ask after the
+    /// last one that answered has failed, so a reply from before the run is
+    /// still the freshest data the page has seen and is allowed to land
+    /// instead of being retired with the rest. A landing reply or a model
+    /// switch ends the run. (An empty window is a successful answer — it
+    /// clears the badge — not a failure.)
+    failed_generation: Arc<AtomicU64>,
+    /// The generation of the figures that last landed: a pre-failure reply is
+    /// only the freshest data in hand while it is newer than what the row
+    /// already shows. A landing reply moves it.
+    allowance_figures_generation: Arc<AtomicU64>,
+    /// How many allowance asks are in flight. Idle asks ride the current
+    /// generation instead of bumping it, so a second ask of the same
+    /// generation — an idle beat racing a turn-end ask — could land out of
+    /// order: the beat holds off until every in-flight ask is done. The ask
+    /// itself is wrapped in a budget timeout, so a host that never answers
+    /// still ends its task and the count cannot stick.
+    allowance_asks_out: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
     /// line that came back every turn would be one more thing to read past.
@@ -3113,6 +3142,7 @@ impl UserInterface for Tui {
                         }
                         m.tick = m.tick.wrapping_add(1);
                     }
+                    self.idle_beat();
                     stale = true;
                 }
                 // A drag held still at the conversation's edge: one more row.
@@ -6860,11 +6890,6 @@ impl Tui {
         });
     }
 
-    /// Ask how much allowance is left, at most this often.
-    ///
-    /// Tied to a turn ending rather than to a timer, and then held to this
-    /// interval: a turn is when the figure can have moved, and the question
-    /// costs a round trip on the account. Idle, nothing is asked at all.
     /// Bring in what was typed into this project's other sessions, once.
     ///
     /// **Older than everything this session has**, so it goes in front: the
@@ -6944,7 +6969,27 @@ impl Tui {
         });
     }
 
-    fn check_allowance(&self, model_completed: bool) {
+    /// The idle beat: the account may have refreshed mid-window while nobody
+    /// was looking. Re-ask — still throttled by [`ALLOWANCE_EVERY`] — only
+    /// while the badge is actually on the row, the SAME visibility the draw
+    /// uses: a figure nobody sees costs a round trip for nothing.
+    fn idle_beat(&self) {
+        let badge_on_row = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            m.allowance
+                .as_ref()
+                .is_some_and(|left| crate::modules::status::badge_visible(left, m.now))
+        };
+        if badge_on_row && self.allowance_asks_out.load(Ordering::SeqCst) == 0 {
+            // The idle ask is the ask itself: it rides the current generation
+            // (see check_allowance), so a slow reply still lands. While any
+            // ask is out the beat holds off — a second of the same
+            // generation would be its out-of-order twin.
+            self.check_allowance(false, true);
+        }
+    }
+
+    fn check_allowance(&self, model_completed: bool, idle: bool) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             return;
         };
@@ -6971,34 +7016,80 @@ impl Tui {
             // A successful model turn can be the first sign of an early reset.
             // Allow one immediate recheck, even if the old lookup is in flight.
             *last = Some((now, recheck_full_window));
-            self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
+            // An idle re-ask rides the CURRENT generation instead of bumping
+            // it: consecutive idle asks sit ALLOWANCE_EVERY apart, and a reply
+            // slower than that would be retired by the next ask's bump — the
+            // badge would never follow a mid-window refresh. Turn-end and
+            // model-switch asks supersede what is in flight, as before.
+            if idle {
+                self.allowance_generation.load(Ordering::SeqCst)
+            } else {
+                self.allowance_generation.fetch_add(1, Ordering::SeqCst) + 1
+            }
         };
+        // Count every ask in flight: an idle ask rides the CURRENT
+        // generation, so a second ask of that same generation — the beat
+        // racing a turn-end ask — could land out of order. The count clears
+        // when the ask's task ends — landed, failed, stale or superseded.
+        self.allowance_asks_out.fetch_add(1, Ordering::SeqCst);
+        let ask_out = self.allowance_asks_out.clone();
+        // Drops the in-flight count whenever the spawned task ends, so the
+        // next idle beat can ask again whatever path the task takes.
+        struct AskDone(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        impl Drop for AskDone {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         let session = self.client.session();
         let host = self.host.clone();
         let nudged = self.allowance_nudged.clone();
         let client = self.client.clone();
         let allowance_generation = self.allowance_generation.clone();
+        let failed_generation = self.failed_generation.clone();
+        let allowance_figures_generation = self.allowance_figures_generation.clone();
         let addressed_session = session.clone();
         let repaint = ctx.service::<RepaintSvc>();
         tokio::spawn(async move {
+            let _ask_done = AskDone(ask_out);
             // The cheap form — the windows and nothing else. The plan behind
             // them and what has been spent are two more round trips, and
             // neither is on this row.
-            let windows = match control
-                .call(HostCommand::Usage {
+            let windows = match tokio::time::timeout(
+                ALLOWANCE_HOST_TIMEOUT,
+                control.call(HostCommand::Usage {
                     session,
                     windows_only: true,
-                })
-                .await
+                }),
+            )
+            .await
             {
-                Ok(HostReply::Usage {
+                Ok(Ok(HostReply::Usage {
                     windows,
                     unavailable: None,
                     ..
-                }) => windows,
+                })) => windows,
                 // A host that will not say leaves the row as it was. Blanking
-                // it on a failed question would read as "you are back to zero".
-                _ => return,
+                // it on a failed question would read as "you are back to zero"
+                // — but the failure is remembered while it is still the
+                // newest ask: the run of failed asks grows at its oldest end,
+                // so the reply from just before the run is the freshest
+                // figure in hand and may land. A superseded ask's late
+                // failure must not clobber the run's record.
+                _ => {
+                    // This ask was the newest when the failure arrived (the
+                    // generation check above), so it starts — or extends —
+                    // the run of failed asks. A superseded ask's late failure
+                    // never gets here, which is what keeps the run's record
+                    // from being clobbered.
+                    if generation == allowance_generation.load(Ordering::SeqCst) {
+                        let previous = failed_generation.load(Ordering::SeqCst);
+                        if previous == 0 {
+                            failed_generation.store(generation, Ordering::SeqCst);
+                        }
+                    }
+                    return;
+                }
             };
             // Out of quota: the alternative is a command most people do not know
             // exists, and the other front end says the same thing on the same
@@ -7010,9 +7101,21 @@ impl Tui {
             }
             let (changed, warning) = {
                 let mut m = host.moment.write().expect("moment poisoned");
-                if generation != allowance_generation.load(Ordering::SeqCst) {
+                let current = allowance_generation.load(Ordering::SeqCst);
+                let failed = failed_generation.load(Ordering::SeqCst);
+                let figures = allowance_figures_generation.load(Ordering::SeqCst);
+                // The pre-failure exemption covers only a reply newer than
+                // the recorded mark: standing figures after a landing, or the
+                // switch's own generation after a model switch — a reply
+                // older than THAT is about the previous provider.
+                let retired = generation != current
+                    && !(failed != 0 && generation < failed && generation >= figures);
+                if retired {
                     return;
                 }
+                // Fresh data in hand: the run of failed asks it outlived is over.
+                failed_generation.store(0, Ordering::SeqCst);
+                allowance_figures_generation.store(generation, Ordering::SeqCst);
                 let warning = crate::moment::Allowance::exhausted(&windows)
                     .filter(|_| !nudged.swap(true, Ordering::SeqCst))
                     .map(|spent| {
@@ -8016,6 +8119,17 @@ impl Tui {
                     let cleared_allowance = refresh_allowance && moment.allowance.take().is_some();
                     if refresh_allowance {
                         self.allowance_generation.fetch_add(1, Ordering::SeqCst);
+                        self.failed_generation.store(0, Ordering::SeqCst);
+                        // The failed-run exemption must not reach across a
+                        // model switch: a pre-switch reply is about the
+                        // previous provider. Recording the switch's own
+                        // generation as the figures mark blocks replies older
+                        // than the switch while still letting post-switch
+                        // pre-run replies through.
+                        self.allowance_figures_generation.store(
+                            self.allowance_generation.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
                     }
                     moment.ctx_window = window;
                     moment.model = model;
@@ -8026,7 +8140,7 @@ impl Tui {
                 if refresh_allowance {
                     *self.allowance_checked.lock().expect("allowance poisoned") = None;
                     self.allowance_nudged.store(false, Ordering::SeqCst);
-                    self.check_allowance(false);
+                    self.check_allowance(false, false);
                 }
                 // The providers rows too, and only now that the moment is free:
                 // `refresh_providers` writes the same lock this branch held, and
@@ -8486,13 +8600,16 @@ impl Tui {
                 }
                 // A turn just spent some of the allowance, so this is the
                 // moment the figure changed. Rate-limited inside.
-                self.check_allowance(matches!(
-                    event,
-                    AgentEvent::TurnComplete {
-                        reason: atomcode_kernel::event::StopReason::Stopped,
-                        ..
-                    }
-                ));
+                self.check_allowance(
+                    matches!(
+                        event,
+                        AgentEvent::TurnComplete {
+                            reason: atomcode_kernel::event::StopReason::Stopped,
+                            ..
+                        }
+                    ),
+                    false,
+                );
                 // A summary the turn outlived would leave 正在压缩 up on an idle
                 // screen. An interrupted one arrives as a said line rather than
                 // as `Compacted`/`CompactionFailed`, so the turn's own end is
@@ -11789,7 +11906,7 @@ impl McpPhase for Phases {
 fn no_clipboard_picture(otherwise: Msg<'static>, remote: bool) -> Msg<'static> {
     if remote {
         Msg::ClipboardRemoteImage
-    } else if cfg!(target_env = "ohos") {
+    } else if cfg!(any(target_env = "ohos", target_os = "android")) {
         Msg::ClipboardImageUnsupportedHere
     } else {
         otherwise
@@ -12693,6 +12810,9 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
             allowance_generation: Arc::new(AtomicU64::new(0)),
+            failed_generation: Arc::new(AtomicU64::new(0)),
+            allowance_figures_generation: Arc::new(AtomicU64::new(0)),
+            allowance_asks_out: Arc::new(AtomicU64::new(0)),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
             asks_ledger: Mutex::new(crate::ask::Ledger::default()),
@@ -19969,6 +20089,245 @@ mod allowance_switch_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_idle_beat_reasks_a_visible_badge_and_stays_throttled() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // The badge is on the row: the idle beat re-asks.
+        tui.idle_beat();
+        let answer = pending.recv().await.unwrap();
+        answer.send(reply(windows.clone())).unwrap();
+        tokio::task::yield_now().await;
+        // The throttle holds: a second idle beat right after does not ask.
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "the idle re-ask must be held to ALLOWANCE_EVERY"
+        );
+        // The throttle expires: the same visible badge asks again — proof
+        // the clock has left the throttle window.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.idle_beat();
+        let later = pending.recv().await.unwrap();
+        // A REFRESHED figure, not the one the row already shows: the point of
+        // the idle re-ask is that the badge follows it.
+        let refreshed = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(90),
+            calls_used: None,
+            call_limit: None,
+        }];
+        later.send(reply(refreshed.clone())).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .is_some_and(|left| left.percent == 90),
+            "the refreshed figure must reach the row"
+        );
+        // An empty moment (no badge) does not ask even with the throttle
+        // expired, so the gate really is the badge and not the throttle.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = None;
+        }
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "a row without a badge must not be asked about"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_idle_reply_slower_than_the_throttle_still_lands() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        tui.idle_beat();
+        let answer = pending.recv().await.unwrap();
+        // The reply takes longer than the throttle: the next beat fires while
+        // the first ask is still out — and must not ask a second time.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_err(),
+            "one idle ask in flight at a time — a second would be its \
+             same-generation out-of-order twin"
+        );
+        // The idle ask rides the current generation, so a reply within the
+        // host deadline can still update the badge after the throttle interval.
+        let refreshed = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(90),
+            calls_used: None,
+            call_limit: None,
+        }];
+        answer.send(reply(refreshed)).unwrap();
+        tokio::task::yield_now().await;
+        let allowance = host.moment.read().unwrap().allowance.clone().unwrap();
+        assert_eq!(
+            allowance.percent, 90,
+            "a slow idle reply still lands — the idle ask does not retire it"
+        );
+        // The ask is done: the next beat asks again.
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        assert!(
+            pending.try_recv().is_ok(),
+            "the in-flight marker cleared with the ask"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_unanswered_allowance_ask_releases_the_next_idle_poll() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let allowance = crate::moment::Allowance {
+            label: "5h".into(),
+            percent: 99,
+            resets_at: String::new(),
+            resets_by: None,
+        };
+        host.moment.write().unwrap().allowance = Some(allowance.clone());
+
+        tui.idle_beat();
+        let unanswered = pending.recv().await.unwrap();
+        tokio::time::advance(ALLOWANCE_HOST_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(unanswered.is_closed());
+        assert_eq!(host.moment.read().unwrap().allowance, Some(allowance));
+
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        pending.try_recv().unwrap().send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        assert!(host.moment.read().unwrap().allowance.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reply_from_before_a_run_of_failed_asks_still_lands() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(100),
+            calls_used: None,
+            call_limit: None,
+        }];
+        let refused = || HostReply::Usage {
+            windows: vec![],
+            unavailable: Some("host refused".into()),
+            plan: None,
+            stats: None,
+            stats_unavailable: None,
+        };
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // The first ask is in flight. Its reply carries a DIFFERENT figure
+        // from the one already on the row: the landing assert below must be
+        // able to tell "the fresh reply landed" from "the stale state sat
+        // there untouched".
+        tui.check_allowance(false, false);
+        let first = pending.recv().await.unwrap();
+        let refreshed = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(40),
+            calls_used: None,
+            call_limit: None,
+        }];
+        // A full badge allows one immediate recheck: it fails.
+        tui.check_allowance(true, false);
+        pending.recv().await.unwrap().send(refused()).unwrap();
+        tokio::task::yield_now().await;
+        // ... and so does the next one, fired after the throttle window.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.check_allowance(false, false);
+        pending.recv().await.unwrap().send(refused()).unwrap();
+        tokio::task::yield_now().await;
+        // The reply from the first ask is the freshest figure in hand: it
+        // lands instead of being retired with the failed run that followed.
+        first.send(reply(refreshed)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let m = host.moment.read().unwrap();
+        assert!(
+            m.allowance.as_ref().is_some_and(|left| left.percent == 40),
+            "the freshest reply must outlive the failed asks after it"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn model_switch_clears_cached_quota_and_discards_the_old_pending_answer() {
         let (host, tui) = assemble(Headless::new(100, 24));
         let app = App::new(PluginRegistry::new(), ConfigTree::default());
@@ -19991,7 +20350,7 @@ mod allowance_switch_tests {
             let mut m = host.moment.write().unwrap();
             m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
         }
-        tui.check_allowance(false);
+        tui.check_allowance(false, false);
         let old = pending.recv().await.unwrap();
         tui.on_event(AgentEvent::Described {
             description: Box::new(AgentDescription {
@@ -20010,6 +20369,106 @@ mod allowance_switch_tests {
         assert!(
             !tui.allowance_nudged.load(Ordering::SeqCst),
             "a stale exhausted window must not issue a warning"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_prereply_from_the_previous_provider_never_lands_across_a_switch() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let windows = vec![atomcode_host_api::UsageWindow {
+            label: "5h".into(),
+            exhausted: false,
+            resets_at: "17:51".into(),
+            resets_in_seconds: 100,
+            window_seconds: 18_000,
+            used_percent: Some(99),
+            calls_used: None,
+            call_limit: None,
+        }];
+        {
+            let mut m = host.moment.write().unwrap();
+            m.allowance = crate::moment::Allowance::nearest(&windows, m.now);
+        }
+        // A pre-switch ask is in flight: its reply is about the previous
+        // provider and has not landed yet.
+        tui.check_allowance(false, false);
+        let pre = pending.recv().await.unwrap();
+        // The model switches: the row is cleared and the failed-run
+        // exemption must not reach across the switch.
+        tui.on_event(AgentEvent::Described {
+            description: Box::new(AgentDescription {
+                session: "lead".into(),
+                model: Some("same-wire-name".into()),
+                ..Default::default()
+            }),
+        });
+        assert!(host.moment.read().unwrap().allowance.is_none());
+        // A post-switch ask lands fresh figures: the standing mark the
+        // failed-run exemption is judged against now belongs to the NEW
+        // provider's generation. The switch's own handler re-asks after
+        // clearing the row, so the ask is already out here.
+        pending
+            .recv()
+            .await
+            .unwrap()
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                label: "5h".into(),
+                exhausted: false,
+                resets_at: "17:51".into(),
+                resets_in_seconds: 100,
+                window_seconds: 18_000,
+                used_percent: Some(40),
+                calls_used: None,
+                call_limit: None,
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .is_some_and(|left| left.percent == 40),
+            "the post-switch figures land and stand"
+        );
+        // The next ask fails: the run of failed asks begins at the newest
+        // generation.
+        tokio::time::advance(ALLOWANCE_EVERY).await;
+        tui.check_allowance(false, false);
+        pending
+            .recv()
+            .await
+            .unwrap()
+            .send(HostReply::Usage {
+                windows: vec![],
+                unavailable: Some("host refused".into()),
+                plan: None,
+                stats: None,
+                stats_unavailable: None,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        // The pre-switch reply finally arrives. It is older than the
+        // switch's own generation — the exemption's reach ends at the
+        // switch, so it must NOT write the previous provider's quota.
+        pre.send(reply(windows)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .is_some_and(|left| left.percent == 40),
+            "a pre-switch reply must not land across a model switch: the \
+             standing figures are newer than it"
         );
     }
 }

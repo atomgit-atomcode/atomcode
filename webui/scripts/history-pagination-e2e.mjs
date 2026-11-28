@@ -20,7 +20,8 @@ let transcriptReads = 0;
 let hold = null;
 let pending = null;
 let expire = false;
-const snapshot = () => ({type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full.slice(34),history_older:cursor(34)});
+const retainedTodos = [{content:"Retained task from before compaction",status:"in_progress"}];
+const snapshot = () => ({todo_state:retainedTodos,type:'snapshot',session_id:id,session_name:meta.name,project_hash:'fixture',working_dir:'/fixture',provider:'fixture',model:'fixture',mode:'build',messages:full.slice(34),history_older:cursor(34)});
 const server = createServer(async (req,res) => {
   const url = new URL(req.url,'http://localhost');
   const path = url.pathname;
@@ -47,7 +48,7 @@ const server = createServer(async (req,res) => {
       if(hold) {pending=answer;hold();return;} return answer();
     }
     assert.equal(url.searchParams.get('recent'),'true');
-    return json({...meta,messages:full.slice(34),history_older:cursor(34)});
+    return json({...meta,messages:full.slice(34),history_older:cursor(34),todo_state:retainedTodos});
   }
   if(path==='/project')return json({working_dir:'/fixture',project_hash:'fixture'});
   if(path==='/config')return json({providers:[],notifications:{enabled:false}});
@@ -72,9 +73,29 @@ try {
   const page=await browser.newPage({viewport:{width:1200,height:900}});
   page.on('pageerror',e=>errors.push(e.message));
   await page.addInitScript(()=>{localStorage.setItem('atomcode.sidebar.view.v1','flat');localStorage.setItem('atomcode.lang','en');localStorage.setItem('atomcode.onboarding.done','1');});
-  await page.goto(`http://127.0.0.1:${server.address().port}/?sync=1&session=${id}`);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const history = await browser.newPage({viewport:{width:1200,height:900}});
+  await history.addInitScript(()=>localStorage.setItem('atomcode.onboarding.done','1'));
+  await history.goto(`${base}/?session=${id}`);
+  await history.locator('.todo-progress-head').click();
+  await history.locator('.todo-progress-list').getByText(retainedTodos[0].content,{exact:true}).waitFor();
+  await history.close();
+
+  await page.goto(`${base}/?sync=1&session=${id}`);
   await page.locator('.message-input').waitFor();
   await page.getByText('PAGE_ANSWER_24',{exact:true}).waitFor();
+  const todoPanel = page.locator('.todo-progress-panel');
+  await todoPanel.locator('.todo-progress-head').click();
+  await todoPanel.getByText(retainedTodos[0].content,{exact:true}).waitFor();
+  const staleSeed = [
+    {role:'assistant',tool_calls:[{id:'old-plan',name:'todowrite',arguments:JSON.stringify({todos:retainedTodos})}]},
+    {role:'tool',tool_result:{call_id:'old-plan',success:true,summary:''}},
+    {role:'assistant',tool_calls:[{id:'old-preview',name:'todowrite',arguments:'{"action":"add","content":"Unsettled old task"}'}]},
+  ];
+  emit({...snapshot(),todo_state:[],history_seed:staleSeed});
+  await todoPanel.waitFor({state:'hidden'});
+  emit(snapshot());
+  await todoPanel.waitFor();
   assert.equal(await page.getByText('PAGE_PROMPT_0',{exact:true}).count(),0);
   assert.equal(pages.length,0,'no eager older-page fetch');
   // Composer arrows recall the loaded user turns without submitting anything.
@@ -122,6 +143,10 @@ try {
   assert.ok(loadingBox && firstUserBox && loadingBox.y+loadingBox.height<=firstUserBox.y+1,'loading owns a row and does not cover the prompt');
   emit({type:'user',text:'LIVE_PROMPT\nSECOND_LINE'});emit({type:'state',running:true});emit({type:'text',content:'LIVE_REPLY_SURVIVES'});
   await page.getByText('LIVE_REPLY_SURVIVES',{exact:true}).waitFor();
+  emit({type:'tool_start',id:'update-restored',name:'todowrite',arguments:{action:'update',id:1,status:'completed'}});
+  emit({type:'tool_result',id:'update-restored',name:'todowrite',output:'Updated task',success:true});
+  await todoPanel.locator('.todo-progress-head').click();
+  await todoPanel.locator('.todo-progress-item.completed').getByText(retainedTodos[0].content,{exact:true}).waitFor();
   await input.fill('RUNNING_DRAFT');
   await input.press('ArrowUp');await value('LIVE_PROMPT\nSECOND_LINE');
   await page.waitForFunction(()=>document.querySelector('.message-input')?.selectionStart===0);

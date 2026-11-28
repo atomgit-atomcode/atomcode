@@ -825,6 +825,8 @@ pub(crate) enum LiveWireEvent {
         history_older: Option<crate::display_history::Cursor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        todo_state: Option<Vec<atomcode_capabilities::session::manager::TodoSidecarItem>>,
         messages: Vec<crate::MessageInfo>,
         session_id: String,
         /// 会话名（Session.name）。让 App 端首次扫码连接就能在顶部显示
@@ -1819,6 +1821,11 @@ pub(crate) async fn live_stream(
             history_older,
             summary_count,
             messages: snapshot_messages,
+            todo_state: atomcode_coding::session_todo_state(
+                &join.snapshot,
+                &display_manager,
+                &join.binding.session_id,
+            ),
             session_id: join.binding.session_id.clone(),
             session_name,
             project_hash,

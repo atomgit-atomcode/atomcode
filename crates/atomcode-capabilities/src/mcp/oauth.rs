@@ -1214,7 +1214,8 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+// Termux ships `xdg-open` (termux-tools), handing the URL to Android.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)

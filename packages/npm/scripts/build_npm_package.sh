@@ -68,7 +68,12 @@ PLATFORMS=(
   "linux-x64:linux:x64"
   "win32-x64:win32:x64"
   "ohos-arm64:ohos:arm64"
+  "android-arm64:android:arm64"
 )
+
+# Platform packages actually published; the core depends on these only, so it
+# never names a version that does not exist (an asset missing from a release).
+PUBLISHED=()
 
 publish_platform() {
   local tag="$1" os="$2" arch="$3"
@@ -106,6 +111,7 @@ EOF
   # publish
   cd "$dir"
   npm publish --registry=https://registry.npmjs.org/ --access public $NPM_EXTRA
+  PUBLISHED+=("$tag")
   echo "  ✓ @atomgit.com/atomcode-${tag}@${VERSION}"
 }
 
@@ -128,18 +134,14 @@ cd "$CORE_DIR"
 # Inject version + optionalDependencies dynamically (like Codex does in CI)
 # 修复 #1515：平台包已改为独立包名发布（@atomgit.com/atomcode-{os}-{arch}），
 # 这里直接引用独立包名版本，不再用 npm: alias 指向同名平台版本。
-node -e "
+PUBLISHED_TAGS="${PUBLISHED[*]:-}" node -e "
 var fs = require('fs');
 var pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 pkg.version = '$VERSION';
-pkg.optionalDependencies = {
-  '@atomgit.com/atomcode-darwin-arm64': '$VERSION',
-  '@atomgit.com/atomcode-darwin-x64': '$VERSION',
-  '@atomgit.com/atomcode-linux-arm64': '$VERSION',
-  '@atomgit.com/atomcode-linux-x64': '$VERSION',
-  '@atomgit.com/atomcode-win32-x64': '$VERSION',
-  '@atomgit.com/atomcode-ohos-arm64': '$VERSION'
-};
+pkg.optionalDependencies = {};
+process.env.PUBLISHED_TAGS.split(' ').filter(Boolean).forEach(function (tag) {
+  pkg.optionalDependencies['@atomgit.com/atomcode-' + tag] = '$VERSION';
+});
 fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
 npm publish --registry=https://registry.npmjs.org/ --access public $NPM_EXTRA

@@ -182,6 +182,9 @@ fn relay_client_target() -> &'static str {
         ("macos", "x86_64") => "x86_64-macos",
         ("linux", "x86_64") => "x86_64-linux",
         ("linux", "aarch64") => "aarch64-linux",
+        // Termux: the static Linux client runs on Android's kernel, as it did
+        // before atomcode itself moved to the Android build.
+        ("android", "aarch64") => "aarch64-linux",
         ("windows", "x86_64") => "x86_64-win",
         _ => "unknown",
     }
