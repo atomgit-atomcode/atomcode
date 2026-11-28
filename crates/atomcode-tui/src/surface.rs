@@ -844,7 +844,7 @@ pub struct Terminal {
     // X11 owns clipboard data in the writing process. Keep its event loop alive
     // until this terminal is dropped rather than losing the selection on return.
     #[cfg(target_os = "linux")]
-    clipboard: Mutex<Option<arboard::Clipboard>>,
+    clipboard: Mutex<Option<system_clipboard::Clipboard>>,
     /// Whether `/raw` has stepped out onto the terminal's own screen
     /// ([`Surface::show_transcript`]): while it has, nothing is written.
     away: std::sync::atomic::AtomicBool,
@@ -1867,7 +1867,7 @@ fn clipboard_diagnostic<T>(stage: &str, operation: impl FnOnce() -> T) -> T {
 fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(windows)]
     let _guard = windows_clipboard_guard();
-    let from_arboard = clipboard_diagnostic("arboard_open", arboard::Clipboard::new)
+    let from_arboard = clipboard_diagnostic("arboard_open", system_clipboard::Clipboard::new)
         .ok()
         .and_then(|mut clipboard| {
             let image = clipboard_diagnostic("arboard_get_image", || clipboard.get_image()).ok();
@@ -1888,6 +1888,39 @@ fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(not(windows))]
     {
         from_arboard
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+use arboard as system_clipboard;
+
+/// `arboard` has no Android backend. Termux reaches its clipboard only through
+/// `termux-clipboard-get`/`-set` (the Termux:API add-on), so here the platform
+/// clipboard is always unavailable: copying falls through to the helper
+/// commands below, and pasting is the terminal's own.
+#[cfg(target_os = "android")]
+mod system_clipboard {
+    #[derive(Debug)]
+    pub struct Error;
+
+    pub struct ImageData {
+        pub width: usize,
+        pub height: usize,
+        pub bytes: std::borrow::Cow<'static, [u8]>,
+    }
+
+    pub struct Clipboard;
+
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            Err(Error)
+        }
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            Err(Error)
+        }
+        pub fn get_image(&mut self) -> Result<ImageData, Error> {
+            Err(Error)
+        }
     }
 }
 
@@ -1950,7 +1983,7 @@ pub fn run_clipboard_helper_if_requested() -> bool {
             out.write_all(&rgba).ok()?;
             Some(())
         }),
-        "text" => arboard::Clipboard::new()
+        "text" => system_clipboard::Clipboard::new()
             .ok()
             .and_then(|mut clipboard| clipboard.get_text().ok())
             .and_then(|text| std::io::stdout().lock().write_all(text.as_bytes()).ok()),
@@ -2051,7 +2084,7 @@ fn read_clipboard_text() -> Option<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let mut clipboard = system_clipboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
         (!text.is_empty()).then_some(text)
     }
@@ -2073,7 +2106,7 @@ fn local_clipboard(text: &str) -> bool {
     // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
     // garbled; it stays as the fallback.
     #[cfg(windows)]
-    if arboard::Clipboard::new()
+    if system_clipboard::Clipboard::new()
         .and_then(|mut board| board.set_text(text.to_string()))
         .is_ok()
     {
@@ -2083,6 +2116,9 @@ fn local_clipboard(text: &str) -> bool {
         &[("pbcopy", &[])]
     } else if cfg!(windows) {
         &[("clip", &[])]
+    } else if cfg!(target_os = "android") {
+        // Termux, with the Termux:API add-on installed.
+        &[("termux-clipboard-set", &[])]
     } else {
         &[
             ("wl-copy", &["--type", "text/plain;charset=utf-8"]),
@@ -2732,7 +2768,7 @@ impl Surface for Terminal {
             }
             let mut owner = self.clipboard.lock().expect("clipboard poisoned");
             if owner.is_none() {
-                *owner = arboard::Clipboard::new().ok();
+                *owner = system_clipboard::Clipboard::new().ok();
             }
             if owner
                 .as_mut()

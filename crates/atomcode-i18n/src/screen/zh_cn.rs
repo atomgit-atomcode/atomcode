@@ -1600,7 +1600,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()
         }
-        Msg::ClipboardImageUnsupportedHere => "鸿蒙上读不到系统剪贴板（文字和图片都读不到）。粘贴文字：在输入框里右键或长按，选「粘贴」；添加图片：存成文件后用 /paste <图片路径>，或直接在输入框里写它的绝对路径".into(),
+        Msg::ClipboardImageUnsupportedHere => "当前系统上读不到系统剪贴板（文字和图片都读不到）。粘贴文字：在输入框里右键或长按，选「粘贴」；添加图片：存成文件后用 /paste <图片路径>，或直接在输入框里写它的绝对路径".into(),
         Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
         Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
         Msg::ChangelogNewTag => "新".into(),

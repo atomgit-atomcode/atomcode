@@ -11906,7 +11906,7 @@ impl McpPhase for Phases {
 fn no_clipboard_picture(otherwise: Msg<'static>, remote: bool) -> Msg<'static> {
     if remote {
         Msg::ClipboardRemoteImage
-    } else if cfg!(target_env = "ohos") {
+    } else if cfg!(any(target_env = "ohos", target_os = "android")) {
         Msg::ClipboardImageUnsupportedHere
     } else {
         otherwise
