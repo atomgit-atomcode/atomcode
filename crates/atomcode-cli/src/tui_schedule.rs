@@ -119,6 +119,7 @@ mod tests {
                 time: "09:00".into(),
             },
             permission_mode: "plan".into(),
+            allow_unattended_auto: false,
             notify: "important".into(),
             enabled,
             created_at: 0,

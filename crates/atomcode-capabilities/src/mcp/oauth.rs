@@ -1214,8 +1214,11 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-// Termux ships `xdg-open` (termux-tools), handing the URL to Android.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// Termux ships `xdg-open` (termux-tools), handing the URL to Android. Not on
+// Android itself: this product runs inside an app process, which cannot launch
+// another app's activity — that path is the `target_os = "android"` arm above,
+// and keeping both would define `open_browser` twice on Android (E0428).
+#[cfg(target_os = "linux")]
 fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)

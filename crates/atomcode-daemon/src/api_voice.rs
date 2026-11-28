@@ -179,7 +179,24 @@ fn read_recording_in(root: &std::path::Path, path: &std::path::Path) -> Result<V
     if !resolved.starts_with(&root) {
         return Err(format!("the recording is outside {}", root.display()));
     }
-    let metadata = std::fs::metadata(&resolved)
+    // Check and read **the same handle**. Deciding on a path and then opening that
+    // path again leaves a window: whatever can write inside `voice/` can swap the
+    // file — or its final component — for a symlink in between, and the read
+    // follows it out of the root, into bytes that are then sent to the provider.
+    let mut file = open_without_following(&resolved)
+        .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
+    // `O_NOFOLLOW` guards only the last component. A directory swapped on the way
+    // is invisible to it, so on Linux ask the kernel what this handle really is
+    // and re-check that — the answer comes from the handle, not from a second
+    // path resolution.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(opened) = opened_path(&file) {
+        if !opened.starts_with(&root) {
+            return Err(format!("the recording is outside {}", root.display()));
+        }
+    }
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
     if !metadata.is_file() {
         return Err(format!("not a file: {}", resolved.display()));
@@ -204,13 +221,55 @@ fn read_recording_in(root: &std::path::Path, path: &std::path::Path) -> Result<V
             metadata.len()
         ));
     }
-    let audio = std::fs::read(&resolved)
+    let mut audio = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut audio)
         .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
     let is_wav = audio.len() >= 12 && &audio[0..4] == b"RIFF" && &audio[8..12] == b"WAVE";
     if !is_wav {
         return Err("the recording is not a WAV file".to_string());
     }
     Ok(audio)
+}
+
+/// Open a file without following a symlink in its final component.
+///
+/// The point is that the caller reads the handle it checked: following the link
+/// at open time would let a swap between the check and the read decide what the
+/// bytes are.
+#[cfg(unix)]
+fn open_without_following(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Windows has no `O_NOFOLLOW`; the equivalent is opening the reparse point
+/// instead of the target it points at.
+#[cfg(windows)]
+fn open_without_following(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_without_following(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+/// What the kernel actually opened, asked through the handle.
+///
+/// `None` where that question has no answer; the caller then keeps the weaker
+/// guarantee (final component not a symlink) rather than failing the read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn opened_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
 /// Where the app parks its recordings: `<product>/voice`.
@@ -542,6 +601,34 @@ mod tests {
         let refused =
             read_recording_in(&root, &traversal).expect_err("a traversal must be refused");
         assert!(refused.contains("outside"), "{refused}");
+    }
+
+    /// The check and the read have to be about the same file.
+    ///
+    /// Containment is decided on a canonical path, but the read then has to open
+    /// *that* path again — and in between, something able to write inside the
+    /// recordings directory can put a symlink there. Refusing to follow the link
+    /// at open time is what closes that window, so the open itself is the unit
+    /// under test here.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_recording_is_not_followed_when_opened() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real.wav");
+        std::fs::write(&real, b"RIFF").expect("write");
+        let link = dir.path().join("link.wav");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let error = open_without_following(&link).expect_err("opening must not follow the link");
+        // Linux says ELOOP, other unices say something else; the outcome is the
+        // contract, not the errno.
+        assert!(!error.to_string().is_empty());
+
+        // The real file still opens — the guard is about links, not files.
+        let mut file = open_without_following(&real).expect("the real file opens");
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut body).expect("read");
+        assert_eq!(body, b"RIFF");
     }
 
     /// A stale recording is swept away; a fresh one is left alone.

@@ -44,6 +44,16 @@ pub struct ScheduleTask {
     pub follow_up: Option<FollowUpTask>,
     #[serde(default = "default_mode")]
     pub permission_mode: String, // "plan" | "accept_edits" | "auto"
+    /// Whether `permission_mode: "auto"` is allowed to mean what it says here.
+    ///
+    /// A scheduled task runs with nobody watching, and `auto` answers approval
+    /// requests inside the runtime — no driver ever sees them, so there is
+    /// nothing left to refuse. Silently granting that to a task somebody typed
+    /// `"auto"` into is how a phone in a pocket runs shell commands overnight.
+    /// Without this flag `auto` degrades to `accept_edits` (edits yes, shell
+    /// still asks); setting it is the deliberate "I know, run anyway".
+    #[serde(default)]
+    pub allow_unattended_auto: bool,
     #[serde(default = "default_notify")]
     pub notify: String, // "off" | "important" | "all"
     #[serde(default = "default_true")]
@@ -208,6 +218,7 @@ mod tests {
                 time: "09:00".into(),
             },
             permission_mode: "plan".into(),
+            allow_unattended_auto: false,
             notify: "important".into(),
             enabled: true,
             created_at: 0,
@@ -225,6 +236,24 @@ mod tests {
         assert_eq!(back.id, "t1");
         assert!(matches!(back.schedule, Schedule::Daily { .. }));
         assert_eq!(back.permission_mode, "plan");
+    }
+
+    #[test]
+    fn a_task_written_before_the_flag_existed_does_not_get_auto() {
+        // The field is new. A stored task that says `auto` but predates it must
+        // come back with the flag off — otherwise every task somebody already
+        // created would silently keep unattended `auto`.
+        let json = r#"{
+            "id": "old",
+            "title": "Old task",
+            "prompt": "do it",
+            "cwd": "/tmp",
+            "schedule": { "kind": "hourly" },
+            "permission_mode": "auto"
+        }"#;
+        let task: ScheduleTask = serde_json::from_str(json).unwrap();
+        assert_eq!(task.permission_mode, "auto");
+        assert!(!task.allow_unattended_auto, "must default to off");
     }
 
     #[test]

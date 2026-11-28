@@ -5659,7 +5659,9 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     }
     set_private_create_mode(&mut options);
     no_follow(&mut options);
-    let mut file = options.open(path).map_err(|e| io_at(path, e))?;
+    // Only the Windows branch below needs `mut` (it seeks); on unix the handle
+    // is used immutably, so a `mut` here would be an unused_mut warning there.
+    let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
     #[cfg(windows)]

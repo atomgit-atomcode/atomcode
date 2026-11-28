@@ -62,6 +62,15 @@ pub enum ScheduleCli {
         /// Completion notifications: off | important (global duration threshold) | all (every completion).
         #[arg(long, default_value = "important", value_parser = ["off", "important", "all"])]
         notify: String,
+
+        /// Let `--mode auto` stay auto while nobody is watching.
+        ///
+        /// A scheduled task runs unattended, and `auto` answers approval requests
+        /// inside the runtime — no one is asked, so shell commands run on their
+        /// own. Without this flag `auto` is downgraded to `accept_edits` (edits
+        /// are applied, shell still asks and therefore does not run).
+        #[arg(long)]
+        allow_unattended_auto: bool,
     },
 
     /// Edit a task, preserving fields whose flags are omitted.
@@ -85,6 +94,9 @@ pub enum ScheduleCli {
         mode: Option<String>,
         #[arg(long, value_parser = ["off", "important", "all"])]
         notify: Option<String>,
+        /// Allow `--mode auto` to run unattended (see `add --allow-unattended-auto`).
+        #[arg(long)]
+        allow_unattended_auto: bool,
         /// Reject the edit if the task no longer has this observed revision.
         #[arg(long)]
         expected: Option<String>,
@@ -211,6 +223,7 @@ pub fn build_task(
     sched: Schedule,
     permission_mode: &str,
     notify: &str,
+    allow_unattended_auto: bool,
 ) -> ScheduleTask {
     let slug = slug(title);
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -227,6 +240,7 @@ pub fn build_task(
         cwd: cwd.to_string(),
         schedule: sched,
         permission_mode: permission_mode.to_string(),
+        allow_unattended_auto,
         notify: notify.to_string(),
         enabled: true,
         created_at,
@@ -398,6 +412,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             cron,
             mode,
             notify,
+            allow_unattended_auto,
         } => {
             let sched = parse_schedule(
                 daily.as_deref(),
@@ -413,7 +428,15 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
                     .to_string_lossy()
                     .into_owned(),
             };
-            let task = build_task(&title, &prompt, &cwd, sched, &mode, &notify);
+            let task = build_task(
+                &title,
+                &prompt,
+                &cwd,
+                sched,
+                &mode,
+                &notify,
+                allow_unattended_auto,
+            );
             let entry = task_service().save(&task, None)?;
             println!("  Added task {} ({})", task.id, task.title);
             if let Some(error) = entry.registration_error {
@@ -434,6 +457,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             hourly,
             mode,
             notify,
+            allow_unattended_auto,
             expected,
         } => {
             let service = task_service();
@@ -454,6 +478,13 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             }
             if let Some(value) = notify {
                 task.notify = value;
+            }
+            // The flag only ever raises the allowance: `--allow-unattended-auto`
+            // turns it on, and there is no flag to turn it back off (use
+            // `--mode` for that). Editing a task must not silently hand a task
+            // more permission than it had.
+            if allow_unattended_auto {
+                task.allow_unattended_auto = true;
             }
             if daily.is_some() || weekly.is_some() || every.is_some() || hourly {
                 task.schedule = parse_schedule(
@@ -987,6 +1018,7 @@ mod tests {
             Schedule::Hourly,
             "plan",
             "off",
+            false,
         );
         task.enabled = false;
         store.put(&task, None).unwrap();
@@ -1038,7 +1070,15 @@ mod tests {
         let sched = Schedule::Daily {
             time: "09:00".into(),
         };
-        let t = build_task("Brief", "summarize", "/tmp/p", sched, "plan", "important");
+        let t = build_task(
+            "Brief",
+            "summarize",
+            "/tmp/p",
+            sched,
+            "plan",
+            "important",
+            false,
+        );
         assert_eq!(t.title, "Brief");
         assert_eq!(t.prompt, "summarize");
         assert_eq!(t.cwd, "/tmp/p");
@@ -1166,6 +1206,7 @@ mod tests {
                 },
                 "plan",
                 "important",
+                false,
             );
             atomcode_config::schedule::save(&t).unwrap();
             let all = atomcode_config::schedule::list();
@@ -1230,6 +1271,7 @@ mod tests {
                 time: "09:00".into(),
             },
             permission_mode: "plan".into(),
+            allow_unattended_auto: false,
             notify: "important".into(),
             enabled,
             created_at: 0,

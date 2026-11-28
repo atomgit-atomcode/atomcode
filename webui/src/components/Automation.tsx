@@ -60,7 +60,7 @@ export function Automation({ cwd, onClose, onSession, onCreateInChat }: Props) {
   const visible = orderedSchedules(entries, query, filter);
   // Keep an open editor visible even when a refresh changes its filter membership.
   const rows = selected && !visible.some(row => row.task.id === selected.task.id) ? [latest || selected, ...visible] : visible;
-  const fresh = (): ScheduledTask => ({ id: randomId(), title: '', prompt: '', cwd, schedule: { kind: 'daily', time: '09:00' }, permission_mode: 'plan', notify: 'important', enabled: true, created_at: 0 });
+  const fresh = (): ScheduledTask => ({ id: randomId(), title: '', prompt: '', cwd, schedule: { kind: 'daily', time: '09:00' }, permission_mode: 'plan', allow_unattended_auto: false, notify: 'important', enabled: true, created_at: 0 });
 
   async function refresh(signal?: AbortSignal): Promise<ScheduleEntry[] | null> {
     const life = lifetime.current, read = ++readSequence.current;
@@ -246,6 +246,7 @@ export function Automation({ cwd, onClose, onSession, onCreateInChat }: Props) {
           <p class="field-hint automation-time-hint">{text('按执行主机本地时区运行', 'Runs in the execution host’s local time zone')}{current?.next_run && <> · {current.next_run.time_zone.replace('host local', text('主机本地', 'host local'))}</>}</p>
           <div class="automation-section-title">{text('执行设置', 'Execution')}</div>
           <label class="field-group"><span class="modal-label">{text('权限', 'Permissions')}</span><select class="menu-input" disabled={missing} value={draft.permission_mode} onChange={event => edit({ permission_mode: event.currentTarget.value })}><option value="plan">{text('只读分析', 'Read-only analysis')}</option><option value="accept_edits">{text('允许编辑；高风险操作仍拒绝', 'Allow edits; risky actions remain denied')}</option>{draft.permission_mode === 'auto' && <option value="auto">{text('兼容自动模式（按允许编辑执行）', 'Legacy auto (runs with edit permissions)')}</option>}</select></label>
+          {draft.permission_mode === 'auto' && <label class="field-group"><span class="modal-label">{text('无人值守也保持自动', 'Keep auto while unattended')}</span><input type="checkbox" disabled={missing} checked={Boolean(draft.allow_unattended_auto)} onChange={event => edit({ allow_unattended_auto: event.currentTarget.checked })} /><p class="field-hint">{text('勾选后本任务在无人值守时也不请求审批，shell 等操作会直接执行；不勾选则降级为「允许编辑」，shell 会被拒绝。', 'Ticked, this task runs without asking anyone: shell commands execute unattended. Unticked, it downgrades to "allow edits" and shell requests are refused.')}</p></label>}
           <div class="automation-context"><span class="modal-label">{text('工作目录', 'Working directory')}</span><code>{draft.cwd}</code><p class="field-hint">{text('使用执行主机当前默认模型，每次在独立会话中运行。', 'Uses the host’s default model in a fresh session for each run.')}</p></div>
           {current?.registration_error && <div class="modal-error" role="alert">{current.registration_error}</div>}
           {current?.next_run && <p class="field-hint">{text('预计下次（本设备时间）', 'Estimated next (device time)')}: {date(current.next_run.at)}</p>}

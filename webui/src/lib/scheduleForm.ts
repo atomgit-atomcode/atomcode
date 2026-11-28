@@ -1,6 +1,6 @@
 import type { Rule, ScheduleEntry, ScheduledTask } from './scheduleApi.ts';
 
-const editable = ['title', 'prompt', 'cwd', 'schedule', 'permission_mode', 'notify', 'enabled'] as const;
+const editable = ['title', 'prompt', 'cwd', 'schedule', 'permission_mode', 'allow_unattended_auto', 'notify', 'enabled'] as const;
 type Field = typeof editable[number];
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;

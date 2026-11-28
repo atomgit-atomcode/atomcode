@@ -3,7 +3,7 @@ import { getToken } from '../api.ts';
 export type Rule = { kind: 'daily'; time: string } | { kind: 'weekly'; weekday: number; time: string } | { kind: 'hourly' } | { kind: 'interval'; every_minutes: number } | { kind: 'cron'; expr: string };
 export interface ScheduledTask {
   id: string; title: string; prompt: string; cwd: string; schedule: Rule;
-  permission_mode: string; notify: string; enabled: boolean; created_at: number;
+  permission_mode: string; allow_unattended_auto?: boolean; notify: string; enabled: boolean; created_at: number;
   last_run_at?: number | null; last_status?: string | null;
 }
 export interface RunEvent {

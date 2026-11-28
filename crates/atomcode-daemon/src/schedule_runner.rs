@@ -190,7 +190,7 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
     // hang the run.
     cfg.interactive = false;
     cfg.dangerously_skip_permissions = false;
-    cfg.initial_mode = runtime_mode(&task.permission_mode);
+    cfg.initial_mode = runtime_mode(task);
 
     let (runtime, _agent) =
         crate::kernel_runtime::start_native_runtime_with_session(cfg, SessionMode::Fresh)
@@ -282,6 +282,17 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
             "{denied} approval request(s) denied: no one is present to approve a scheduled run"
         ));
     }
+    // Say it in the ledger: a task that asked for `auto` and did not get it is
+    // otherwise indistinguishable from one that ran as asked, and the difference
+    // is exactly "shell commands will be refused".
+    if auto_was_downgraded(task) {
+        let note = "permission mode `auto` was downgraded to `accept_edits` for this \
+                    unattended run (set allow_unattended_auto to keep `auto`)";
+        diagnostic = Some(match diagnostic {
+            Some(existing) => format!("{note}; {existing}"),
+            None => note.to_string(),
+        });
+    }
     Ok(Outcome {
         status,
         session_id,
@@ -289,14 +300,32 @@ async fn run_turn(state: &AppState, task: &ScheduleTask) -> anyhow::Result<Outco
     })
 }
 
-fn runtime_mode(permission_mode: &str) -> RuntimeMode {
-    match permission_mode {
-        "auto" => RuntimeMode::Auto,
+/// The mode a scheduled run actually uses.
+///
+/// A scheduled run is unattended. `auto` does not merely allow more — it answers
+/// approval requests inside the runtime (`runtime.rs`'s `bypass_approval`), so no
+/// driver ever sees them and there is nothing left for the "nobody is present,
+/// deny" path below to refuse. Granting that to whatever `"auto"` happens to sit
+/// in a stored task is how a phone in a pocket runs shell commands overnight.
+///
+/// So it needs [`ScheduleTask::allow_unattended_auto`]. Without it `auto`
+/// degrades to `accept_edits`: edits are applied, shell still asks — and the
+/// denial path below turns that into a reported outcome rather than a silent
+/// no-op.
+fn runtime_mode(task: &ScheduleTask) -> RuntimeMode {
+    match task.permission_mode.as_str() {
+        "auto" if task.allow_unattended_auto => RuntimeMode::Auto,
+        "auto" => RuntimeMode::AcceptEdits,
         "accept_edits" => RuntimeMode::AcceptEdits,
         // `plan` and anything unrecognised: the most restrictive mode, because a
         // stored value this build cannot read is not permission to do more.
         _ => RuntimeMode::Plan,
     }
+}
+
+/// Whether [`runtime_mode`] had to override what the task asked for.
+fn auto_was_downgraded(task: &ScheduleTask) -> bool {
+    task.permission_mode == "auto" && !task.allow_unattended_auto
 }
 
 /// Stop the runtime and join its task.
@@ -328,4 +357,54 @@ fn stop_reason_name(reason: atomcode_kernel::event::StopReason) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomcode_config::schedule::{Schedule, ScheduleTask};
+
+    fn task(permission_mode: &str, allow_unattended_auto: bool) -> ScheduleTask {
+        ScheduleTask {
+            id: "t".into(),
+            title: "t".into(),
+            prompt: "p".into(),
+            cwd: "/tmp".into(),
+            schedule: Schedule::Hourly,
+            follow_up: None,
+            permission_mode: permission_mode.into(),
+            allow_unattended_auto,
+            notify: "off".into(),
+            enabled: true,
+            created_at: 0,
+            last_run_at: None,
+            last_status: None,
+        }
+    }
+
+    // The whole point of the flag: `auto` answers approval requests inside the
+    // runtime, so no driver sees them and the "nobody is present, deny" path
+    // never runs. A stored `auto` alone must therefore not mean "run shell
+    // overnight".
+    #[test]
+    fn unattended_auto_needs_the_explicit_flag() {
+        assert_eq!(runtime_mode(&task("auto", false)), RuntimeMode::AcceptEdits);
+        assert!(auto_was_downgraded(&task("auto", false)));
+
+        assert_eq!(runtime_mode(&task("auto", true)), RuntimeMode::Auto);
+        assert!(!auto_was_downgraded(&task("auto", true)));
+    }
+
+    #[test]
+    fn other_modes_are_unaffected_by_the_flag() {
+        assert_eq!(runtime_mode(&task("plan", true)), RuntimeMode::Plan);
+        assert_eq!(
+            runtime_mode(&task("accept_edits", false)),
+            RuntimeMode::AcceptEdits
+        );
+        // A value this build cannot read stays restrictive; it must not inherit
+        // `auto` just because the flag is set.
+        assert_eq!(runtime_mode(&task("bypass", true)), RuntimeMode::Plan);
+        assert!(!auto_was_downgraded(&task("plan", true)));
+    }
 }

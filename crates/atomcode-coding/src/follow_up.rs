@@ -85,6 +85,11 @@ impl NewSession {
                 context: self.context.clone(),
             }),
             permission_mode: self.permission_mode.clone(),
+            // A follow-up runs with nobody attached to it either: inheriting the
+            // session's mode is not the same as inheriting permission to run
+            // shell unattended, so `auto` degrades here too unless someone sets
+            // the flag on the stored task.
+            allow_unattended_auto: false,
             notify: "off".into(),
             enabled: true,
             created_at: chrono::Utc::now().timestamp(),

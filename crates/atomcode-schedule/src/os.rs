@@ -918,6 +918,7 @@ mod tests {
                 time: "09:30".into(),
             },
             permission_mode: "plan".into(),
+            allow_unattended_auto: false,
             notify: "important".into(),
             enabled: true,
             created_at: 0,
