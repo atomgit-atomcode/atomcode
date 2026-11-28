@@ -1,7 +1,12 @@
 //! Content progress deadlines shared by provider transports and their host.
 use atomcode_kernel::stream::StreamEvent;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
+
+/// How often a wait re-reads the wall clock. The monotonic clock stops while
+/// the machine sleeps (macOS), so a stream that died across a 30-minute lid
+/// close would otherwise still be waited on for its whole budget after wake.
+const WALL_CHECK: Duration = Duration::from_secs(5);
 
 /// A positive-integer-seconds duration read from env var `var`: `None` when unset,
 /// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
@@ -39,21 +44,47 @@ pub fn default_first_token_timeout() -> Duration {
 }
 
 /// A first-content deadline followed by an idle deadline. Metadata never resets it.
+///
+/// Silence is measured on both clocks: the monotonic one for the deadline, and
+/// the wall clock so time the machine spent asleep counts too.
 pub struct StreamWatchdog {
     first: Option<Duration>,
     idle: Option<Duration>,
     started: Instant,
     last_content: Option<Instant>,
+    wall_now: fn() -> SystemTime,
+    wall_started: SystemTime,
+    wall_last_content: Option<SystemTime>,
 }
 
 impl StreamWatchdog {
     pub fn new(first: Option<Duration>, idle: Option<Duration>) -> Self {
+        Self::with_wall_clock(first, idle, SystemTime::now)
+    }
+    fn with_wall_clock(
+        first: Option<Duration>,
+        idle: Option<Duration>,
+        wall_now: fn() -> SystemTime,
+    ) -> Self {
         Self {
             first,
             idle,
             started: Instant::now(),
             last_content: None,
+            wall_now,
+            wall_started: wall_now(),
+            wall_last_content: None,
         }
+    }
+    /// Wall-clock silence; zero if the clock was set back.
+    fn wall_silent_for(&self) -> Duration {
+        (self.wall_now)()
+            .duration_since(self.wall_last_content.unwrap_or(self.wall_started))
+            .unwrap_or_default()
+    }
+    fn wall_expired(&self) -> bool {
+        self.budget()
+            .is_some_and(|budget| self.wall_silent_for() >= budget)
     }
     fn content_deadline(&self) -> Option<Instant> {
         let budget = if self.last_content.is_some() {
@@ -80,8 +111,12 @@ impl StreamWatchdog {
     pub fn deadline(&self) -> Option<Instant> {
         self.content_deadline()
     }
+    /// The longer of the two clocks' silence, so a log after sleep shows it.
     pub fn silent_for(&self) -> Duration {
-        self.last_content.unwrap_or(self.started).elapsed()
+        self.last_content
+            .unwrap_or(self.started)
+            .elapsed()
+            .max(self.wall_silent_for())
     }
     /// Enforce the deadline even when a stream continuously yields ready metadata.
     pub async fn next<S: futures::Stream + Unpin>(
@@ -92,10 +127,19 @@ impl StreamWatchdog {
         let Some(deadline) = self.deadline() else {
             return Ok(stream.next().await);
         };
-        if Instant::now() >= deadline {
-            return tokio::time::timeout_at(deadline, futures::future::pending()).await;
+        loop {
+            let now = Instant::now();
+            if now >= deadline || self.wall_expired() {
+                return tokio::time::timeout_at(now, futures::future::pending()).await;
+            }
+            // `StreamExt::next` is cancel-safe: dropping it at a wall check
+            // loses no item.
+            if let Ok(item) =
+                tokio::time::timeout_at(deadline.min(now + WALL_CHECK), stream.next()).await
+            {
+                return Ok(item);
+            }
         }
-        tokio::time::timeout_at(deadline, stream.next()).await
     }
 
     pub fn observe(&mut self, event: &StreamEvent) {
@@ -117,6 +161,7 @@ impl StreamWatchdog {
         };
         if content {
             self.last_content = Some(Instant::now());
+            self.wall_last_content = Some((self.wall_now)());
         }
     }
 }
@@ -199,5 +244,73 @@ mod tests {
         assert_eq!(next.deadline(), None);
         next.observe(&StreamEvent::TextDelta("answer".into()));
         assert_eq!(next.deadline(), None);
+    }
+
+    thread_local! {
+        static WALL: std::cell::Cell<SystemTime> =
+            std::cell::Cell::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    }
+    fn fake_wall() -> SystemTime {
+        WALL.with(|w| w.get())
+    }
+    /// Moves the wall clock only, as a machine sleep does to a monotonic clock.
+    fn sleep_machine(by: Duration) {
+        WALL.with(|w| w.set(w.get() + by));
+    }
+    fn set_wall_back(by: Duration) {
+        WALL.with(|w| w.set(w.get() - by));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_silent_across_a_machine_sleep_times_out_soon_after_wake() {
+        let mut w = StreamWatchdog::with_wall_clock(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+            fake_wall,
+        );
+        w.observe(&StreamEvent::Reasoning("thinking".into()));
+        let mut dead = futures::stream::pending::<StreamEvent>();
+        let waited = Instant::now();
+        tokio::time::advance(Duration::from_secs(28)).await;
+        sleep_machine(Duration::from_secs(1929));
+        assert!(w.next(&mut dead).await.is_err());
+        assert!(waited.elapsed() <= Duration::from_secs(28) + WALL_CHECK);
+        assert!(w.silent_for() >= Duration::from_secs(1929));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn without_a_sleep_the_wall_checks_neither_cut_nor_extend_the_budget() {
+        let mut w = StreamWatchdog::with_wall_clock(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+            fake_wall,
+        );
+        w.observe(&StreamEvent::Reasoning("thinking".into()));
+        let started = Instant::now();
+        let mut late = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(290)).await;
+            StreamEvent::TextDelta("more".into())
+        });
+        futures::pin_mut!(late);
+        assert!(w.next(&mut late).await.unwrap().is_some());
+        assert_eq!(started.elapsed(), Duration::from_secs(290));
+        let mut dead = futures::stream::pending::<StreamEvent>();
+        assert!(w.next(&mut dead).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_wall_clock_set_back_does_not_end_the_wait_early() {
+        let mut w = StreamWatchdog::with_wall_clock(
+            Some(Duration::from_secs(600)),
+            Some(Duration::from_secs(300)),
+            fake_wall,
+        );
+        w.observe(&StreamEvent::Reasoning("thinking".into()));
+        set_wall_back(Duration::from_secs(3600));
+        let started = Instant::now();
+        let mut dead = futures::stream::pending::<StreamEvent>();
+        assert!(w.next(&mut dead).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
     }
 }
