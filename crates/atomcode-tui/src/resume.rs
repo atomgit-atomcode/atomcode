@@ -55,12 +55,20 @@ impl Session {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResumeView {
     sessions: std::sync::Arc<Vec<Session>>,
+    pub hints: atomcode_host_api::SessionListHints,
 }
 
 impl ResumeView {
     pub fn new(sessions: Vec<Session>) -> Self {
         Self {
             sessions: std::sync::Arc::new(sessions),
+            ..Default::default()
+        }
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        if self.sessions.iter().any(|s| s.id == id) {
+            std::sync::Arc::make_mut(&mut self.sessions).retain(|s| s.id != id);
         }
     }
 
@@ -96,15 +104,34 @@ impl ResumeView {
                 .is_some_and(|dir| dir.to_lowercase().contains(needle))
     }
 
+    pub(crate) fn selected(&self, panel: &Panel) -> Option<&Session> {
+        let needle = panel.query.trim().to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|session| Self::hit(session, &needle))
+            .nth(panel.cursor)
+    }
+
     /// 当前筛出多少行。
     pub fn rows(&self, panel: &Panel) -> usize {
         self.listed(panel).len()
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub(crate) session: String,
+    pub(crate) request: u64,
+    pub(crate) lines: Option<Vec<String>>,
+}
+
 /// 恢复面板升着的时候。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    pub all_projects: bool,
+    pub(crate) other_scope: Option<ResumeView>,
+    pub(crate) loading: Option<u64>,
+    pub(crate) load_error: Option<String>,
     /// 箭头停在**筛出行**里的第几个。
     pub cursor: usize,
     /// 搜索框里输的字。
@@ -151,12 +178,21 @@ pub trait Resume: Send + Sync {
 pub enum Step {
     /// 面板自己变了,外面没事。
     Stay,
+    ToggleScope,
+    LoadAll(u64),
+    ResumeAcrossProjects {
+        id: String,
+    },
     /// 收起面板。
     Close,
     /// 恢复这个会话。
-    Resume { id: String },
+    Resume {
+        id: String,
+    },
     /// 删掉这个会话(已经问过第二次了)。
-    Delete { id: String },
+    Delete {
+        id: String,
+    },
 }
 
 /// 跑一个键。自由函数、纯的,和 [`crate::rewind::key`] 一样:面板写回去,要恢复哪个
@@ -177,6 +213,7 @@ pub fn key(view: &ResumeView, panel: &mut Panel, press: KeyPress) -> Step {
     };
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Step::Close,
+        (Key::Tab, Mods::NONE) => Step::ToggleScope,
         _ if deleting => {
             let Some(session) = listed
                 .get(panel.cursor)
@@ -211,6 +248,11 @@ pub fn key(view: &ResumeView, panel: &mut Panel, press: KeyPress) -> Step {
             {
                 // 读不了的会话(更新版本写的)不恢复——选中也是空动作,像 rewind 停在
                 // 「当前」上按回车。
+                Some(session) if !session.needs_newer_version && panel.all_projects => {
+                    Step::ResumeAcrossProjects {
+                        id: session.id.clone(),
+                    }
+                }
                 Some(session) if !session.needs_newer_version => Step::Resume {
                     id: session.id.clone(),
                 },

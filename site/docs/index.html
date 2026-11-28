@@ -1,22 +1,7 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>AtomCode 文档 / Documentation</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>AtomCode 文档 / Documentation</title>
+<link rel="icon" type="image/svg+xml" href="../assets/atomgit-mark.svg">
 <meta http-equiv="refresh" content="0; url=./zh/index.html">
-<script>
-(function(){
-  var lang = 'zh';
-  try {
-    if (localStorage.getItem('atomcode_lang') === 'en') lang = 'en';
-  } catch (e) {}
-  var requested = new URLSearchParams(location.search).get('lang');
-  if (requested === 'en' || requested === 'zh') lang = requested;
-  location.replace('./' + lang + '/index.html' + location.hash);
-})();
-</script>
-</head>
-<body>
-<p>Redirecting to <a href="./zh/index.html">中文文档</a> / <a href="./en/index.html">English docs</a>…</p>
-</body>
-</html>
+<script>(function(){var l='zh';try{if(localStorage.getItem('atomcode_lang')==='en')l='en'}catch(e){}
+var q=new URLSearchParams(location.search).get('lang');if(q==='en'||q==='zh')l=q;location.replace('./'+l+'/index.html'+location.hash)})();</script>
+</head><body style="background:#050605;color:#a3a99f;font:14px monospace;padding:40px">Redirecting… <a style="color:#c6f24e" href="./zh/index.html">中文文档</a> / <a style="color:#c6f24e" href="./en/index.html">English docs</a></body></html>

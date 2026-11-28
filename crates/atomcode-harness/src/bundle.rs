@@ -174,6 +174,11 @@ config = { warn_after = 3, stop_after = 4 }
 name = "repeat-fuse"
 config = { nudge_at = 3, stop_at = 6 }
 
+# write_file does not replace a file this conversation never read, edited or
+# wrote. Narrow on purpose (see the row); remove it to write unguarded.
+[[insert]]
+name = "write-guard"
+
 # --- policy, in wrap order: repair -> rules -> approve -> cap --------------
 [[insert]]
 name = "tool-args-repair"

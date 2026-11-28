@@ -12,6 +12,13 @@ use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LiveGoalAction {
+    Pause,
+    Remove,
+}
+
 pub trait LiveRuntimeControl: Send + Sync {
     fn status(&self) -> RuntimeStatus;
     fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable>;
@@ -200,10 +207,14 @@ struct HubState {
 
 fn sampled_goal_progress(state: &HubState) -> Option<atomcode_coding::GoalProgress> {
     let mut progress = state.goal_progress.clone()?;
-    if let (Some(recovery), Some(at)) = (progress.recovery.as_mut(), state.goal_sampled_at) {
-        recovery.retry_in_secs = recovery
-            .retry_in_secs
-            .saturating_sub(at.elapsed().as_secs());
+    if let Some(at) = state.goal_sampled_at {
+        let elapsed = at.elapsed().as_secs();
+        if progress.active {
+            progress.elapsed_secs = progress.elapsed_secs.saturating_add(elapsed);
+        }
+        if let Some(recovery) = progress.recovery.as_mut() {
+            recovery.retry_in_secs = recovery.retry_in_secs.saturating_sub(elapsed);
+        }
     }
     Some(progress)
 }
@@ -943,6 +954,31 @@ impl LiveViewHub {
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), HubError> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Self::dispatch_locked(&state, command)
+    }
+
+    pub(crate) async fn control_goal(
+        &self,
+        session_id: &str,
+        control_id: uuid::Uuid,
+        action: LiveGoalAction,
+    ) -> Result<(), HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        if binding.session_id != session_id {
+            return Err(HubError::StaleBinding);
+        }
+        match action {
+            LiveGoalAction::Pause => {
+                handle
+                    .pause_goal_at_generation(binding.generation, Some(control_id))
+                    .await
+            }
+            LiveGoalAction::Remove => {
+                handle
+                    .stop_goal_at_generation(binding.generation, Some(control_id))
+                    .await
+            }
+        }
+        .map_err(|error| HubError::RuntimeRejected(error.to_string()))
     }
 
     pub async fn refresh_quota_wait(&self) -> Result<bool, HubError> {
@@ -2379,6 +2415,7 @@ mod tests {
                 generation: 1,
                 sequence: 1,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    control_id: uuid::Uuid::nil(),
                     report: Default::default(),
                     evaluation_ready: false,
                     active: true,
@@ -2410,6 +2447,7 @@ mod tests {
         hub.seed_goal_progress(
             &binding,
             GoalProgress {
+                control_id: uuid::Uuid::nil(),
                 report: Default::default(),
                 evaluation_ready: false,
                 active: true,
@@ -2431,6 +2469,7 @@ mod tests {
                 generation: 1,
                 sequence: 0,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    control_id: uuid::Uuid::nil(),
                     report: Default::default(),
                     evaluation_ready: false,
                     active: true,
@@ -4425,6 +4464,7 @@ mod tests {
                 generation: 1,
                 sequence: 2,
                 event: CodingRuntimeEvent::GoalChanged(GoalProgress {
+                    control_id: uuid::Uuid::nil(),
                     active: true,
                     terminal: None,
                     phase: GoalPhase::Pursuing,

@@ -2,84 +2,81 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Slash Commands · AtomCode Docs</title>
 <meta name="description" content="Reference for the 30+ built-in slash commands organised by category.">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<meta name="theme-color" content="#050605">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../docs.css">
-<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+<script>try{if(localStorage.getItem('atomcode_theme')==='light')document.documentElement.classList.add('light')}catch(e){}</script>
 </head>
-<body data-page="slash-commands">
+<body data-page="slash-commands" data-lang="en">
+<div class="prog" id="prog"></div>
 
-<header class="dhdr" id="dhdr">
-  <a class="dhdr-logo" href="../../index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
-    <span>AtomCode</span>
-    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.8</span>
-  </a>
-  <div class="dhdr-right">
-    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span data-i18n="search.trigger.text">搜索文档…</span>
-      <span class="kbd">⌘K</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
-    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
-    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
-    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
-  </div>
+<!-- ==================== 头部 ==================== -->
+<header class="dh">
+  <button class="ib sb-btn" id="sbBtn" aria-label="Menu" aria-expanded="false">☰</button>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>DOCS</em><small>v5.2.9</small></a>
+  <button class="dh-search" id="sBtn"><b>/</b><span>Search docs…</span><kbd>⌘K</kbd></button>
+  <nav class="dh-r">
+    <a class="ib txt" href="../../index.html">Home</a>
+    <a class="ib" href="../zh/slash-commands.html" id="langBtn" hreflang="zh" aria-label="中文">中</a>
+    <button class="ib" id="themeBtn" aria-label="Toggle theme"><span class="i-moon">◐</span></button>
+    <a class="ib txt" href="https://atomgit.com/atomgit_atomcode/atomcode">Repository ↗</a>
+  </nav>
 </header>
 
-<div class="dlayout">
-  <aside class="dside" id="dside">
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
-    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
-    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
-    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
-    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
-    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
-    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
-    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
-    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
-    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
-    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
-    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
-    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
-    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
-    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
-    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
-    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
-    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
-    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
-    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
-    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
-  </div>
+<div class="dl">
+  <!-- ==================== 侧栏 ==================== -->
+  <aside class="ds" id="ds" aria-label="Menu">
+<div class="sg"><div class="sg-t">Overview</div>
+<a class="sl" href="./index.html"><i>Ac</i><span>Docs home</span></a>
+</div>
+<div class="sg"><div class="sg-t">Start</div>
+<a class="sl" href="./getting-started.html"><i>Qs</i><span>Quickstart</span></a>
+<a class="sl" href="./login.html"><i>Lg</i><span>Login methods</span></a>
+<a class="sl" href="./configuration.html"><i>Cf</i><span>Configuration</span></a>
+</div>
+<div class="sg"><div class="sg-t">Usage</div>
+<a class="sl" href="./basic-usage.html"><i>Bu</i><span>Basic usage</span></a>
+<a class="sl on" href="./slash-commands.html" aria-current="page"><i>Sc</i><span>Slash commands</span></a>
+<a class="sl" href="./keybindings.html"><i>Kb</i><span>Keybindings</span></a>
+<a class="sl" href="./sessions.html"><i>Ud</i><span>Sessions & undo</span></a>
+<a class="sl" href="./interactive-questions.html"><i>Iq</i><span>Interactive questions</span></a>
+</div>
+<div class="sg"><div class="sg-t">Advanced</div>
+<a class="sl" href="./tools.html"><i>Tl</i><span>Built-in tools</span></a>
+<a class="sl" href="./subagents.html"><i>Sa</i><span>Subagents</span></a>
+<a class="sl" href="./approvals.html"><i>Ap</i><span>Approvals</span></a>
+<a class="sl" href="./skills.html"><i>Sk</i><span>Skills</span></a>
+<a class="sl" href="./mcp.html"><i>Mc</i><span>MCP</span></a>
+<a class="sl" href="./plugins.html"><i>Pl</i><span>Plugins</span></a>
+<a class="sl" href="./memory.html"><i>Me</i><span>Memory</span></a>
+<a class="sl" href="./project-instructions.html"><i>Pi</i><span>Project instructions</span></a>
+<a class="sl" href="./webui.html"><i>Wb</i><span>WebUI</span></a>
+<a class="sl" href="./webui-remote-access.html"><i>Ra</i><span>Remote access</span></a>
+</div>
+<div class="sg"><div class="sg-t">Help</div>
+<a class="sl" href="./faq.html"><i>Fq</i><span>FAQ</span></a>
+</div>
+<div class="sg"><div class="sg-t">Releases</div>
+<a class="sl" href="./changelog.html"><i>Cl</i><span>Changelog</span></a>
+</div>
   </aside>
+  <div class="ds-bg" id="dsBg"></div>
 
-  <main class="dmain prose-docs">
+  <!-- ==================== 正文 ==================== -->
+  <main class="dm">
+    <div class="crumb"><a href="./index.html">Docs</a><span>/</span><span>Usage</span><span>/</span><b>Slash Commands</b><em>13 min read</em></div>
+    <article class="prose" id="prose">
 <h1 id="slash-commands">Slash Commands</h1>
       <p class="lede">Start an input with <code>/</code> in the TUI to trigger a command and get an autocomplete menu. The 50+ built-in commands are organised below; commands loaded from Skills and Plugins also appear in the menu automatically.</p>
 
       <h2 id="core">Core</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -91,12 +88,12 @@
           <tr><td><code>/rename &lt;new-name&gt;</code></td><td>Rename the current session (changes the display name in the <code>/resume</code> picker)</td></tr>
           <tr><td><code>/provider</code></td><td>Manage provider accounts and their models, using a vendor preset or a custom endpoint</td></tr>
           <tr><td><code>/model</code></td><td>Set the default model / provider and switch the current session; other open sessions are unchanged</td></tr>
-          <tr><td><code>/cd</code></td><td>Change working directory and start a new session, writing it back as <code>default_workdir</code>. You can also just type <code>cd /path</code> (no slash prefix)</td></tr>
+          <tr><td><code>/cd</code></td><td>Switch to the requested directory and start a new session. You can also type <code>cd /path</code> directly.</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="tools-utilities">Tools &amp; utilities</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -119,7 +116,7 @@
           <tr><td><code>/copy</code></td><td>Copy the last reply to the clipboard: <code>/copy</code> copies the whole reply as raw markdown (the whole turn, without tool output); <code>/copy code</code> copies the last code block, <code>/copy code N</code> the N-th, <code>/copy code all</code> every code block (the old <code>/copy N</code>, <code>/copy all</code> and <code>/copy msg</code> still work).</td></tr>
           <tr><td><code>/save</code></td><td>Export the current conversation to a markdown file: <code>/save</code> uses an auto-generated filename, <code>/save &lt;filename&gt;</code> a name you choose</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <div class="callout callout-info">
         <strong>AtomGit Issues are tools, not slash commands</strong>
@@ -156,7 +153,7 @@ timeout_secs = 60</code></pre>
       <p>The system prompt is not the complete model request: tool definitions and conversation history are separate. These prompt-text inspection commands apply to the TUI; the WebUI's <code>/context</code> provides budget statistics only. For compaction protection and why prompts can change after resuming, see <a href="./sessions.html#prompt-retention">session prompt retention</a>.</p>
 
       <h2 id="conversation-modes-thinking">Conversation modes &amp; thinking</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -171,10 +168,10 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/think budget &lt;N&gt;</code></td><td>Cap the thinking token budget (Claude family); controls reasoning length</td></tr>
           <tr><td><code>/effort &lt;high|max|off&gt;</code></td><td>DeepSeek reasoning-effort control — trade latency/tokens for deeper reasoning on DeepSeek models</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="team-panel">Team panel</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -184,11 +181,11 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/team hide</code> · <code>/team fold</code> · <code>/team close</code></td><td>Collapse the team panel (members keep running in the background; none is cancelled), answering "Team panel collapsed."</td></tr>
           <tr><td>Anything else</td><td>Refused with the usage line — those three states are all <code>/team</code> takes (<code>status</code>, <code>clear</code> and the like are not among them)</td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>All three subcommands only change what is drawn: the acknowledgement appears as a notice for about five seconds, does not enter the conversation, and does not call the model; none of them starts, cancels or waits for a member. The panel's header gives the member and background-task counts, and each member row says what it was asked to do, how long it has run and how much context it holds; members come from the agent delegating through the <code>team</code> tool (several in parallel, each with a role and scope). See also <a href="./subagents.html">Subagents</a> (short-lived subtasks via the <code>task</code> tool).</p>
 
       <h2 id="persistent-memory">Persistent memory</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -198,11 +195,11 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/forget &lt;keyword&gt;</code></td><td>Delete every entry in global + project memory matching the keyword (case-insensitive)</td></tr>
           <tr><td><code>/memory</code></td><td>Show all active memories, grouped by <code>[Global]</code> / <code>[Project]</code></td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>Full usage and best practices at <a href="./memory.html">Persistent Memory</a>.</p>
 
       <h2 id="extension-ecosystem">Extension ecosystem</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -216,14 +213,14 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/plugin list</code></td><td>List locally installed plugins</td></tr>
           <tr><td><code>/plugin reload</code></td><td>Reload all plugins (re-scan disk, refresh skill/hook registration)</td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>See <a href="./skills.html">Skills</a> and <a href="./plugins.html">Plugin System</a> for details.</p>
       <p>Plugins can register their own slash commands. For example, the official channel plugin adds <code>/wechat</code> (shows the AtomCode WeChat community group QR code):</p>
       <pre><code>/plugin marketplace add https://atomgit.com/atomgit_atomcode/AtomCode-Channel
 /plugin install weixin@atomcode-channel</code></pre>
 
       <h2 id="mcp-integration">MCP integration</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -232,11 +229,11 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>Async-list the remote tools actually exposed by a specific MCP server (you'll be told if it times out or fails)</td></tr>
           <tr><td><code>/mcp reload</code></td><td>Re-read <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> and reconnect every server in the background</td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>Full configuration and usage at <a href="./mcp.html">MCP Integration</a>.</p>
 
       <h2 id="web-ui-sync">Web UI &amp; sync</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>What it does</th></tr>
         </thead>
@@ -249,11 +246,11 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/app</code></td><td>Expose the current session to the <strong>mobile App</strong> via the official relay: a QR code is printed right in the terminal, scan it with the App to pair, then view and drive this conversation live from your phone (same source as <code>/webui</code> — one shared session, two-way live sync; the difference is no browser, and it goes over the relay rather than the LAN). Requires <code>/login</code> first</td></tr>
           <tr><td><code>/app stop</code></td><td>Stop App remote access, disconnect the relay, and return to a local session</td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>More in <a href="./webui.html">Web UI</a> and the <a href="./webui-remote-access.html">Remote Access</a> guide.</p>
 
       <h2 id="config-help">Config &amp; help</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
@@ -272,7 +269,7 @@ timeout_secs = 60</code></pre>
           <tr><td><code>/keys</code></td><td>Show the keyboard-shortcut reference (grouped by input / history / session / modal navigation, with per-terminal compatibility notes for <code>Shift+Enter</code> and <code>Alt+Enter</code>). See <a href="./keybindings.html">Keybindings</a></td></tr>
           <tr><td><code>/quit</code> · <code>/exit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="tips">Tips</h2>
       <ul>
@@ -320,26 +317,26 @@ Rolled back to turn 3 of 3.
         <li><a href="./keybindings.html">Keybindings</a> — pair commands with keybindings to double your speed</li>
         <li><a href="./sessions.html">Sessions &amp; Undo</a> — full behaviour of <code>/resume</code>, <code>/undo</code>, <code>/compact</code></li>
       </ul>
-
-    <footer class="dftr">
-      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
-      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
-    </footer>
+    </article>
+    <nav class="pager"><a class="pg prev" href="./basic-usage.html"><small>← Previous</small><b><i>Bu</i>Basic usage</b></a><a class="pg next" href="./keybindings.html"><small>Next →</small><b><i>Kb</i>Keybindings</b></a></nav>
+    <footer class="df"><span>© 2026 AtomCode · MIT</span><a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">Report an issue ↗</a></footer>
   </main>
+
+  <!-- ==================== 本页目录 ==================== -->
+  <aside class="toc" id="toc" aria-label="On this page"><p>On this page</p><nav id="tocList"></nav><button id="toTop">↑ Back to top</button></aside>
 </div>
 
-<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
-  <div class="search-modal-bg"></div>
-  <div class="search-modal-box">
-    <div class="search-input-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
-      <span class="search-esc">ESC</span>
-    </div>
-    <div class="search-results" id="searchResults"></div>
+<!-- ==================== 搜索 ==================== -->
+<div class="sm" id="sm" role="dialog" aria-modal="true" aria-label="Search docs…">
+  <div class="sm-box">
+    <div class="sm-in"><b>/</b><input id="sIn" type="search" autocomplete="off" spellcheck="false" placeholder="Search docs…"><kbd>ESC</kbd></div>
+    <ul class="sm-list" id="sList" role="listbox"></ul>
+    <div class="sm-ft">↑↓ select · ↵ open · esc close</div>
   </div>
 </div>
-
+<div class="toast" id="toast" role="status"></div>
+<script>window.DOCS_UI={"copy": "Copy", "copied": "Copied", "noRes": "No results"};</script>
+<script src="../search-index.en.js"></script>
 <script src="../docs.js"></script>
 </body>
 </html>

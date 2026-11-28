@@ -2,84 +2,81 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>快捷键 · AtomCode 文档</title>
 <meta name="description" content="快捷键 — AtomCode 文档。">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<meta name="theme-color" content="#050605">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../docs.css">
-<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+<script>try{if(localStorage.getItem('atomcode_theme')==='light')document.documentElement.classList.add('light')}catch(e){}</script>
 </head>
-<body data-page="keybindings">
+<body data-page="keybindings" data-lang="zh">
+<div class="prog" id="prog"></div>
 
-<header class="dhdr" id="dhdr">
-  <a class="dhdr-logo" href="../../index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
-    <span>AtomCode</span>
-    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.8</span>
-  </a>
-  <div class="dhdr-right">
-    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span data-i18n="search.trigger.text">搜索文档…</span>
-      <span class="kbd">⌘K</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
-    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
-    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
-    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
-  </div>
+<!-- ==================== 头部 ==================== -->
+<header class="dh">
+  <button class="ib sb-btn" id="sbBtn" aria-label="目录" aria-expanded="false">☰</button>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>DOCS</em><small>v5.2.9</small></a>
+  <button class="dh-search" id="sBtn"><b>/</b><span>搜索文档…</span><kbd>⌘K</kbd></button>
+  <nav class="dh-r">
+    <a class="ib txt" href="../../index.html">官网</a>
+    <a class="ib" href="../en/keybindings.html" id="langBtn" hreflang="en" aria-label="English">EN</a>
+    <button class="ib" id="themeBtn" aria-label="切换主题"><span class="i-moon">◐</span></button>
+    <a class="ib txt" href="https://atomgit.com/atomgit_atomcode/atomcode">仓库 ↗</a>
+  </nav>
 </header>
 
-<div class="dlayout">
-  <aside class="dside" id="dside">
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
-    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
-    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
-    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
-    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
-    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
-    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
-    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
-    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
-    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
-    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
-    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
-    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
-    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
-    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
-    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
-    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
-    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
-    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
-    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
-    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
-  </div>
+<div class="dl">
+  <!-- ==================== 侧栏 ==================== -->
+  <aside class="ds" id="ds" aria-label="目录">
+<div class="sg"><div class="sg-t">概览</div>
+<a class="sl" href="./index.html"><i>Ac</i><span>文档首页</span></a>
+</div>
+<div class="sg"><div class="sg-t">开始</div>
+<a class="sl" href="./getting-started.html"><i>Qs</i><span>快速开始</span></a>
+<a class="sl" href="./login.html"><i>Lg</i><span>登录方式</span></a>
+<a class="sl" href="./configuration.html"><i>Cf</i><span>配置文件</span></a>
+</div>
+<div class="sg"><div class="sg-t">使用</div>
+<a class="sl" href="./basic-usage.html"><i>Bu</i><span>基本使用</span></a>
+<a class="sl" href="./slash-commands.html"><i>Sc</i><span>斜杠命令</span></a>
+<a class="sl on" href="./keybindings.html" aria-current="page"><i>Kb</i><span>快捷键</span></a>
+<a class="sl" href="./sessions.html"><i>Ud</i><span>会话与撤销</span></a>
+<a class="sl" href="./interactive-questions.html"><i>Iq</i><span>交互提问</span></a>
+</div>
+<div class="sg"><div class="sg-t">进阶</div>
+<a class="sl" href="./tools.html"><i>Tl</i><span>内置工具</span></a>
+<a class="sl" href="./subagents.html"><i>Sa</i><span>子代理</span></a>
+<a class="sl" href="./approvals.html"><i>Ap</i><span>权限审批</span></a>
+<a class="sl" href="./skills.html"><i>Sk</i><span>Skills 扩展</span></a>
+<a class="sl" href="./mcp.html"><i>Mc</i><span>MCP 集成</span></a>
+<a class="sl" href="./plugins.html"><i>Pl</i><span>Plugin 系统</span></a>
+<a class="sl" href="./memory.html"><i>Me</i><span>永久记忆</span></a>
+<a class="sl" href="./project-instructions.html"><i>Pi</i><span>项目指令文件</span></a>
+<a class="sl" href="./webui.html"><i>Wb</i><span>WebUI 界面</span></a>
+<a class="sl" href="./webui-remote-access.html"><i>Ra</i><span>远程访问指南</span></a>
+</div>
+<div class="sg"><div class="sg-t">问题</div>
+<a class="sl" href="./faq.html"><i>Fq</i><span>常见问题</span></a>
+</div>
+<div class="sg"><div class="sg-t">发布</div>
+<a class="sl" href="./changelog.html"><i>Cl</i><span>更新日志</span></a>
+</div>
   </aside>
+  <div class="ds-bg" id="dsBg"></div>
 
-  <main class="dmain prose-docs">
+  <!-- ==================== 正文 ==================== -->
+  <main class="dm">
+    <div class="crumb"><a href="./index.html">文档</a><span>/</span><span>使用</span><span>/</span><b>快捷键</b><em>7 分钟阅读</em></div>
+    <article class="prose" id="prose">
 <h1 id="快捷键">快捷键</h1>
       <p class="lede">AtomCode 的 TUI 是基于 ratatui + crossterm 构建的,常用快捷键尽量贴近主流终端工具的约定。在会话里输入 <code>/keys</code> 可以随时把这张表打印到当前 scrollback,<code>/help</code> 则查看所有斜杠命令。</p>
 
       <h2 id="输入编辑">输入编辑</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
@@ -105,7 +102,7 @@
           <tr><td><code>Ctrl+A</code></td><td>光标移到行首</td></tr>
           <tr><td><code>Ctrl+E</code></td><td>输入时光标移到行尾；问题面板中编辑高亮选项</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="custom-newline">自定义换行快捷键</h2>
       <p>在 <code>/config</code> 中搜索“换行”，选择“快捷键 / 换行”。按 <code>Enter</code> 或 <code>A</code> 添加，按下想绑定的组合键后再按 <code>Enter</code> 确认。按 <code>M</code> 可手动填写逗号分隔的按键名（例如 <code>alt+j, ctrl+j</code>）；录入时也可按 <code>Tab</code> 切到手动填写。<code>Delete</code> 移除选中绑定，<code>Ctrl+D</code> 恢复默认，<code>Esc</code> 返回。</p>
@@ -115,7 +112,7 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
       <p>普通字符不能单独用作快捷键。支持 <code>ctrl</code>、<code>alt</code>、<code>shift</code>、<code>cmd</code> 修饰符，字母、数字、<code>enter</code>、<code>space</code>、方向键和 <code>f1</code>–<code>f24</code> 等按键名。终端或 IDE 拦截的组合键无法由 AtomCode 检测或释放；手动填写后仍须验证宿主能把它传入。</p>
 
       <h2 id="浏览与滚动">浏览与滚动</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
@@ -129,10 +126,10 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
           <tr><td><code>Home / End</code></td><td>阅读模式：跳到首尾</td></tr>
           <tr><td><code>Esc</code></td><td>退出阅读模式，保留原输入草稿和主界面阅读位置；重新运行 /read 更新副本</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="选区与复制">选区与复制</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键 / 操作</th><th>动作</th></tr>
         </thead>
@@ -142,10 +139,10 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
           <tr><td><code>Ctrl+Shift+C</code></td><td>复制选区到系统剪贴板</td></tr>
           <tr><td>右键菜单</td><td>在某些终端中可直接复制/粘贴(取决于终端而非 atomcode)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="流程控制">流程控制</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
@@ -157,11 +154,11 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
           <tr><td><code>Esc</code></td><td>取消当前正在进行的工具调用或流式输出</td></tr>
           <tr><td><code>Ctrl+C</code></td><td>第一次:取消当前操作;连按第二次:退出程序</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="新界面">新界面(atomcode --tui)</h2>
       <p>新界面的按键大多与上面相同,以下几个不同;完整列表在会话里输入 <code>/keys</code> 查看。</p>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
@@ -173,11 +170,11 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
           <tr><td><code>Ctrl+X</code></td><td>中断当前回合,并把排队中的消息立刻逐条发出(各带各的图);没有排队时就是普通中断</td></tr>
           <tr><td><code>双击 Esc</code></td><td>打开回退面板(同 <code>/rewind</code>),挑一条历史提示回退</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="工具权限对话框">工具权限对话框</h2>
       <p>当模型准备执行危险操作(破坏性 bash 命令、写敏感文件、删除源码等)时,AtomCode 会弹出一个确认对话框,此时:</p>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>按键</th><th>动作</th></tr>
         </thead>
@@ -186,7 +183,7 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
           <tr><td><code>a</code></td><td>本次会话内始终允许这种模式</td></tr>
           <tr><td><code>n</code> / <code>Esc</code></td><td>拒绝</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <div class="callout callout-info">
         <strong>别贪心</strong>
@@ -198,26 +195,26 @@ newline = ["alt+j", "ctrl+j"]</code></pre>
         <li><a href="./slash-commands.html">斜杠命令</a> —— 记住了快捷键,也别忘记命令补全</li>
         <li><a href="./sessions.html">会话与撤销</a> —— <code>/undo</code> 的精确含义</li>
       </ul>
-
-    <footer class="dftr">
-      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
-      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
-    </footer>
+    </article>
+    <nav class="pager"><a class="pg prev" href="./slash-commands.html"><small>← 上一篇</small><b><i>Sc</i>斜杠命令</b></a><a class="pg next" href="./sessions.html"><small>下一篇 →</small><b><i>Ud</i>会话与撤销</b></a></nav>
+    <footer class="df"><span>© 2026 AtomCode · MIT</span><a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">报告问题 ↗</a></footer>
   </main>
+
+  <!-- ==================== 本页目录 ==================== -->
+  <aside class="toc" id="toc" aria-label="本页目录"><p>本页目录</p><nav id="tocList"></nav><button id="toTop">↑ 回到顶部</button></aside>
 </div>
 
-<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
-  <div class="search-modal-bg"></div>
-  <div class="search-modal-box">
-    <div class="search-input-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
-      <span class="search-esc">ESC</span>
-    </div>
-    <div class="search-results" id="searchResults"></div>
+<!-- ==================== 搜索 ==================== -->
+<div class="sm" id="sm" role="dialog" aria-modal="true" aria-label="搜索文档…">
+  <div class="sm-box">
+    <div class="sm-in"><b>/</b><input id="sIn" type="search" autocomplete="off" spellcheck="false" placeholder="搜索文档…"><kbd>ESC</kbd></div>
+    <ul class="sm-list" id="sList" role="listbox"></ul>
+    <div class="sm-ft">↑↓ 选择 · ↵ 打开 · esc 关闭</div>
   </div>
 </div>
-
+<div class="toast" id="toast" role="status"></div>
+<script>window.DOCS_UI={"copy": "复制", "copied": "已复制", "noRes": "没有匹配的结果"};</script>
+<script src="../search-index.zh.js"></script>
 <script src="../docs.js"></script>
 </body>
 </html>

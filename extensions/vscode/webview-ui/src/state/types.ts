@@ -120,7 +120,7 @@ export interface PermissionRequestData {
   reason: string;
   args: string;
   isDestructive: boolean;
-  status: 'pending' | 'submitting' | 'allowed' | 'denied';
+  status: 'pending' | 'submitting' | 'expired' | 'allowed' | 'denied';
   decision?: PermissionDecision;
   error?: string;
 }
@@ -271,7 +271,7 @@ export type ChatAction =
   | { type: 'IMAGE_PREVIEW_PREV' }
   | { type: 'PERMISSION_REQUEST'; id: string; approvalId?: string; sessionId: string; toolName: string; reason: string; args: string; isDestructive: boolean }
   | { type: 'PERMISSION_RESPOND'; id: string; approvalId?: string; decision: PermissionDecision }
-  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; approvalId?: string; success: boolean; message?: string }
+  | { type: 'PERMISSION_RESPONSE_RESULT'; id: string; approvalId?: string; success: boolean; expired?: boolean; message?: string }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'SEARCH_NEXT' }
@@ -327,7 +327,7 @@ export type ExtensionMessage =
   | { type: 'insertText'; text: string }
   | { type: 'skills'; skills: SkillInfo[] }
   | { type: 'permissionRequest'; sessionId: string; id: string; approvalId?: string; toolName: string; reason: string; args: string; isDestructive: boolean }
-  | { type: 'permissionResponseResult'; id: string; approvalId?: string; success: boolean; message?: string }
+  | { type: 'permissionResponseResult'; id: string; approvalId?: string; success: boolean; expired?: boolean; message?: string }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string }
   | { type: 'chromeFont'; value: string | null }

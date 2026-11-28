@@ -3153,6 +3153,7 @@ fn start_with_mcp_server(
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust,
         auto_approve: Vec::new(),
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }];
@@ -3421,6 +3422,7 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }];
@@ -4022,6 +4024,7 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }];
@@ -4441,6 +4444,7 @@ async fn a_cold_resume_recovers_abandoned_progress_before_the_next_request() {
             text: "last saved progress".into(),
             reasoning: "unsigned private thought".into(),
             reset: true,
+            provider_call: false,
         },
     ];
     manager
@@ -5154,19 +5158,21 @@ async fn a_team_run_reaches_the_team_panel() {
     let mut seen = turn_collecting(&mut runtime, "delegate a team").await;
     // The run outlives the turn that started it; its events may trail it.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !seen
-        .iter()
-        .any(|event| matches!(event, CodingRuntimeEvent::Team { .. }))
-    {
+    let measured = |item: &CodingRuntimeEvent| {
+        matches!(item, CodingRuntimeEvent::Team { event, .. }
+        if matches!(&event.payload, atomcode_capabilities::team::TeamEventPayload::MemberFinished {
+            provider_requests: Some(1), input_tokens: Some(10), output_tokens: 2, success: true, ..
+        }))
+    };
+    while !seen.iter().any(measured) {
         match tokio::time::timeout_at(deadline, runtime.events.recv()).await {
             Ok(Some(event)) => seen.push(event.event),
             _ => break,
         }
     }
     assert!(
-        seen.iter()
-            .any(|event| matches!(event, CodingRuntimeEvent::Team { .. })),
-        "the team run never reached the driver"
+        seen.iter().any(measured),
+        "missing completed member usage: {seen:?}"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -5368,6 +5374,7 @@ async fn a_team_is_kept_and_comes_back_with_its_lead() {
                         text: "scout saved progress".into(),
                         reasoning: String::new(),
                         reset: true,
+                        provider_call: false,
                     },
                 },
             ],
@@ -6154,6 +6161,7 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }];
@@ -6989,6 +6997,7 @@ async fn a_failed_mcp_connection_is_metered() {
         source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
         trust: true,
         auto_approve: Vec::new(),
+        team_read_only_tools: Default::default(),
         allowed_tools: None,
         required_experimental_capabilities: Default::default(),
     }];

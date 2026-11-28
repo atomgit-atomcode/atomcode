@@ -76,6 +76,7 @@ fn a_peer_note_from_an_older_build_still_reads() {
         InjectionOrigin::Peer {
             from: "lead-1/scout".into(),
             outside: false,
+            source_turn: None,
         }
     );
 }
@@ -88,6 +89,7 @@ fn a_peer_note_of_this_tree_is_written_exactly_as_before() {
     let mine = serde_json::to_string(&InjectionOrigin::Peer {
         from: "lead-1/scout".into(),
         outside: false,
+        source_turn: None,
     })
     .unwrap();
     assert_eq!(mine, r#"{"peer":{"from":"lead-1/scout"}}"#);
@@ -99,6 +101,7 @@ fn a_note_from_outside_says_so_and_round_trips() {
     let outside = InjectionOrigin::Peer {
         from: "bg-7".into(),
         outside: true,
+        source_turn: None,
     };
     let json = serde_json::to_string(&outside).unwrap();
     assert!(json.contains(r#""outside":true"#), "{json}");

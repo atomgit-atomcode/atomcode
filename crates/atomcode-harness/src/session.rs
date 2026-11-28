@@ -14,8 +14,9 @@
 //! # Why events instead of messages
 //!
 //! `Vec<Message>` cannot express what a UI and a compactor both need: the raw
-//! chunks a renderer replays, the boundary a compactor cut at, the provenance of
-//! an injected reminder. `derive_messages` projects the model's view *out* of the
+//! chunks a renderer replays while a round streams (they leave once its message
+//! settles it — `settle_transients`), the boundary a compactor cut at, the
+//! provenance of an injected reminder. `derive_messages` projects the model's view *out* of the
 //! log; the log keeps the rest.
 
 use std::collections::BTreeMap;
@@ -264,7 +265,28 @@ impl SessionLog {
         // records.
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         events.push(LoggedEvent { seq, at, event });
+        // A round's chunks go once its message (or the turn) is in: the session
+        // file never kept them, and in memory they were most of a long session.
+        settle_transients(&mut events);
         (seq, at)
+    }
+
+    /// Most recent assistant text from the specified turn, even if it ended in failure.
+    pub fn latest_assistant_text(&self, turn: u64) -> Option<String> {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .take_while(|e| !matches!(e.event, SessionEvent::TurnStart { turn: t } if t == turn))
+            .find_map(|e| match &e.event {
+                SessionEvent::AssistantMessage { turn: t, text, .. }
+                    if *t == turn && !text.trim().is_empty() =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
     }
 
     /// Latest durable human message for a turn, without cloning tool payloads
@@ -311,6 +333,22 @@ impl SessionLog {
         self.events.read().expect("session log poisoned").clone()
     }
 
+    /// Read the committed facts in place. Keep the callback synchronous and
+    /// short, and avoid calling other methods that lock this log from it.
+    pub fn read_events<R>(&self, read: impl FnOnce(&[LoggedEvent]) -> R) -> R {
+        read(&self.events.read().expect("session log poisoned"))
+    }
+
+    /// Inspect committed facts without cloning message and tool payloads.
+    pub(crate) fn contains_event(&self, predicate: impl Fn(&SessionEvent) -> bool) -> bool {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .rev()
+            .any(|entry| predicate(&entry.event))
+    }
+
     /// Last committed fact, without copying the event payloads.
     pub fn last_seq(&self) -> SeqNo {
         self.events
@@ -341,14 +379,14 @@ impl SessionLog {
 
     /// Events after `cursor`, for an incremental consumer (persistence, a UI
     /// that already rendered a prefix).
+    ///
+    /// Facts are kept in sequence order, so the tail is found by bisection:
+    /// every commit advances the projections through here, and a scan of the
+    /// whole log per fact grows with the session.
     pub fn since(&self, cursor: SeqNo) -> Vec<LoggedEvent> {
-        self.events
-            .read()
-            .expect("session log poisoned")
-            .iter()
-            .filter(|e| e.seq > cursor)
-            .cloned()
-            .collect()
+        let events = self.events.read().expect("session log poisoned");
+        let start = events.partition_point(|e| e.seq <= cursor);
+        events[start..].to_vec()
     }
 
     pub fn len(&self) -> usize {
@@ -375,7 +413,7 @@ impl SessionLog {
     /// This is the single place the log becomes a prompt. A consumer that needs
     /// "what the model saw" calls this rather than keeping a parallel list.
     pub fn derive_messages(&self) -> Vec<Message> {
-        derive_messages(&self.events())
+        self.read_events(derive_messages)
     }
 }
 
@@ -691,5 +729,91 @@ mod prompt_anchor_tests {
             from: 0,
         });
         assert!(log.prompt_anchor().is_none(), "a compaction ends it");
+    }
+}
+
+#[cfg(test)]
+mod transient_retention_tests {
+    use super::*;
+    use atomcode_kernel::event::StopReason;
+
+    fn message(turn: u64, round: u32) -> SessionEvent {
+        SessionEvent::AssistantMessage {
+            turn,
+            round,
+            text: "done".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: vec![],
+            meta: None,
+        }
+    }
+
+    fn chunk(turn: u64, round: u32) -> SessionEvent {
+        SessionEvent::AssistantChunk {
+            turn,
+            round,
+            delta: "字".into(),
+            reasoning: false,
+        }
+    }
+
+    /// The memory a long session holds is its facts, not every delta that ever
+    /// streamed: the log is no longer after 100 rounds of 1 000 chunks than a
+    /// resumed one, which never had them.
+    #[test]
+    fn a_long_stream_leaves_only_its_facts_in_memory() {
+        let log = SessionLog::new("long-stream");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        for round in 1..=100 {
+            for _ in 0..1_000 {
+                log.append(chunk(1, round));
+            }
+            log.append(message(1, round));
+        }
+        log.append(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        });
+
+        let events = log.events();
+        assert_eq!(events.len(), 1 + 100 + 1);
+        assert!(events.windows(2).all(|w| w[0].seq < w[1].seq));
+        assert_eq!(log.last_seq(), 1 + 100 * 1_001 + 1);
+    }
+
+    /// Only the round the message closes loses its chunks: one still streaming
+    /// is what a live view and a cancel read from.
+    #[test]
+    fn the_round_still_streaming_keeps_its_chunks() {
+        let log = SessionLog::new("streaming");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(chunk(1, 1));
+        log.append(SessionEvent::ReasoningDiscarded { turn: 1, round: 1 });
+        log.append(chunk(1, 2));
+        log.append(message(1, 1));
+
+        let kept: Vec<_> = log
+            .events()
+            .into_iter()
+            .filter(|e| e.event.is_transient())
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(kept, vec![chunk(1, 2)]);
+    }
+
+    /// An incremental reader by sequence number sees every fact once, however
+    /// many chunks left between two reads.
+    #[test]
+    fn a_reader_since_a_sequence_number_misses_nothing() {
+        let log = SessionLog::new("cursor");
+        log.append(SessionEvent::TurnStart { turn: 1 });
+        log.append(chunk(1, 1));
+        let cursor = log.last_seq();
+        log.append(chunk(1, 1));
+        let message_seq = log.append(message(1, 1));
+        let since: Vec<_> = log.since(cursor).into_iter().map(|e| e.seq).collect();
+        assert_eq!(since, vec![message_seq]);
     }
 }

@@ -286,6 +286,10 @@ impl Subagents for InProcessSubagents {
             .and_then(|c| c.service::<SessionSvc>())
             .map(|log| log.id().to_string());
         let child_session = format!("sub-{}", crate::agent::mint_session_id());
+        // The setup closure below takes the label to describe the child with;
+        // the header wants the same wording, kept apart so the two uses do not
+        // fight over ownership.
+        let header_label = label.clone();
         let delegated_llm = self.ctx.service::<crate::seams::DelegatedLlmSvc>();
         let mut req = crate::agent::CreateAgent::new()
             .id(child_session.clone())
@@ -339,6 +343,12 @@ impl Subagents for InProcessSubagents {
             }));
         if let Some(parent) = parent {
             req = req.parent(parent);
+        }
+        // The label the person sees in `/agents`: the header is what a picker
+        // reads, and the child's log starts with the task as its first user
+        // message — no name for a person.
+        if !header_label.is_empty() {
+            req = req.label(header_label);
         }
         let child = match agents.create(&self.ctx, req).await {
             Ok(child) => child,

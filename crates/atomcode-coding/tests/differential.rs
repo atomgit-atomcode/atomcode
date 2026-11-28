@@ -2914,12 +2914,19 @@ async fn on_harness_headless(
     dir: &std::path::Path,
 ) -> (AgentHandle, atomcode_plexus::App) {
     let quiet = quiet_rows(dir);
+    // These scenarios overwrite a seeded file they never read — what the
+    // recorded chain did, which had no `write-guard`. They measure the verify
+    // cadence after an edit, not write safety, so the guard is left out rather
+    // than the recording touched.
+    let unguarded =
+        atomcode_plexus::Layer::from_toml("[[patch]]\nid = \"write-guard\"\ndisabled = true\n")
+            .expect("the unguarded layer parses");
     atomcode_coding::on_harness::mount(
         dir,
         &atomcode_coding::config::product_dirs_from_env(),
         atomcode_coding::on_harness::Presence::Headless,
         script,
-        &[quiet.clone()],
+        &[quiet.clone(), unguarded],
     )
     .await
     .expect("the headless coding-on-harness tree must mount")

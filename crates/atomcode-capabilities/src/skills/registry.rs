@@ -24,6 +24,8 @@ fn ignored_discovery_directory(path: &Path) -> bool {
         ".ruff_cache",
         ".tox",
         ".nox",
+        // Claude's skill manager moves deleted skills here; they are not installed.
+        ".trash",
     ];
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1514,6 +1516,7 @@ mod tests {
             "__pycache__",
             ".pytest_cache",
             ".tox",
+            ".trash",
         ] {
             let directory = root.path().join(ignored).join("dependency");
             std::fs::create_dir_all(&directory).unwrap();

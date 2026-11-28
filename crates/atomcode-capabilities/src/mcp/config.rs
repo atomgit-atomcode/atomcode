@@ -103,6 +103,8 @@ pub struct McpServerConfig {
     /// Per-tool auto-approve allowlist (the `autoApprove` array): bare tool names
     /// (e.g. `["query", "search"]`) whose calls skip the approval prompt.
     pub auto_approve: Vec<String>,
+    /// Exact tools the user or driver authorizes for direct read-only Team queries.
+    pub team_read_only_tools: BTreeMap<String, Vec<String>>,
     /// Exact raw MCP tool names permitted for discovery and execution. None permits all; empty denies all.
     pub allowed_tools: Option<Vec<String>>,
     /// Exact positive versions required in every initialize response, including reconnect.
@@ -169,6 +171,8 @@ struct McpServerEntry {
     /// `autoApprove: ["query", ...]` ⇒ per-tool auto-approve allowlist.
     #[serde(default, rename = "autoApprove", alias = "auto_approve")]
     auto_approve: Vec<String>,
+    #[serde(default, rename = "teamReadOnlyTools")]
+    team_read_only_tools: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "allowedTools", alias = "allowed_tools")]
     allowed_tools: Option<Vec<String>>,
     #[serde(
@@ -491,6 +495,17 @@ pub fn config_path_for_source(
     }
 }
 
+fn write_mcp_config(path: &Path, content: String) -> Result<()> {
+    // User MCP configs can include inline credentials. Project configs
+    // intentionally share the project's permissions.
+    #[cfg(windows)]
+    if path.file_name().is_some_and(|name| name == "mcp.json") {
+        return crate::fs::atomic_write(path, content.as_bytes(), 0o600);
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 /// Turn one configured server off or back on, in the file that defines it.
 ///
 /// Turning off writes `disabled: true`. Turning on **removes** the key rather than writing
@@ -510,7 +525,7 @@ pub fn set_mcp_server_disabled_in_json_file(
     }
     let text = read_config_text(path)?;
     let out = with_server_disabled(&text, server_key, disabled, &path.display())?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
     Ok(())
@@ -687,6 +702,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         source: McpConfigSource::Project, // default; overwritten by load_config_file
         trust,
         auto_approve: entry.auto_approve,
+        team_read_only_tools: entry.team_read_only_tools,
         allowed_tools: entry.allowed_tools,
         required_experimental_capabilities: entry.required_experimental_capabilities,
     })
@@ -805,7 +821,7 @@ pub fn merge_stdio_mcp_server_into_json_file(
         &path.display(),
     )?;
     create_parent(path)?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
     Ok(())
@@ -895,7 +911,7 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
         &path.display(),
     )?;
     create_parent(path)?;
-    std::fs::write(path, out)
+    write_mcp_config(path, out)
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
     Ok(())
 }
@@ -1062,7 +1078,7 @@ fn write_auto_approved_tool(target: &Path, server: &str, tool: &str) -> Result<(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(target, out)?;
+    write_mcp_config(target, out)?;
     Ok(())
 }
 

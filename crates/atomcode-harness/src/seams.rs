@@ -23,6 +23,87 @@ pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(ProductDirsSvc => atomcode_capabilities::ProductDirs, "product-dirs", Core, "Where the product keeps its data: the user tree and the per-project dir");
+plexus_service!(TurnRequestsSvc => TurnRequests, "turn-requests", Core, "Per-turn provider invocation accounting for the owning agent");
+
+/// Optional product-owned context for an existing member report. The key identifies
+/// the work covered, so a progress report cannot suppress a later, changed handoff.
+pub struct MemberReportNote {
+    pub key: String,
+    pub text: String,
+}
+
+pub type MemberReportNoteFn = dyn Fn(&Agent, &Agent) -> Option<MemberReportNote> + Send + Sync;
+plexus_service!(MemberReportNoteSvc => MemberReportNoteFn, "member-report-note", Seam, "Product context accompanying a team member's report");
+
+/// Counts calls at the chat_stream boundary, including harness retries. Transport
+/// retries internal to an adapter and side calls such as compaction are separate.
+pub struct TurnRequests {
+    pub session: String,
+    pub limit: u32,
+    state: std::sync::Mutex<RequestCount>,
+}
+
+#[derive(Default)]
+struct RequestCount {
+    turn: u64,
+    calls: u64,
+    closing_round: Option<u32>,
+    limited: bool,
+}
+
+impl TurnRequests {
+    pub fn new(session: String, limit: u32) -> Self {
+        Self {
+            session,
+            limit,
+            state: Default::default(),
+        }
+    }
+
+    pub fn count(&self, turn: u64) -> u64 {
+        let state = self.state.lock().expect("turn requests poisoned");
+        if state.turn == turn {
+            state.calls
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn exhausted(&self, turn: u64) -> bool {
+        self.limit > 0 && self.count(turn) >= u64::from(self.limit)
+    }
+
+    pub(crate) fn limited(&self, turn: u64) -> bool {
+        let state = self.state.lock().expect("turn requests poisoned");
+        state.turn == turn && state.limited
+    }
+
+    pub(crate) fn allow_closing(&self, turn: u64, round: u32, budget_closing: bool) {
+        let mut state = self.state.lock().expect("turn requests poisoned");
+        if state.turn == turn {
+            state.closing_round = Some(round);
+            state.limited |= budget_closing;
+        }
+    }
+
+    pub(crate) fn admit(&self, turn: u64, round: u32) -> bool {
+        let mut state = self.state.lock().expect("turn requests poisoned");
+        if state.turn != turn {
+            *state = RequestCount {
+                turn,
+                ..Default::default()
+            };
+        }
+        let closing = state.closing_round == Some(round);
+        if self.limit > 0 && state.calls >= u64::from(self.limit) + u64::from(closing) {
+            state.limited = true;
+            return false;
+        }
+        state.calls += 1;
+        true
+    }
+}
+
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
 plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");
@@ -774,6 +855,15 @@ pub trait SessionPersistence: Send + Sync {
 
     /// Replay a session's events in order.
     async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String>;
+
+    /// Delete an inactive session and its owned files. Returns false when no
+    /// session exists. Backends must opt in to this destructive operation.
+    async fn delete(&self, _session_id: &str) -> Result<bool, String> {
+        Err(
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::SessionStoreDeleteUnsupported)
+                .into_owned(),
+        )
+    }
 
     /// The sessions a person can pick up, newest first where the backend can
     /// tell. A delegated agent's session — a team member, a task child — is

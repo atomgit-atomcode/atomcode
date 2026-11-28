@@ -252,13 +252,17 @@ impl Plugin for SessionNativePlugin {
 pub struct HostHooks {
     hooks: RwLock<BTreeMap<String, Arc<dyn LifecycleHooks>>>,
     /// The log's projection with its stats, for the request being made — see
-    /// [`HostHooks::logged_view`].
-    logged_view: Mutex<Option<(LoggedViewKey, Arc<Vec<Message>>)>>,
+    /// [`HostHooks::logged_view`]. Weak: the bridges of the request in flight
+    /// hold it, and it goes with them instead of sitting beside the log as one
+    /// more copy of the whole conversation between requests.
+    logged_view: Mutex<Option<(LoggedViewKey, std::sync::Weak<Vec<Message>>)>>,
 }
 
 /// Which request a [`HostHooks::logged_view`] was made for: the session, how
-/// far its log had got, and the turn and round asking.
-type LoggedViewKey = (String, usize, u64, u32);
+/// far its log had got (its last sequence number — a length can come back to
+/// an earlier value once a round's chunks leave the log), and the turn and
+/// round asking.
+type LoggedViewKey = (String, u64, u64, u32);
 
 impl HostHooks {
     pub fn new() -> Arc<Self> {
@@ -291,15 +295,15 @@ impl HostHooks {
     /// some path the key does not see costs nothing worse than the stats:
     /// [`with_logged_meta`] only lends them to messages that line up.
     fn logged_view(&self, log: &SessionLog, turn: u64, round: u32) -> Arc<Vec<Message>> {
-        let key = (log.id().to_string(), log.len(), turn, round);
+        let key = (log.id().to_string(), log.last_seq(), turn, round);
         let mut cached = self.logged_view.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, view)) = cached.as_ref() {
-            if *at == key {
-                return view.clone();
+            if let Some(view) = view.upgrade().filter(|_| *at == key) {
+                return view;
             }
         }
-        let view = Arc::new(derive_messages_with_meta(&log.events()));
-        *cached = Some((key, view.clone()));
+        let view = Arc::new(log.read_events(derive_messages_with_meta));
+        *cached = Some((key, Arc::downgrade(&view)));
         view
     }
 
@@ -567,6 +571,10 @@ impl Waterfall<AgentRequest> for Bridge {
         } else {
             Vec::new()
         };
+        // Both are whole conversations, and the rest of this function waits on
+        // the provider's whole stream: held, every mounted hook would keep two
+        // more copies alive for it. `logged` stays — the bridges share it.
+        drop((proposed, handed));
         let at = req.messages.len();
         req.messages.extend(tail.iter().cloned());
         let mut timing =
@@ -3696,6 +3704,34 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    /// One projection for every bridge of a request, and none left over once
+    /// the request lets go of it: between requests the log is the only copy.
+    #[test]
+    fn the_logged_view_is_shared_by_a_request_and_released_after_it() {
+        use super::{HostHooks, SessionEvent, SessionLog};
+        use std::sync::Arc;
+        let hooks = HostHooks::new();
+        let log = SessionLog::new("view");
+        log.append(SessionEvent::UserMessage {
+            turn: 1,
+            text: "看看".into(),
+            images: vec![],
+        });
+
+        let outer = hooks.logged_view(&log, 1, 1);
+        let inner = hooks.logged_view(&log, 1, 1);
+        assert!(Arc::ptr_eq(&outer, &inner), "the bridges share one view");
+        drop((outer, inner));
+        let (_, kept) = hooks.logged_view.lock().unwrap().clone().unwrap();
+        assert!(
+            kept.upgrade().is_none(),
+            "nothing holds it after the request"
+        );
+
+        let next = hooks.logged_view(&log, 1, 2);
+        assert_eq!(next.len(), 1, "a later request projects the log again");
+    }
+
     #[test]
     fn the_stub_budget_is_described_as_clamped() {
         let row = super::CodingCompaction {

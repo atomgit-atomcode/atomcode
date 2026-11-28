@@ -2,79 +2,76 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Headless 与 Daemon · AtomCode 文档</title>
 <meta name="description" content="Headless 与 Daemon — AtomCode 文档。">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<meta name="theme-color" content="#050605">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../docs.css">
-<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+<script>try{if(localStorage.getItem('atomcode_theme')==='light')document.documentElement.classList.add('light')}catch(e){}</script>
 </head>
-<body data-page="headless-daemon">
+<body data-page="headless-daemon" data-lang="zh">
+<div class="prog" id="prog"></div>
 
-<header class="dhdr" id="dhdr">
-  <a class="dhdr-logo" href="../../index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
-    <span>AtomCode</span>
-    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.8</span>
-  </a>
-  <div class="dhdr-right">
-    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span data-i18n="search.trigger.text">搜索文档…</span>
-      <span class="kbd">⌘K</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
-    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
-    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
-    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
-  </div>
+<!-- ==================== 头部 ==================== -->
+<header class="dh">
+  <button class="ib sb-btn" id="sbBtn" aria-label="目录" aria-expanded="false">☰</button>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>DOCS</em><small>v5.2.9</small></a>
+  <button class="dh-search" id="sBtn"><b>/</b><span>搜索文档…</span><kbd>⌘K</kbd></button>
+  <nav class="dh-r">
+    <a class="ib txt" href="../../index.html">官网</a>
+    <a class="ib" href="../en/headless-daemon.html" id="langBtn" hreflang="en" aria-label="English">EN</a>
+    <button class="ib" id="themeBtn" aria-label="切换主题"><span class="i-moon">◐</span></button>
+    <a class="ib txt" href="https://atomgit.com/atomgit_atomcode/atomcode">仓库 ↗</a>
+  </nav>
 </header>
 
-<div class="dlayout">
-  <aside class="dside" id="dside">
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
-    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
-    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
-    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
-    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
-    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
-    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
-    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
-    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
-    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
-    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
-    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
-    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
-    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
-    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
-    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
-    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
-    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
-    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
-    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
-    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
-  </div>
+<div class="dl">
+  <!-- ==================== 侧栏 ==================== -->
+  <aside class="ds" id="ds" aria-label="目录">
+<div class="sg"><div class="sg-t">概览</div>
+<a class="sl" href="./index.html"><i>Ac</i><span>文档首页</span></a>
+</div>
+<div class="sg"><div class="sg-t">开始</div>
+<a class="sl" href="./getting-started.html"><i>Qs</i><span>快速开始</span></a>
+<a class="sl" href="./login.html"><i>Lg</i><span>登录方式</span></a>
+<a class="sl" href="./configuration.html"><i>Cf</i><span>配置文件</span></a>
+</div>
+<div class="sg"><div class="sg-t">使用</div>
+<a class="sl" href="./basic-usage.html"><i>Bu</i><span>基本使用</span></a>
+<a class="sl" href="./slash-commands.html"><i>Sc</i><span>斜杠命令</span></a>
+<a class="sl" href="./keybindings.html"><i>Kb</i><span>快捷键</span></a>
+<a class="sl" href="./sessions.html"><i>Ud</i><span>会话与撤销</span></a>
+<a class="sl" href="./interactive-questions.html"><i>Iq</i><span>交互提问</span></a>
+</div>
+<div class="sg"><div class="sg-t">进阶</div>
+<a class="sl" href="./tools.html"><i>Tl</i><span>内置工具</span></a>
+<a class="sl" href="./subagents.html"><i>Sa</i><span>子代理</span></a>
+<a class="sl" href="./approvals.html"><i>Ap</i><span>权限审批</span></a>
+<a class="sl" href="./skills.html"><i>Sk</i><span>Skills 扩展</span></a>
+<a class="sl" href="./mcp.html"><i>Mc</i><span>MCP 集成</span></a>
+<a class="sl" href="./plugins.html"><i>Pl</i><span>Plugin 系统</span></a>
+<a class="sl" href="./memory.html"><i>Me</i><span>永久记忆</span></a>
+<a class="sl" href="./project-instructions.html"><i>Pi</i><span>项目指令文件</span></a>
+<a class="sl" href="./webui.html"><i>Wb</i><span>WebUI 界面</span></a>
+<a class="sl" href="./webui-remote-access.html"><i>Ra</i><span>远程访问指南</span></a>
+</div>
+<div class="sg"><div class="sg-t">问题</div>
+<a class="sl" href="./faq.html"><i>Fq</i><span>常见问题</span></a>
+</div>
+<div class="sg"><div class="sg-t">发布</div>
+<a class="sl" href="./changelog.html"><i>Cl</i><span>更新日志</span></a>
+</div>
   </aside>
+  <div class="ds-bg" id="dsBg"></div>
 
-  <main class="dmain prose-docs">
+  <!-- ==================== 正文 ==================== -->
+  <main class="dm">
+    <div class="crumb"><a href="./index.html">文档</a><span>/</span><span>进阶</span><span>/</span><b>Headless 与 Daemon</b><em>11 分钟阅读</em></div>
+    <article class="prose" id="prose">
 <h1>Headless 与 Daemon</h1>
       <p class="lede">AtomCode 除了交互式 TUI,还提供两种无头运行方式:CLI 的 <code>-p</code> headless 模式适合脚本与 CI;<code>atomcode-daemon</code> 则是一个基于 HTTP + SSE 的 API 服务,可以被任意客户端调用。</p>
 
@@ -84,7 +81,7 @@
       <p>默认只输出 AI 最终的回复文本,方便 pipe 到其他命令。工具调用、token 用量等信息不会污染 stdout。</p>
 
       <h3>常用 headless 参数</h3>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>参数</th><th>说明</th></tr>
         </thead>
@@ -92,21 +89,22 @@
           <tr><td><code>-p, --prompt TEXT</code></td><td>要执行的任务描述</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
           <tr><td><code>-v, --verbose</code></td><td>把工具调用日志、token 用量、turn 摘要打到 <em>stderr</em>,不影响 stdout</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>强制上限 N 轮 LLM 调用,避免 agent 在长任务里无限跑。默认不设上限</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>禁用特定工具,比如 <code>bash,web_fetch</code>。被禁用的工具不会出现在 schema 列表中,模型不会尝试调用</td></tr>
+          <tr><td><code>--no-tools</code></td><td>Headless 专用。不给模型提供内置工具、MCP、Skill 工具或子代理工具。</td></tr>
+          <tr><td><code>--ephemeral</code></td><td>不创建、加载或写入持久化会话。</td></tr>
+          <tr><td><code>--output-format text|jsonl</code></td><td>默认输出助手回复文本，<code>jsonl</code> 输出带版本的 JSON Lines 事件。</td></tr>
+          <tr><td><code>--require-approval-hook</code></td><td>要求启用覆盖所有工具的必需审批 Hook。</td></tr>
           <tr><td><code>-C, --dir PATH</code></td><td>工作目录,默认为当前目录</td></tr>
           <tr><td><code>--provider / --model</code></td><td>临时覆盖 provider 或模型</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>本次调用关闭遥测上报</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h3>示例</h3>
       <pre><code># 把当前项目总结写进 README
 atomcode -p "总结项目结构并写成 README 草稿" &gt; README.draft.md
 
-# 在 CI 里跑一轮自动修复
-atomcode -p "跑 pnpm lint 并修复所有报错,不修改测试文件" \
-         --max-turns 30 --disable-tools web_search,web_fetch
+# 让 CI 解释已有的 lint 输出，关闭全部工具
+atomcode --prompt-file lint-report.txt --no-tools --ephemeral
 
 # 从文件读取 prompt
 atomcode --prompt-file task.md -v 2&gt; run.log
@@ -122,18 +120,18 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
 
       <div class="callout callout-warn">
         <strong>注意:权限模型</strong>
-        <p>Headless 模式没有交互式权限确认对话框。当前实现中,需要确认的 <code>bash</code> 调用会自动批准,并把原因写到 stderr:</p>
-        <pre><code>[headless] auto-approved bash: &lt;reason&gt;</code></pre>
-        <p>其他需要确认的工具(<code>edit</code>、<code>write</code>、<code>web_fetch</code> 等的高风险路径)会被自动拒绝:</p>
-        <pre><code>[approval-denied] tool=&lt;name&gt; reason=&lt;reason&gt;</code></pre>
-        <p>出现 <code>[approval-denied]</code> 时进程会以非 0 退出码结束。如果你不希望 CI 中执行 shell,可以显式加上 <code>--disable-tools bash</code> 把它从工具列表里彻底移除。</p>
+        <p>普通 <code>-p</code> 模式没有交互式审批。进入审批环节的 <code>bash</code> 和 <code>bash_start</code> 会自动批准，stderr 输出工具名：</p>
+        <pre><code>[headless] auto-approved bash</code></pre>
+        <p>其他进入审批环节的工具默认拒绝，示例：</p>
+        <pre><code>[denied] edit_file requires interactive approval</code></pre>
+        <p>发生审批拒绝时，进程以非零状态退出。CI 需要完全关闭模型工具时使用 <code>--no-tools</code>。定时任务的非交互执行会拒绝所有进入审批环节的调用。</p>
       </div>
 
       <h2>atomcode-daemon</h2>
       <p><code>atomcode-daemon</code> 是构建在 <code>CodingRuntime</code> 之上的独立传输适配器。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
 
       <h3>启动</h3>
-      <pre><code># 推荐:通过 CLI 子命令启动,自动调用同目录下的 atomcode-daemon 二进制
+      <pre><code># 通过 CLI 在当前进程内启动，固定监听 127.0.0.1
 atomcode daemon
 
 # 指定端口与客户端身份(用于遥测分流)
@@ -145,38 +143,39 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
       <p>daemon 读取与 CLI 相同的 <code>~/.atomcode/config.toml</code>,登录态、provider 配置、会话历史全部共享。</p>
 
       <h3>启动参数</h3>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>参数</th><th>说明</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>--host HOST</code></td><td>监听地址,默认 <code>127.0.0.1</code>。非 loopback 地址会触发警告(daemon 没有鉴权,不应暴露到公网)</td></tr>
+          <tr><td><code>--host HOST</code></td><td>仅独立的 <code>atomcode-daemon</code> 支持，用于指定监听地址。默认 <code>127.0.0.1</code>。</td></tr>
           <tr><td><code>--port PORT</code></td><td>监听端口,默认 <code>13456</code></td></tr>
-          <tr><td><code>--client NAME</code></td><td>客户端身份,目前识别 <code>vscode</code> / <code>atomcode-air</code>,其他值视为通用 IDE。影响遥测打点与部分行为</td></tr>
-          <tr><td><code>--idle-timeout SECS</code></td><td>空闲超时(秒)。默认 1800(30 分钟),<code>0</code> 表示禁用,非零值最小钳制到 60。也可用环境变量 <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code></td></tr>
+          <tr><td><code>--client NAME</code></td><td>为遥测标记客户端。两种入口均识别 <code>vscode</code>、<code>jetbrains</code> 和 <code>atomcode-air</code>。</td></tr>
+          <tr><td><code>--idle-timeout SECS</code></td><td>空闲超时，默认 1800 秒，<code>0</code> 关闭。也可设置 <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code>。独立二进制把非零值下限设为 60 秒。</td></tr>
+          <tr><td><code>--no-auth</code></td><td>关闭 API token 鉴权，适用于隔离的本机开发环境。</td></tr>
           <tr><td><code>--no-telemetry</code></td><td>关闭本次进程的遥测上报</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <div class="callout callout-warn">
         <strong>安全</strong>
-        <p>daemon 没有内置鉴权,默认只监听 <code>127.0.0.1</code>。<strong>切勿把它直接暴露到公网或局域网</strong> —— 调用方相当于直接拿到本机所有工具的执行权(包括 <code>bash</code>、<code>write</code>、<code>edit</code>)。需要远程使用时,请在前置反代上自行做认证 / TLS / 来源限制。</p>
+        <p>两种 Daemon 入口默认都启用 API token 鉴权。<code>GET /health</code> 可用于无 token 健康检查。访问受保护端点时，从 <code>$ATOMCODE_HOME/daemon-&lt;port&gt;.json</code>（默认在 <code>~/.atomcode/</code> 下）取得 token，并发送 <code>Authorization: Bearer &lt;token&gt;</code>。独立二进制在关闭鉴权且绑定非本机地址时默认拒绝启动。远程使用应保留鉴权并通过 TLS 保护连接。</p>
       </div>
 
       <h3>端点总览</h3>
-      <p>所有端点都注册在 <code>crates/atomcode-daemon/src/main.rs</code>,以下按功能分组。</p>
+      <p>下面列出常用端点。路由从 <code>crates/atomcode-daemon/src/lib.rs</code> 注册或合并。</p>
 
       <h4>健康与生命周期</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /health</code></td><td>健康检查</td></tr>
           <tr><td><code>POST /shutdown</code></td><td>主动关闭 daemon(用于客户端退出时优雅关停)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>会话 / 项目</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /sessions</code></td><td>列出所有会话</td></tr>
@@ -190,20 +189,20 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>DELETE /projects/:hash/sessions/:id</code></td><td>删除会话</td></tr>
           <tr><td><code>PATCH /projects/:hash/sessions/:id/rename</code></td><td>重命名会话</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>聊天与模型</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /models</code></td><td>列出可用的 provider / model</td></tr>
           <tr><td><code>POST /chat</code></td><td>发送一条 prompt,返回 SSE 流</td></tr>
           <tr><td><code>POST /chat/stop</code></td><td>停止正在进行的 <code>/chat</code></td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>配置 / Provider</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /config</code></td><td>读取当前 <code>config.toml</code></td></tr>
@@ -215,19 +214,19 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /providers/:name/default</code></td><td>把该 provider 设为默认</td></tr>
           <tr><td><code>PATCH /providers/:name/thinking</code></td><td>切换/调整 provider 的 thinking 模式</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>MCP</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /mcp/status</code></td><td>MCP server 接入状态</td></tr>
           <tr><td><code>POST /mcp/reload</code></td><td>重新加载 <code>.mcp.json</code></td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h4>认证 / CodingPlan</h4>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td><code>GET /auth/status</code></td><td>当前登录状态</td></tr>
@@ -237,7 +236,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /auth/logout</code></td><td>登出</td></tr>
           <tr><td><code>POST /codingplan/setup</code></td><td>领取 CodingPlan 并写入 provider 配置(等同 CLI <code>atomcode login</code>;<code>atomcode codingplan</code> 仍作为隐藏别名保留)</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h3>SSE 流式聊天</h3>
       <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。daemon wire schema 见 <code>crates/atomcode-daemon/src/live_api.rs</code> 中的 <code>LiveWireEvent</code>。</p>
@@ -259,26 +258,26 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
         <li><a href="./skills.html">Skills 扩展</a> —— 把工作流固化成命令,配合 headless 调用更顺手</li>
         <li><a href="./faq.html">常见问题</a> —— headless / daemon 常见坑</li>
       </ul>
-
-    <footer class="dftr">
-      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
-      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
-    </footer>
+    </article>
+    <nav class="pager"><span></span><span></span></nav>
+    <footer class="df"><span>© 2026 AtomCode · MIT</span><a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">报告问题 ↗</a></footer>
   </main>
+
+  <!-- ==================== 本页目录 ==================== -->
+  <aside class="toc" id="toc" aria-label="本页目录"><p>本页目录</p><nav id="tocList"></nav><button id="toTop">↑ 回到顶部</button></aside>
 </div>
 
-<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
-  <div class="search-modal-bg"></div>
-  <div class="search-modal-box">
-    <div class="search-input-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
-      <span class="search-esc">ESC</span>
-    </div>
-    <div class="search-results" id="searchResults"></div>
+<!-- ==================== 搜索 ==================== -->
+<div class="sm" id="sm" role="dialog" aria-modal="true" aria-label="搜索文档…">
+  <div class="sm-box">
+    <div class="sm-in"><b>/</b><input id="sIn" type="search" autocomplete="off" spellcheck="false" placeholder="搜索文档…"><kbd>ESC</kbd></div>
+    <ul class="sm-list" id="sList" role="listbox"></ul>
+    <div class="sm-ft">↑↓ 选择 · ↵ 打开 · esc 关闭</div>
   </div>
 </div>
-
+<div class="toast" id="toast" role="status"></div>
+<script>window.DOCS_UI={"copy": "复制", "copied": "已复制", "noRes": "没有匹配的结果"};</script>
+<script src="../search-index.zh.js"></script>
 <script src="../docs.js"></script>
 </body>
 </html>

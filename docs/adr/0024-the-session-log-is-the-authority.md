@@ -70,6 +70,14 @@ rewind、恢复、会话目录、租约、落盘失败即停只认它。harness 
    `AssistantMessage` 的文本画(`tui/modules/transcript.rs:189-193`)。本机实测片段占 journal
    行数的 97%。磁盘上的序号因此有空洞:屏幕按 `seq > high` 去重、`restore` 取最大序号,都不要求
    连续。
+   - 2026-11-25 补充:内存里也只留**还在流式的那一轮**的片段。一轮的 `AssistantMessage`
+     提交时移出该轮的片段与 `ReasoningDiscarded`,`TurnEnd` 提交时移出本回合剩下的
+     (`kernel::session::settle_transients`;harness 的 `SessionLog::record` 与 tui 留给重画的
+     `view.events` 用同一条规则)。依据:实测长会话的内存几乎全是片段——一个 delta 一条约 288
+     字节的事实,harness 与 tui 各存一份,磁盘 2 775 条事实的会话内存里有约 9.5 万条;已结束的
+     轮次没有读者需要它们(tui 照上文直接画 `AssistantMessage`,`PartialReply` 只读未结束的轮次,
+     且在 `TurnEnd` 之前提交)。内存日志于是与恢复出来的日志同形。代价:日志里的位置会变,
+     读者一律按序号续读(`background.rs` 的 `LogCursor` 与 `logged_view` 的缓存键已改)。
 8. **人取消时,半截输出合并成一条事实提交。** 流式到一半被人取消,这一步已经收到、还没有
    `AssistantMessage` 的文本与推理,合并成一条事实,在 `Interrupted` 之前提交
    (`agent_loop.rs:724-731` 的同一条件:`Cancelled` 且是人取消的)。它进内存日志,也落盘。

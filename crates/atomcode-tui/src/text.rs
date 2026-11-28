@@ -225,6 +225,23 @@ pub fn spoken_duration(secs: u64) -> String {
     .into_owned()
 }
 
+/// A duration as a compact badge figure: seconds, then minutes and seconds,
+/// then hours and minutes.
+///
+/// Never milliseconds and never a float: this is read at a glance beside a
+/// status word, and `13400ms` is a number to work out rather than an answer.
+pub fn compact_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m{:02}s", secs % 60);
+    }
+    format!("{}h{:02}m", mins / 60, mins % 60)
+}
+
 /// The terminal window/tab title: an optional status dot, then the session's
 /// name — or a fallback for a window not yet named.
 ///

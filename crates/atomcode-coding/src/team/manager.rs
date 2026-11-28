@@ -575,6 +575,8 @@ impl TeamRunManager {
                 member_id: member.id.clone(),
                 success: completed_status == TeamMemberStatus::Completed,
                 stop: outcome.stop,
+                provider_requests: None,
+                input_tokens: None,
                 summary: member
                     .result
                     .lines()

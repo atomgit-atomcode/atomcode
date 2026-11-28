@@ -5,6 +5,10 @@
 pub(crate) fn detected() -> bool {
     static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DETECTED.get_or_init(|| {
+        // Services with a generic PTY wrapper can identify the browser explicitly.
+        if std::env::var_os("ATOMCODE_BROWSER_TERMINAL").is_some_and(|value| value == "1") {
+            return true;
+        }
         if !cfg!(target_os = "linux") {
             return false;
         }

@@ -448,7 +448,48 @@ mod tests {
         let said =
             reconfigured(&old, &new, Some(100_000)).expect("a switch over the threshold is told");
         assert!(said.contains("host may compact"), "{said}");
+        assert!(said.contains("only an estimate"), "{said}");
         assert!(!said.contains("cannot fit"), "{said}");
+    }
+
+    /// `compact_token_limit` caps the trigger below the window×threshold pair:
+    /// usage between the capped trigger and the raw threshold still warns, and
+    /// the copy names the CAPPED trigger, not the threshold one.
+    #[test]
+    fn the_configured_token_limit_caps_the_trigger() {
+        let mut old = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "big",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        old.context_window = 200_000;
+        let mut new = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            "small",
+            ".",
+            crate::config::product_dirs_from_env(),
+        );
+        new.context_window = 200_000;
+        new.compact_token_limit = Some(100_000);
+        // 120_000 of 200_000 is 60% — under the 0.7 threshold (140_000) but
+        // over the capped trigger (100_000): the cap is what fires the hint.
+        let said = reconfigured(&old, &new, Some(120_000))
+            .expect("usage between the capped trigger and the threshold is told");
+        assert!(said.contains("host may compact"), "{said}");
+        assert!(
+            said.contains("100000 of a 200000-token window"),
+            "the copy names the capped trigger, not the threshold one: {said}"
+        );
+
+        // Below the capped trigger the hint stays quiet.
+        let quiet = reconfigured(&old, &new, Some(90_000)).expect("the switch itself is told");
+        assert!(
+            !quiet.contains("host may compact"),
+            "no window hint below the capped trigger: {quiet}"
+        );
     }
 
     #[test]

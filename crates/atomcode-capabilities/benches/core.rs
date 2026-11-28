@@ -488,16 +488,9 @@ fn create_session(
         .unwrap_or_default()
         .as_millis() as i64;
     let lease = manager.acquire_lease(id).expect("acquire lease");
-    let header = SessionHeader {
-        version: SESSION_FORMAT_VERSION,
-        id: id.to_string(),
-        created_at: now as u64,
-        cwd: Some(root.to_string_lossy().into_owned()),
-        parent: None,
-        inherited: 0,
-        context: None,
-        member: None,
-    };
+    let mut header = SessionHeader::new(id);
+    header.created_at = now as u64;
+    header.cwd = Some(root.to_string_lossy().into_owned());
     let mut meta = SessionMeta::new(id, root.to_string_lossy(), now);
     meta.owner = StorageOwner::Native;
     meta.format_version = SESSION_FORMAT_VERSION;

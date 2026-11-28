@@ -81,6 +81,17 @@ pub fn source_rank(path: &Path, native_roots: &[PathBuf]) -> u8 {
     }
 }
 
+/// Below this average display width (CJK counts double) the shared description
+/// prefixes say nothing — `Use when creating, c…` — so the catalog lists names
+/// alone and leaves the descriptions to `list_skills`, as Claude Code does.
+pub const MIN_SHARED_DESC_WIDTH: usize = 32;
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| if c >= '\u{2E80}' { 2 } else { 1 })
+        .sum()
+}
+
 /// Truncate a description to [`PER_SKILL_DESC_CAP`] chars on a char boundary,
 /// appending `…` when cut.
 fn truncate_desc(desc: &str) -> String {
@@ -184,6 +195,38 @@ pub fn render_skill_catalog_prioritizing(
                 break;
             }
         }
+        // Judge only the descriptions that were cut: a short one shown whole is not noise.
+        let cut: Vec<usize> = (0..chars.len())
+            .filter(|&i| counts[i] < chars[i].len())
+            .collect();
+        let shared_width = cut
+            .iter()
+            .map(|&i| display_width(&chars[i][..counts[i]].iter().collect::<String>()))
+            .sum::<usize>()
+            / cut.len().max(1);
+        if !cut.is_empty() && shared_width < MIN_SHARED_DESC_WIDTH {
+            // Names only; skills the instructions name keep their description while it fits.
+            let mut remaining = CATALOG_BYTE_BUDGET - minimum_cost;
+            return Some(render_lines(
+                bases
+                    .iter()
+                    .zip(&descriptions)
+                    .zip(&sorted)
+                    .map(|((base, desc), entry)| {
+                        let priority = priority_names.iter().any(|name| name == &entry.name);
+                        let extra = 2 + desc.len();
+                        if priority && !desc.is_empty() && extra <= remaining {
+                            remaining -= extra;
+                            format!("{base}: {desc}")
+                        } else {
+                            base.clone()
+                        }
+                    })
+                    .collect(),
+                true,
+                0,
+            ));
+        }
         bases
             .iter()
             .enumerate()
@@ -220,6 +263,10 @@ pub fn render_skill_catalog_prioritizing(
             .collect::<Vec<_>>()
     };
 
+    Some(render_lines(lines, shortened, omitted))
+}
+
+fn render_lines(lines: Vec<String>, shortened: bool, omitted: usize) -> String {
     let mut out = String::new();
     out.push_str(CATALOG_HEADER);
     out.push('\n');
@@ -235,7 +282,7 @@ pub fn render_skill_catalog_prioritizing(
             "... and {omitted} more lower-priority skills not shown."
         ));
     }
-    Some(out)
+    out
 }
 
 #[cfg(test)]
@@ -458,7 +505,9 @@ mod tests {
         let lines = catalog_body(&out);
         assert_eq!(lines.len(), 250);
         assert!(lines.iter().map(|line| line.len() + 1).sum::<usize>() <= CATALOG_BYTE_BUDGET);
-        assert!(lines.iter().all(|line| line.contains(": 中")));
+        // A share of a few characters each says nothing: names only, full text via list_skills.
+        assert!(lines.iter().all(|line| !line.contains(": ")), "{lines:?}");
+        assert!(out.contains("list_skills"));
         assert_eq!(
             out,
             render_skill_catalog(&entries.into_iter().rev().collect::<Vec<_>>()).unwrap()
@@ -505,6 +554,51 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains(": ")));
         assert!(!out.contains("more lower-priority skills not shown"));
         assert!(out.contains("against full descriptions"));
+    }
+
+    /// The real catalog that prompted this: 165 skills sharing 8000 bytes left each
+    /// about 20 characters (`huawei-ecs: Use when creating, c…`). A skill the
+    /// instructions name still keeps its description.
+    #[test]
+    fn a_share_too_short_to_say_anything_lists_names_and_keeps_named_descriptions() {
+        let mut entries: Vec<_> = (0..165)
+            .map(|i| {
+                entry(
+                    &format!("huawei-service-{i:03}"),
+                    &"Use when creating or managing cloud resources".repeat(3),
+                    1,
+                )
+            })
+            .collect();
+        entries.push(entry(
+            "brainstorming",
+            "You MUST use this before any creative work",
+            2,
+        ));
+        let out = render_skill_catalog_prioritizing(&entries, &["brainstorming".into()]).unwrap();
+        let lines = catalog_body(&out);
+        assert_eq!(lines.len(), 166);
+        assert_eq!(
+            lines[0],
+            "- brainstorming: You MUST use this before any creative work"
+        );
+        assert!(
+            lines[1..].iter().all(|line| !line.contains(": ")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().map(|line| line.len() + 1).sum::<usize>() <= CATALOG_BYTE_BUDGET);
+        assert!(out.contains("Search `list_skills`"));
+    }
+
+    /// Short descriptions shown whole do not drag the average down into names-only.
+    #[test]
+    fn whole_short_descriptions_do_not_count_as_too_short_to_share() {
+        let mut entries: Vec<_> = (0..200)
+            .map(|i| entry(&format!("s{i:03}"), "Short and complete.", 1))
+            .collect();
+        entries.push(entry("long", &"x".repeat(3000), 1));
+        let out = render_skill_catalog(&entries).unwrap();
+        assert!(out.contains("- s000: Short and complete."), "{out}");
     }
 
     #[test]

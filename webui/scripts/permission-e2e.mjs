@@ -12,7 +12,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 900, height: 850 } });
   const errors = [];
   const submitted = [];
-  let accepted = false;
+  let accepted;
   page.on('pageerror', (error) => errors.push(error.message));
   await page.route('**/chat/permission', async (route) => {
     submitted.push(route.request().postDataJSON());
@@ -42,17 +42,24 @@ try {
   const box = await save.boundingBox();
   assert.ok(box && box.x >= 0 && box.x + box.width <= 390);
   await save.click();
+  await page.getByText(/Invalid approval acknowledgement/).waitFor();
+  assert.equal(await save.isEnabled(), true);
+  accepted = false;
+  await save.click();
   await page.getByText(/This approval request is no longer pending/).waitFor();
-  assert.deepEqual(await page.evaluate(() => window.resolved), [], 'rejected delivery keeps the card');
+  assert.deepEqual(await page.evaluate(() => window.resolved), [], 'expired approval was not delivered');
   assert.deepEqual(submitted[0], { session_id: 'session', decision: 'allow_project', tool_name: 'bash', call_id: 'call-1' });
   assert.equal('rule' in submitted[0], false, 'the client cannot choose the saved rule');
+  assert.equal(await save.count(), 0, 'expired approvals have no decision buttons');
+  await page.getByRole('status').getByRole('button').click();
+  await page.evaluate((req) => window.mountPermission({ ...req, call_id: 'fresh' }), request);
   accepted = true;
   await save.click();
-  await page.waitForFunction(() => window.resolved.length === 1);
+  await page.waitForFunction(() => window.resolved.includes('fresh'));
   await page.evaluate((req) => window.mountPermission({ ...req, call_id: 'call-2', project_rule: undefined }), request);
   assert.equal(await page.getByRole('button', { name: 'Approve and save exact project rule', exact: true }).count(), 0, 'unoffered persistence is hidden');
   assert.deepEqual(errors, []);
-  console.log('Approval browser checks passed (reason, rule preview, exact call correlation, rejected delivery and retry).');
+  console.log('Approval browser checks passed (reason, rule preview, exact call correlation, expiry and fresh approval).');
 } finally {
   await browser?.close();
   await server.close();

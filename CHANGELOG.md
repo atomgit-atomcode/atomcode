@@ -22,6 +22,55 @@
   英文界面读它，某个版本没有英文节时显示这里的中文节。Issues 只写在这份里，英文界面也显示这里的。
 -->
 
+## v5.2.9 (2026-11-26)
+
+### 概览
+
+这一版的主题是团队协作、长会话稳定性与日常操作体验。团队成员之间可以在授权下直接交接，不必全部经 lead 中转，成员还能按需开启申请预算与任务成本记账；会话侧补上跨项目浏览与恢复、旧会话预览与清理，写文件加了写保护——本会话没碰过的已有文件不会被覆盖，压缩前的评审原文也能重新展开。长回合跑完后可以要点一段回顾，工作台也能整棵浏览并下载会话工作区里的文件。
+
+终端与网页端同步改版：`/provider` 改为列表 → 详情两层，WebUI 的 Git 面板改成 VSCode 式源控制并可只读查看团队成员对话。安全侧，本地 API 鉴权失败按次数限流，token 校验改为常量时间比较。性能侧，流式回复改为原地追加与增量渲染，会话历史与事件日志改为增量读取，file-index 过滤不再逐项做小写转换。
+
+### 更新内容
+
+- **团队成员间授权直达交接**：成员可以在授权下直接向对方交接任务与结论，不必全部经 lead 中转；`tell_parent` 要求交付内容真正进入汇报，派只读成员时当场说明交付方式，成员在进度汇报后停下会唤醒 lead，成员报告完成时提醒 lead 核对后再停掉它。成员可按需开启申请预算与任务成本记账，角色可按职责直查只读 MCP 工具并复核结果，交付校验会区分有无 shell 的成员。
+- **团队角色的模型与工具授权**：角色可写 `model: inherit`（沿用会话模型）或 `model: auto`（按难度在可委派且有档位的模型里选：简单档取最弱、困难档取最强；可委派模型不足两个、或当前模型不在候选内时就不选）。这两种写法下再显式指定模型会被拒绝。未写 `model` 且难度为 simple 时走 `llm-utility` 档位。角色文件里点名的模型不在目录中会直接失败，不回落成别的模型。`tools` 与 `allowed_tools` 是同一个列表的别名，同时写会报错；`denied_tools` 优先剔除重叠工具；`allowed_mcp_servers` 按服务器名限定可直查的只读 MCP 工具，填 `[]` 即关闭。
+- **写文件写保护**：`write_file` 不再覆盖本会话没碰过的已有文件。循环检测按会话分开计数，压缩与溢出守卫按当前 agent 的模型计算窗口，畸形工具调用的重复重试有上限，长思考模型减少无效轮次并统一流式超时。
+- **会话可跨项目浏览与恢复**：TUI 可跨工作目录浏览并恢复会话，支持预览与清理旧会话；`/agents` 列出一次性 task 子代理，header 带子代理标签。后台任务改为增量读取会话事件日志，历史读取加快并合并会话预览请求，会话启动提示在 SSE 消费中去重。
+- **压缩前的评审原文可展开**：recall 支持展开压缩前的评审原文；团队成员会话也可以压缩，成员压缩后保留的委派标为历史消息；压缩会披露被替代方案舍弃的用户需求。
+- **`/provider` 改为列表 → 详情两层**：统一回车 / Ctrl+E / Ctrl+D 操作，表单改为固定键义并去掉 `^o` / `^f` 与 Key 字段；无可用模型时详情页提供「添加并使用」，资格单一且可被显式切换撤销。
+- **WebUI 改为 VSCode 式源控制**：Git 面板改为 VSCode 式源控制，修正丢弃与提交范围、只读渲染与空仓库加载；新增会话目标状态条与实时计时，可只读查看团队成员对话；附件菜单在小屏不再被裁出视口，实时聊天可粘贴更大的图片。
+- **本地 API 鉴权加固与限流**：鉴权失败的本地 API 请求按次数限流，封锁期间已有效的 token 仍可用；token 校验改为常量时间比较；Windows 为凭据文件设置并校验用户专属 ACL；panic 遥测脱敏并限制 WebUI SSE 事件大小。新增 `X-Atomcode-Daemon-Authorization` 透传头，供会吃掉 `Authorization` 的中继转发凭据；取 token 的顺序为该头、`Authorization`、Cookie，直连路径行为不变。
+- **工作台可浏览与下载会话文件**：新增 `GET /workbench/tree` 递归返回会话工作区的目录树，跳过 `.git`、`node_modules`、`__pycache__` 等目录，不跟随符号链接，深度上限 32、条目预算 5000，超出处在 `truncated` 上标记；新增 `GET /workbench/download` 下载会话工作区内的普通文件，文件名用 ASCII 兜底名加 RFC 5987 编码双写，大小上限 100MB。新建会话可指定 `isolated_workspace`，在当前项目目录下开一个独立子目录作为工作区。
+- **长回合跑完可要一段回顾**：新增 `POST /chat/recap`，按会话与回合返回一段回顾文字（上限 240 字）。只认正常结束的回合，会话须是原生存储的主会话；超时有 30 秒上限，读日志上限 32MB。回合用的模型若已换掉或不再可用，直接不返回，不把记录发给别的模型。WebUI 在回合正常结束、且该回合耗时超过 2 分钟或你切走过时自动要这段回顾。
+- **流式回复原地追加与增量渲染**：TUI 流式回复不再逐 delta 复制全文，改为原地追加并增量渲染，切换视图时保留缓冲的 delta；复用未变化的渲染行，复用前先校验修订后的文本；生成速度排除突发帧，修正虚高数值。
+- **file-index 过滤提速**：过滤不再逐项小写转换、只保留前 30 名，改为有界选择与全序排序；非 ASCII 查询复用同一份小写缓冲，ASCII 查询跳过折叠，候选克隆与比较次数有界。
+- **终端交互细节修复**：`@` 提及菜单按 Esc 关闭后不再重弹，被拒 token 按偏移与文本识别；浏览态保留拒绝记录，编辑与光标跟踪正确；迟到回执不关闭强度选择器；回合中按 Esc 不再丢弃后台任务完成通知；短屏不再拿命令行数换面板的脚，窄屏先丢计时再丢徽标状态；审批面板在 legend 与状态栏之间留一行分隔，无应答路由的审批不再显示。清单没做完的停下收成一行暗色「— 停下 钟点 · 账」，不再用黄色警告句，也不再提示「发一句继续」——该不该继续交给输入框按实时待办状态提议；待办面板折叠时点标题、任一项或「+N 更多」都能展开，展开后只有表头能收起。弱网下自动恢复达到上限时，提示可以先执行 `/compact` 压缩历史——请求体变小后更容易一次通过。
+- **`/goal` 徽标显示运行时长**：运行中动态递增、暂停后冻结，只认自己的样本。状态栏会显示当前成员的 worktree 分支，额度恢复后立即复查底栏提醒。
+- **进程输出有界**：采集的进程输出有上限，前台输出截断时保留编码，TUI 实时缓存同样有上限。
+- **AI 行内补全（幽灵文本）**：编辑器扩展端与 daemon 端支持 AI 行内补全，过期的补全请求会被取消并保留原始插入文本。
+- **VS Code 聊天焦点恢复**：Alt+Tab 切回后恢复聊天输入框焦点并拦截孤立 Alt，收紧焦点恢复条件。
+- **会话与运行时一致性**：运行状态同步、历史读取阻塞减轻；重复工具检查减少、任务及时结束；后台审查保留单次执行限制，长会话请求与订阅追赶的整份复制峰值降低。会话开始时告诉模型自己有没有管理员权限——Windows 上两种状态都说明，并写明「拒绝访问」还可能来自占用、安装器或安全软件的锁，管理员也写不进，免得反复提权；Unix 只在 root 时加这一行。引用其他会话时若事件投影超出预算，提示改为可行动的出路：打开源会话复制相关片段，`/compact` 不会删除已提交的事件。
+- **官网与文档站改版**：双语更新日志展示并统一品牌样式，页脚字标改为「电子轨道」——一颗电子绕字运行、走到哪照亮哪；新增 SkillHub 技能元素库，可用 `/plugin install` 或 `atomcode plugin install` 安装；官网与文档站视觉改版，补齐图标与横屏、触屏、刘海适配，可点元素在触屏下不小于 44px，移动端安装体验改善并校准文档。
+
+### Issues
+
+本节收录 [v5.2.9 里程碑](https://atomgit.com/atomgit_atomcode/atomcode/milestones/1135577?iid=52)下的全部 issue，不区分状态与标签。此列表用于关联跟踪，不表示所有条目均已实现或完成发布验收。
+
+- [#1819 Feature Request: Engineering Opportunity Reports for Recoverable Technical Limitations](https://atomgit.com/atomgit_atomcode/atomcode/issues/1819)
+- [#1820 Code Review: `host.rs` (Host↔Runtime adapter)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1820)
+- [#1823 Team 模式下调用次数消耗过快：成员默认无轮次限制 + Hard 角色高消耗组合](https://atomgit.com/atomgit_atomcode/atomcode/issues/1823)
+- [#1824 历史记录 JSONL 无限增长导致用户磁盘爆炸：缺乏自动清理与容量控制机制](https://atomgit.com/atomgit_atomcode/atomcode/issues/1824)
+- [#1825 Team 模式缺少 Member 间直接通信机制：星型拓扑导致协调效率低](https://atomgit.com/atomgit_atomcode/atomcode/issues/1825)
+- [#1828 子代理取技能数据/执行命令必须经主模型中转 —— 建议支持工具调用直通子代理](https://atomgit.com/atomgit_atomcode/atomcode/issues/1828)
+- [#1833 [Bug] WebUI「＋」附件菜单：小屏幕 100% 缩放下弹层顶部被裁出视口，顶部菜单项不可点击且滚动无法找回](https://atomgit.com/atomgit_atomcode/atomcode/issues/1833)
+- [#1835 上下文压缩导致评审条目丢失，用户需手动恢复上下文](https://atomgit.com/atomgit_atomcode/atomcode/issues/1835)
+- [#1836 file-index: 过滤时只保留前 30 名，并去掉逐项 lowercase](https://atomgit.com/atomgit_atomcode/atomcode/issues/1836)
+- [#1837 auth: rate-limit failed local API authentication](https://atomgit.com/atomgit_atomcode/atomcode/issues/1837)
+- [#1840 [Bug] 默认权限下审批弹窗样式需优化：缺少默认选中项，底部 footer 与状态栏粘连](https://atomgit.com/atomgit_atomcode/atomcode/issues/1840)
+- [#1841 [Bug] TUI /goal 徽标缺运行时长：运行中动态递增、暂停后冻结（仅 /goal，/loop 不在范围）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1841)
+- [#1842 webui重复展示加载claude.md](https://atomgit.com/atomgit_atomcode/atomcode/issues/1842)
+- [#1843 [性能] TUI 流式回复逐 delta 复制全文，建议原地追加并增量渲染](https://atomgit.com/atomgit_atomcode/atomcode/issues/1843)
+
 ## v5.2.8 (2026-11-20)
 
 ### 概览

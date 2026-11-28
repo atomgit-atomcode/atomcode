@@ -34,6 +34,37 @@ const SAMPLE_TIMEOUT: Duration = Duration::from_secs(25);
 /// What the screen will carry at most. Two short sentences fit with room.
 pub(crate) const MAX_RECAP_CHARS: usize = 240;
 
+/// Read-only input for a recap of a committed conversation in a web session.
+/// Keep the task projection and the model fallback identical to the live recap.
+pub struct CommittedRecap {
+    transcript: Option<String>,
+    tasks: TaskState,
+}
+
+impl CommittedRecap {
+    pub fn new(
+        messages: &[Message],
+        manager: &atomcode_capabilities::session::SessionManager,
+        session_id: &str,
+    ) -> Self {
+        let tasks = crate::todo::recap_todos(messages, Some((manager, session_id)));
+        let transcript = if matches!(tasks, Ok(None)) {
+            recent_stable_transcript(messages)
+        } else {
+            None
+        };
+        Self { transcript, tasks }
+    }
+
+    pub fn needs_provider(&self) -> bool {
+        self.transcript.is_some()
+    }
+
+    pub async fn generate(self, provider: Option<Arc<dyn LlmProvider>>) -> Option<String> {
+        generate_from_transcript(provider, || self.transcript, self.tasks).await
+    }
+}
+
 const INSTRUCTIONS: &str = r#"Write a recap for a person coming back to this coding session after looking away.
 
 Say, in one or two short sentences: what is being worked on and where it stands now, then what happens next and who it is waiting on (for example: waiting for the user to confirm a plan, or the next step the assistant will take). Write in the same language the user writes in.
@@ -49,6 +80,14 @@ Output only the plain-text recap, never JSON or a conversation record: no headin
 pub(crate) async fn generate_recap(
     provider: Option<Arc<dyn LlmProvider>>,
     messages: &[Message],
+    tasks: TaskState,
+) -> Option<String> {
+    generate_from_transcript(provider, || recent_stable_transcript(messages), tasks).await
+}
+
+async fn generate_from_transcript(
+    provider: Option<Arc<dyn LlmProvider>>,
+    transcript: impl FnOnce() -> Option<String>,
     tasks: TaskState,
 ) -> Option<String> {
     match tasks {
@@ -85,7 +124,7 @@ pub(crate) async fn generate_recap(
         Ok(None) => {}
     }
     let provider = provider?;
-    let transcript = recent_stable_transcript(messages)?;
+    let transcript = transcript()?;
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
     let sample = sample_side_call(provider, prompt, SAMPLE_TIMEOUT, "recap").await?;
     if sample.cut_off {

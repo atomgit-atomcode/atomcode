@@ -4,7 +4,7 @@ use std::path::Path;
 
 use atomcode_kernel::message::Role;
 
-use super::SessionManager;
+use super::{SessionManager, SessionStoreError};
 
 pub const MAX_REFERENCES: usize = 4;
 const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
@@ -125,6 +125,14 @@ fn parsed(text: &str) -> Result<(Vec<SessionReference>, Vec<std::ops::Range<usiz
     Ok((result, ranges))
 }
 
+fn projection_too_large_message(id: &str, limit: usize) -> String {
+    format!(
+        "Cannot reference session {id}: its event projection exceeds the {limit}-byte limit. \
+         Open the source session and copy the relevant excerpt into your message. \
+         /compact does not remove committed events."
+    )
+}
+
 /// Read strict native aggregates, using the existing committed event projection.
 /// Keep only visible user/assistant text. JSON framing escapes source text so a
 /// source cannot forge another excerpt's metadata or closing delimiters.
@@ -146,7 +154,14 @@ pub fn resolve(root: &Path, references: &[SessionReference]) -> Result<String, S
         }
         let (meta, projected, clipped, captured_through_seq) = SessionManager::with_root(folder)
             .reference_projection(&reference.id, MAX_RETAINED_BYTES)
-            .map_err(|e| format!("Cannot reference session {}: {e}", reference.id))?;
+            .map_err(|e| match &e {
+                SessionStoreError::TooLarge {
+                    kind: super::events::REFERENCE_PROJECTION_KIND,
+                    limit,
+                    ..
+                } => projection_too_large_message(&reference.id, *limit),
+                _ => format!("Cannot reference session {}: {e}", reference.id),
+            })?;
         if meta.parent.is_some() || meta.origin == super::manager::SessionOrigin::Delegated {
             return Err("A delegated session cannot be referenced independently".into());
         }
@@ -331,6 +346,51 @@ pub fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_too_large_message_names_the_limit_and_how_to_continue() {
+        assert_eq!(
+            projection_too_large_message("fe2558bb", 8_388_608),
+            "Cannot reference session fe2558bb: its event projection exceeds the 8388608-byte limit. \
+             Open the source session and copy the relevant excerpt into your message. \
+             /compact does not remove committed events."
+        );
+    }
+
+    #[test]
+    fn resolve_reports_an_oversized_projection_with_the_way_back() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let (manager, reference) = seed(
+            root.path(),
+            vec![atomcode_kernel::message::Message::user("hello")],
+        );
+        // Enough retained events to exhaust the 8 MiB projection budget.
+        let path = manager.events_path(&reference.id).unwrap();
+        let seq = std::fs::read_to_string(&path).unwrap().lines().count() as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let text = "x".repeat(8000);
+        for n in 1..=1100 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"seq": seq + n, "at": 0, "event": {
+                    "kind": "user_message", "turn": 2, "text": text, "images": []
+                }})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let err = resolve(root.path(), std::slice::from_ref(&reference)).unwrap_err();
+        assert_eq!(
+            err,
+            projection_too_large_message(&reference.id, MAX_RETAINED_BYTES)
+        );
+    }
+
     #[test]
     fn references_are_explicit_stable_and_deduplicated() {
         let r = SessionReference {

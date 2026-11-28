@@ -28,8 +28,10 @@ fn _isolate_atomcode_home() {
 mod api_auth;
 mod api_codingplan;
 mod api_config;
+mod api_cue;
 mod api_provider;
 mod api_provider_accounts;
+mod api_recap;
 mod api_schedule;
 mod api_voice;
 pub mod approval_mode;
@@ -53,6 +55,7 @@ mod project_preferences;
 mod runtime_host;
 #[cfg(target_os = "android")]
 mod schedule_runner;
+mod team_view;
 mod transcript_view;
 pub mod turn_outcome;
 mod workbench;
@@ -170,6 +173,19 @@ use atomcode_telemetry::{
 };
 
 const CHAT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+fn chat_message_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/chat",
+            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/live/message",
+            post(live_api::live_message)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
+}
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -429,6 +445,12 @@ pub struct SessionsByWorkingDirQuery {
 /// Request to create a new session
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Isolation: only effective when `working_dir` is absent — a new UUID is
+    /// generated and used as both the session id and the directory name under
+    /// the current project dir (`{project_dir}/{uuid}`, created if missing).
+    /// When `working_dir` is given, it is used as-is and this flag has no effect.
+    #[serde(default)]
+    pub isolated_workspace: bool,
     /// Optional working directory (uses current project dir if not provided)
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
@@ -782,6 +804,10 @@ pub struct AppState {
     /// different localhost port would shadow the shared-jar cookie). See
     /// [`auth_token::webui_cookie_name`].
     pub webui_cookie_name: String,
+    /// CUE's provider cache, shared with the `/cue/complete` route. Keyed by a
+    /// fingerprint of the credentials and endpoint, so a changed model or key
+    /// rebuilds instead of reusing a stale provider.
+    pub cue_providers: api_cue::CueProviders,
 }
 
 /// Get default working directory
@@ -2080,29 +2106,41 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// cross-site sends) carry the protection.
 async fn serve_webui_index(
     State(state): State<AppState>,
-    uri: axum::http::Uri,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    let uri = req.uri().clone();
     if state.enforce_token {
+        let source = auth_token::request_source(&req);
+        let now = std::time::Instant::now();
         if let Some(query) = uri.query() {
             if let Some(token) = first_query_value(query, "token") {
-                if !token.is_empty() && state.webui_tokens.is_valid(&token) {
-                    let rest = strip_query_key(query, "token");
-                    let location = if rest.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("/?{rest}")
-                    };
-                    let cookie = format!(
-                        "{}={}; Path=/; HttpOnly; SameSite=Strict",
-                        state.webui_cookie_name, token
-                    );
-                    return axum::response::Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(header::LOCATION, location)
-                        .header(header::SET_COOKIE, cookie)
-                        .body(axum::body::Body::empty())
-                        .map(IntoResponse::into_response)
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                if !token.is_empty() {
+                    if state.webui_tokens.is_valid(&token) {
+                        state.webui_tokens.note_auth_success(&source);
+                        let rest = strip_query_key(query, "token");
+                        let location = if rest.is_empty() {
+                            "/".to_string()
+                        } else {
+                            format!("/?{rest}")
+                        };
+                        let cookie = format!(
+                            "{}={}; Path=/; HttpOnly; SameSite=Strict",
+                            state.webui_cookie_name, token
+                        );
+                        return axum::response::Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(header::LOCATION, location)
+                            .header(header::SET_COOKIE, cookie)
+                            .body(axum::body::Body::empty())
+                            .map(IntoResponse::into_response)
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    if let Some(wait) = state.webui_tokens.auth_retry_after(&source, now) {
+                        return auth_token::too_many_requests(wait);
+                    }
+                    if let Some(wait) = state.webui_tokens.note_auth_failure(&source, now) {
+                        return auth_token::too_many_requests(wait);
+                    }
                 }
             }
         }
@@ -3504,33 +3542,47 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // Determine working directory
-    let working_dir = match req.working_dir {
+    let (id, working_dir) = match req.working_dir {
         Some(dir) => {
             let mut proj = state.project.write().await;
             update_project_state(&mut proj, &dir);
-            dir
+            // An explicit working_dir is used as-is; isolated_workspace has no
+            // effect in this branch.
+            (uuid::Uuid::new_v4().to_string(), dir)
         }
         None => {
             // Use current project's working directory
             let project = state.project.read().await;
-            project.working_dir.clone()
+            if req.isolated_workspace {
+                // Isolated workspace without an explicit dir: the generated UUID
+                // is both the session id and the directory name under the
+                // current project dir ({project_dir}/{uuid}, created below if
+                // missing).
+                let id = uuid::Uuid::new_v4().to_string();
+                let dir = project.working_dir.join(&id);
+                (id, dir)
+            } else {
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    project.working_dir.clone(),
+                )
+            }
         }
     };
 
     // Ensure working directory exists
     if !working_dir.exists() {
-        // Create atomchat directory in user's home if default
-        let home = atomcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let atomchat_dir = home.join("atomchat");
-        if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
-            // Use atomchat directory as working dir
-        } else {
-            let msg = format!("Working directory does not exist: {:?}", working_dir);
-            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        if let Err(error) = std::fs::create_dir_all(&working_dir) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(format!(
+                    "Failed to create working directory {working_dir:?}: {error}"
+                )),
+            )
+                .into_response();
         }
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let manager = atomcode_capabilities::session::SessionManager::for_project(
         &working_dir,
         &atomcode_coding::config::product_dirs_from_env(),
@@ -4533,6 +4585,13 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Internal until the response polls it. Emits the existing warning wire shape.
+    #[serde(skip)]
+    StartupAdvisory {
+        project_bucket: String,
+        session_id: String,
+        message: String,
+    },
     /// Routine automatic retry diagnostics; clients keep these out of live status.
     #[serde(rename = "provider_retry")]
     ProviderRetry { message: String },
@@ -4559,6 +4618,8 @@ pub enum ChatEvent {
 
 #[derive(Debug, Serialize)]
 pub struct TurnStatsWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<u64>,
     duration_ms: u64,
     rounds: usize,
     tool_calls: usize,
@@ -4570,6 +4631,7 @@ pub struct TurnStatsWire {
 impl From<atomcode_coding::RuntimeTurnStats> for TurnStatsWire {
     fn from(stats: atomcode_coding::RuntimeTurnStats) -> Self {
         Self {
+            turn_id: None,
             duration_ms: stats.duration.as_millis().min(u128::from(u64::MAX)) as u64,
             rounds: stats.turn_count,
             tool_calls: stats.tool_call_count,
@@ -4798,6 +4860,12 @@ mod chat_event_type_tests {
             }),
             snapshot: None,
         };
+        assert!(projector
+            .project_runtime(
+                atomcode_coding::CodingRuntimeEvent::Request(request.clone()),
+                "session-without-responder",
+            )
+            .is_empty());
         let events = projector.project_runtime(
             atomcode_coding::CodingRuntimeEvent::Request(request),
             "session-1",
@@ -5382,12 +5450,14 @@ impl ChatRuntimeProjector {
                 else {
                     return Vec::new();
                 };
-                let approval_id = self.permission_routes.as_ref().and_then(|routes| {
+                let Some(approval_id) = self.permission_routes.as_ref().and_then(|routes| {
                     routes.approval_id(permission_session_id, &approval.call_id)
-                });
+                }) else {
+                    return Vec::new();
+                };
                 vec![ChatEvent::PermissionRequest {
                     session_id: permission_session_id.to_string(),
-                    approval_id,
+                    approval_id: Some(approval_id),
                     tool_name: approval.tool,
                     reason: approval
                         .reason
@@ -5441,6 +5511,7 @@ impl ChatRuntimeProjector {
                 message: format!("compact failed: {error}"),
             }],
             CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                turn_id,
                 reason,
                 snapshot,
                 stats,
@@ -5464,7 +5535,10 @@ impl ChatRuntimeProjector {
                     self.total_tokens = (usage.tokens.prompt + usage.tokens.completion) as usize;
                 }
                 self.tool_call_count = self.tool_call_count.max(stats.tool_call_count);
-                let stats = TurnStatsWire::from(stats);
+                let stats = TurnStatsWire {
+                    turn_id: Some(turn_id),
+                    ..stats.into()
+                };
 
                 let mut events = Vec::new();
                 if let Some(event) = self.finish() {
@@ -5839,7 +5913,7 @@ async fn chat_stream(
     let active_conns = state.active_connections.clone();
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+    let stream = chat_response_events(rx, live_api::chat_startup_advisories()).map(|event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
@@ -5861,6 +5935,28 @@ async fn chat_stream(
                 .text("ping"),
         )
         .into_response()
+}
+
+fn chat_response_events(
+    receiver: mpsc::UnboundedReceiver<ChatEvent>,
+    advisories: &live_api::StartupAdvisories,
+) -> impl futures::Stream<Item = ChatEvent> + '_ {
+    UnboundedReceiverStream::new(receiver).filter_map(move |event| {
+        futures::future::ready(match event {
+            ChatEvent::StartupAdvisory {
+                project_bucket,
+                session_id,
+                message,
+            } => {
+                if advisories.already_shown((project_bucket, session_id), &message) {
+                    None
+                } else {
+                    Some(ChatEvent::Warning { message })
+                }
+            }
+            event => Some(event),
+        })
+    })
 }
 
 /// Await the inner chat task, translating its outcome into SSE events and
@@ -6108,7 +6204,7 @@ async fn process_chat_request(
         interactive_permission && approval_mode_requires_responder(approval_mode);
     // Native runtime observations stay native until this daemon driver projects
     // them to the HTTP ChatEvent wire model.
-    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
 
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
@@ -6232,7 +6328,22 @@ async fn process_chat_request(
         summary_count: summary_baseline,
         ..Default::default()
     };
+    let project_bucket = NativeSessionManager::project_hash(
+        &working_dir,
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
     while let Some(event) = runtime_event_rx.recv().await {
+        let event = match event {
+            live_api::ChatTurnEvent::Runtime(event) => event,
+            live_api::ChatTurnEvent::StartupAdvisory(message) => {
+                let _ = event_tx.send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.clone(),
+                    session_id: perm_session_key.clone(),
+                    message,
+                });
+                continue;
+            }
+        };
         for chat_event in projector.project_runtime(event, &perm_session_key) {
             // Handing the request to the client is the moment the turn stops
             // progressing until somebody answers — that is what `/health` reports
@@ -6720,17 +6831,20 @@ async fn serve_http(
             },
         ));
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal(shutdown).await;
-            // The host, HTTP /shutdown, and OS signals converge on the same fact.
-            // Streaming bodies must see it too, otherwise graceful shutdown can
-            // wait forever for an old EventSource connection.
-            if let Some(owner) = owner {
-                owner.send_replace(true);
-            }
-        })
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal(shutdown).await;
+        // The host, HTTP /shutdown, and OS signals converge on the same fact.
+        // Streaming bodies must see it too, otherwise graceful shutdown can
+        // wait forever for an old EventSource connection.
+        if let Some(owner) = owner {
+            owner.send_replace(true);
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -6852,10 +6966,8 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
         let bt = std::backtrace::Backtrace::force_capture().to_string();
         let scrubbed_loc =
             atomcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
-        let scrubbed_msg = atomcode_telemetry::scrub::truncate_head(
-            &atomcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
-            atomcode_telemetry::scrub::HEAD_MAX,
-        );
+        let scrubbed_msg =
+            atomcode_telemetry::scrub::message_head(&msg, home.as_deref(), cwd.as_deref());
         let frames =
             atomcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
         telemetry.track(Event::Panic {
@@ -8461,6 +8573,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
         // instances get distinct cookie names.
         webui_cookie_name: auth_token::webui_cookie_name(port),
+        cue_providers: api_cue::CueProviders::default(),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。页面必须可加载，
@@ -8484,6 +8597,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             state.project.clone(),
             api_schedule::system_service(),
         ))
+        // CUE — AI inline completion. The IDE extension asks here; the daemon
+        // owns the credential, so the extension never holds a key.
+        .merge(api_cue::routes())
         // Shutdown endpoint (R7.1)
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
@@ -8517,6 +8633,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/projects/:hash/sessions/:id/todo-sources",
             get(get_todo_sources),
         )
+        .route("/projects/:hash/sessions/:id/team", get(team_view::list))
+        .route(
+            "/projects/:hash/sessions/:id/team/:member",
+            get(team_view::detail),
+        )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
         // Model API
@@ -8526,11 +8647,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(|| async { Json(atomcode_capabilities::model_cards::catalog()) }),
         )
         // Chat API
-        .route(
-            "/chat",
-            post(chat_stream).layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
-        )
+        .merge(chat_message_routes())
         .route("/chat/stop", post(stop_chat))
+        .route(
+            "/chat/recap",
+            post(api_recap::recap).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
         .route("/chat/user-input", post(chat_user_input))
@@ -8543,7 +8665,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/tunnel/start", post(start_webui_relay))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
-        .route("/live/message", post(live_api::live_message))
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/release", post(live_api::live_release))
         .route("/live/permission", post(live_api::live_permission))
@@ -8558,6 +8679,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live/goal/start", post(live_api::live_goal_start))
         .route("/live/goal/arm", post(live_api::live_goal_arm))
         .route("/live/goal/stop", post(live_api::live_goal_stop))
+        .route("/live/goal/action", post(live_api::live_goal_action))
         .route("/live/compact", post(live_api::live_compact))
         .route("/live/command", post(live_api::live_command))
         .route("/live/mcp/trust", post(live_api::live_mcp_trust))
@@ -8879,6 +9001,16 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     if let Some(ref token) = token_file_token {
         match daemon_token_file::write(daemon_token_port, std::process::id(), token) {
             Ok(p) => tracing::info!("daemon token file written: {}", p.display()),
+            #[cfg(windows)]
+            Err(e) => {
+                let path = daemon_token_file::token_file_path(daemon_token_port);
+                telemetry.shutdown(Duration::from_millis(500)).await;
+                return Err(anyhow::Error::new(e).context(format!(
+                    "Failed to publish the private daemon token at {}. IDE clients require this file. Check the directory permissions and use a filesystem that supports Windows ACLs",
+                    path.display()
+                )));
+            }
+            #[cfg(not(windows))]
             Err(e) => tracing::warn!("failed to write daemon token file: {e}"),
         }
     }
@@ -10164,6 +10296,42 @@ mod tests {
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn live_message_accepts_large_image_bodies_up_to_the_chat_limit() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let app = chat_message_routes()
+            .layer(axum::Extension(SessionMode::Webui))
+            .with_state(chat_test_state(&home));
+        // Omit the required message so an admitted body fails at JSON validation,
+        // without creating a session or calling a model.
+        let prefix = r#"{"images":[{"media_type":"image/png","data":""#;
+        let suffix = r#""}]}"#;
+        for (size, expected) in [
+            (2_365_600, StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                CHAT_REQUEST_BODY_LIMIT_BYTES,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                CHAT_REQUEST_BODY_LIMIT_BYTES + 1,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut body = Vec::with_capacity(size);
+            body.extend_from_slice(prefix.as_bytes());
+            body.resize(size - suffix.len(), b'A');
+            body.extend_from_slice(suffix.as_bytes());
+            let request = axum::http::Request::post("/live/message")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "request size: {size}");
+        }
+    }
+
     fn chat_test_state(home: &ScopedChatHome) -> AppState {
         let working_dir = home._dir.path().to_path_buf();
         let (shutdown_tx, _) = watch::channel(false);
@@ -10192,7 +10360,128 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             bind_port: 13456,
             webui_cookie_name: auth_token::webui_cookie_name(13456),
+            cue_providers: api_cue::CueProviders::default(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn webui_index_handoff_shares_the_auth_failure_budget() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/", get(serve_webui_index))
+            .with_state(state);
+
+        let send = |token: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/?token={token}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
+            }
+        };
+
+        // The valid handoff sets the cookie and clears the failure budget.
+        assert_eq!(send("good-token").await.0, StatusCode::FOUND);
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_ne!(send("wrong-token").await.0, StatusCode::TOO_MANY_REQUESTS);
+        }
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send("wrong-token").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked handoffs must carry Retry-After, got {retry_after:?}"
+        );
+        assert_eq!(
+            send("good-token").await.0,
+            StatusCode::FOUND,
+            "the recovery handoff must still work during a block"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn require_webui_token_returns_429_after_repeated_failures() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut state = chat_test_state(&home);
+        state.enforce_token = true;
+        state.webui_tokens.insert("good-token".into());
+        let app = Router::new()
+            .route("/ping", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_token::require_webui_token,
+            ))
+            .with_state(state);
+
+        let send = |token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = axum::http::Request::builder().method("GET").uri("/ping");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                let response = app
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let retry_after = response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                (response.status(), retry_after)
+            }
+        };
+
+        // Missing credentials are not guesses and must not consume the budget.
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT + 2 {
+            assert_eq!(send(None).await.0, StatusCode::UNAUTHORIZED);
+        }
+
+        for _ in 0..auth_token::AUTH_FAILURE_LIMIT - 1 {
+            assert_eq!(send(Some("wrong-token")).await.0, StatusCode::UNAUTHORIZED);
+        }
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "Retry-After must be seconds in 1..=30, got {retry_after:?}"
+        );
+        let (status, retry_after) = send(Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            matches!(retry_after, Some(1..=30)),
+            "blocked retries must carry Retry-After, got {retry_after:?}"
+        );
+        assert_eq!(
+            send(Some("good-token")).await.0,
+            StatusCode::OK,
+            "a valid token must still work during a block; the block only stops guesses"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -10870,6 +11159,20 @@ mod tests {
         tokio::sync::oneshot::Receiver<String>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_openai_sse_with_finish(response_text, None).await
+    }
+
+    /// The same mock, but able to say the response was CUT OFF
+    /// (`finish_reason: "length"`) — which is how a model reports that it ran
+    /// out of room, and what the daemon must refuse to insert.
+    async fn spawn_openai_sse_with_finish(
+        response_text: &str,
+        finish_reason: Option<&str>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -10880,7 +11183,7 @@ mod tests {
         let payload = serde_json::json!({
             "choices": [{
                 "delta": { "content": response_text },
-                "finish_reason": null
+                "finish_reason": finish_reason,
             }]
         });
         let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
@@ -11789,6 +12092,182 @@ mod tests {
             json,
             r#"{"type":"warning","message":"conversation compacted"}"#
         );
+    }
+
+    // 回归 #1842：/chat 每条输入都重建一个临时 CodingRuntime，每个 runtime 都
+    // 重新推导同样的启动提示（如 claude.md 被 AGENTS.md 遮蔽），并作为首批
+    // ControllerWarning 重发 —— WebUI 里每发一句话就重复展示一次「claude.md …
+    // not loaded」。修复后：同一会话内已展示过的启动提示只在首个回合出现，
+    // 指令文件状态真的变化产生的新提示仍然展示。
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_shows_each_startup_advisory_once_per_session_until_it_changes() {
+        async fn run_turn(
+            home: &ScopedChatHome,
+            dir: &std::path::Path,
+            session_id: &str,
+            request_id: &str,
+            message: &str,
+        ) -> mpsc::UnboundedReceiver<ChatEvent> {
+            let (main_url, _main_request, main_task) = spawn_openai_sse("turn done").await;
+            let mut config = Config::with_default_provider("main");
+            config
+                .providers
+                .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+            config
+                .save(&Config::default_path())
+                .expect("save chat test config");
+
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let active_chats = ActiveChatRegistry::default();
+            let admission = active_chats.admit(None, Some(request_id)).await.unwrap();
+            let operation_id = admission.operation_id.clone();
+            process_chat_request(
+                ChatRequest {
+                    reasoning_effort: None,
+                    message: message.into(),
+                    working_dir: Some(dir.to_path_buf()),
+                    provider: Some("main".into()),
+                    session_id: Some(session_id.into()),
+                    request_id: Some(request_id.into()),
+                    images: Vec::new(),
+                    approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                },
+                event_tx,
+                admission.cancellation,
+                operation_id.clone(),
+                active_chats.clone(),
+                chat_test_telemetry(home),
+                permission_bridge::PermissionResponders::new(),
+                permission_bridge::UserInputResponders::new(),
+                false,
+                false,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .expect("chat turn succeeds");
+            active_chats.complete(&operation_id).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), main_task)
+                .await
+                .expect("provider task finishes");
+
+            event_rx
+        }
+
+        async fn warnings(
+            receiver: mpsc::UnboundedReceiver<ChatEvent>,
+            advisories: &live_api::StartupAdvisories,
+        ) -> Vec<String> {
+            chat_response_events(receiver, advisories)
+                .filter_map(|event| {
+                    futures::future::ready(match event {
+                        ChatEvent::Warning { message } => Some(message),
+                        _ => None,
+                    })
+                })
+                .collect()
+                .await
+        }
+
+        let home = ScopedChatHome::new();
+        let dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "claude rules").unwrap();
+        let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        // Seed a native session so every turn continues the SAME session id.
+        {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::for_project(
+                &dir,
+                &atomcode_coding::config::product_dirs_from_env(),
+            );
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("seed"),
+            ]);
+            let mut meta = SessionMeta::new(id, dir.to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let advisories = live_api::StartupAdvisories::default();
+        // An unpolled response can be dropped before its queued warning reaches SSE.
+        drop(run_turn(&home, &dir, id, "chat-advisory-abandoned", "abandoned").await);
+
+        // The first consumed response still shows the startup advisory.
+        let first = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-1", "one").await,
+            &advisories,
+        )
+        .await;
+        assert_eq!(
+            first.iter().filter(|w| w.contains("CLAUDE.md")).count(),
+            1,
+            "first turn must show the claude.md advisory once: {first:?}"
+        );
+
+        // 第 2 条输入：同一会话，同样的提示不再重复。
+        let second = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-2", "two").await,
+            &advisories,
+        )
+        .await;
+        assert!(
+            !second.iter().any(|w| w.contains("CLAUDE.md")),
+            "second turn must not repeat the claude.md advisory: {second:?}"
+        );
+
+        // 指令文件状态真的变化：AGENTS.md 变空产生新提示，必须再次展示。
+        std::fs::write(dir.join("AGENTS.md"), "").unwrap();
+        let third = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-3", "three").await,
+            &advisories,
+        )
+        .await;
+        assert!(
+            third
+                .iter()
+                .any(|w| w.contains("AGENTS.md") && w.contains("empty")),
+            "a changed instruction state must surface its new advisory: {third:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_startup_advisories_are_scoped_to_the_project_and_ignore_live_warnings() {
+        let advisories = live_api::StartupAdvisories::default();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for project_bucket in ["project-a", "project-a", "project-b"] {
+            sender
+                .send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.into(),
+                    session_id: "same-session-id".into(),
+                    message: "same warning".into(),
+                })
+                .unwrap();
+        }
+        sender
+            .send(ChatEvent::Warning {
+                message: "same warning".into(),
+            })
+            .unwrap();
+        drop(sender);
+
+        let events: Vec<_> = chat_response_events(receiver, &advisories).collect().await;
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| {
+            matches!(event, ChatEvent::Warning { message } if message == "same warning")
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12761,6 +13240,328 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
             Some("172.16.2.14".into())
         );
         assert_eq!(extract_ip_eq("no ip here"), None);
+    }
+
+    /// The whole CUE path, end to end: an IDE asks the daemon, the daemon asks
+    /// the model, and the model's answer comes back as the text to insert.
+    ///
+    /// The provider is a mock SSE server, so this asserts the CHAIN — the
+    /// route, the config boundary, the provider factory, the prompt, and the
+    /// extraction — without a network or a credential.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_completes_a_cursor_position_from_the_model() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let (url, request, task) = spawn_openai_sse("+counter").await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let body = serde_json::json!({
+            "file_path": "src/main.ts",
+            "language_id": "typescript",
+            "prefix": "function main() {\n    let x = +",
+            "suffix": ";\n}",
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // The second plus is part of the insertion, even though the prefix
+        // ends with the first one.
+        assert_eq!(
+            payload["completion"].as_str(),
+            Some("+counter"),
+            "the insertion must be preserved: {payload}"
+        );
+        assert_eq!(payload["model"].as_str(), Some("test-model"));
+
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .expect("the provider must be called")
+            .expect("provider request captured");
+        assert!(
+            sent.contains("let x = +"),
+            "the request must carry the code before the cursor: {sent}"
+        );
+        assert!(
+            sent.contains(";\\n}"),
+            "the request must carry the code after the cursor: {sent}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_disconnect_drops_the_upstream_request() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::Notify;
+
+        struct NotifyOnDrop(Arc<Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let home = ScopedChatHome::new();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let (started, dropped) = (started.clone(), dropped.clone());
+                move |Json(_): Json<serde_json::Value>| {
+                    let (started, dropped) = (started.clone(), dropped.clone());
+                    async move {
+                        let _on_drop = NotifyOnDrop(dropped);
+                        started.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let mut config = Config::with_default_provider("p");
+        config.providers.insert(
+            "p".into(),
+            test_provider("test-model", format!("http://{upstream_addr}/v1")),
+        );
+        config.cue.enabled = true;
+        config.cue.timeout_secs = 120;
+        config.save(&Config::default_path()).unwrap();
+
+        let app = api_cue::routes().with_state(chat_test_state(&home));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = r#"{"prefix":"const n = +"}"#;
+        let request = format!(
+            "POST /cue/complete HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .expect("daemon dispatched the provider request");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(3), dropped.notified())
+            .await
+            .expect("disconnect cancelled the provider request before the CUE deadline");
+
+        task.abort();
+        upstream_task.abort();
+    }
+
+    /// CUE is opt-in: a disabled configuration answers "no suggestion" rather
+    /// than an error, and never calls the model.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_says_nothing_when_it_is_disabled() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut config = Config::with_default_provider("p");
+        config.cue.enabled = false;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "let x = ", "suffix": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "a disabled CUE offers nothing: {payload}"
+        );
+    }
+
+    /// A request that carries more text than the daemon accepts is refused
+    /// before it reaches the model — a whole repository must not be billed as
+    /// one completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_an_oversized_request() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let mut config = Config::with_default_provider("p");
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "prefix": "a".repeat(100_000),
+                            "suffix": "",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An answer the model reports as CUT OFF is a fragment, not a
+    /// completion. Inserting half of it would put broken code in the user's
+    /// file, so the daemon offers nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_a_cut_off_answer() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let (url, _request, task) =
+            spawn_openai_sse_with_finish("let x = println!();", Some("length")).await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "fn main() {", "suffix": "}"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "a cut-off answer must not be inserted: {payload}"
+        );
+        task.abort();
+    }
+
+    /// An answer longer than a completion is a model that lost the thread,
+    /// not a completion. Truncating it would insert half a statement, so it
+    /// is refused instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cue_refuses_an_answer_longer_than_a_completion() {
+        use tower::ServiceExt;
+
+        let home = ScopedChatHome::new();
+        let huge = "x".repeat(9 * 1024);
+        let (url, _request, task) = spawn_openai_sse(&huge).await;
+
+        let mut config = Config::with_default_provider("p");
+        config
+            .providers
+            .insert("p".into(), test_provider("test-model", url));
+        config.cue.enabled = true;
+        config
+            .save(&Config::default_path())
+            .expect("save cue test config");
+
+        let state = chat_test_state(&home);
+        let app = api_cue::routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/cue/complete")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"prefix": "fn main() {", "suffix": "}"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            payload["completion"].is_null(),
+            "an over-long answer must not be inserted: {payload}"
+        );
+        task.abort();
     }
 }
 

@@ -1,7 +1,4 @@
-// `Write::write_all` and `PathBuf` only appear inside `#[cfg(unix)]`
-// blocks below (the atomic-rename + chmod-600 path uses them; the
-// Windows fallback at line 49 just calls `std::fs::write`). Gate the
-// imports so a Windows build doesn't fire unused_imports.
+// The Unix and Windows writers both flush a temporary file before replacing the destination.
 #[cfg(any(unix, target_os = "windows"))]
 use std::io::Write;
 use std::path::Path;
@@ -68,9 +65,10 @@ pub fn write_auth_file_secure(path: &Path, content: &str) -> Result<()> {
         let parent = path
             .parent()
             .context("Invalid auth file path — please use /login again")?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-            format!("Failed to create temp auth file beside {}", path.display())
-        })?;
+        let mut temp =
+            atomcode_config::windows_private_file::tempfile_in(parent).with_context(|| {
+                format!("Failed to create temp auth file beside {}", path.display())
+            })?;
         temp.write_all(content.as_bytes())
             .context("Failed to write auth content")?;
         temp.as_file()

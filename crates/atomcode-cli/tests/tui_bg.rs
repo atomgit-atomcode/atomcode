@@ -153,7 +153,11 @@ impl LlmProvider for Model {
         // person's "审查下代码改动" makes it.
         if !tools.is_empty()
             && last.is_some_and(|m| {
-                m.role == Role::User && matches!(m.text.as_str(), "review it" | "review it slow")
+                m.role == Role::User
+                    && matches!(
+                        m.text.as_str(),
+                        "review it" | "review it slow" | "review it before foreground"
+                    )
             })
         {
             return Ok(Box::pin(futures::stream::iter(vec![
@@ -164,6 +168,30 @@ impl LlmProvider for Model {
                 }),
                 StreamEvent::Done { truncated: false },
             ])));
+        }
+        if !tools.is_empty()
+            && last.is_some_and(|m| {
+                m.role == Role::User
+                    && m.text.starts_with(
+                        "=== ORIGINATING REQUEST (CONTEXT ONLY) === review it before foreground\n",
+                    )
+            })
+        {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let mut gate = self.gate.clone();
+            let _ = gate.wait_for(|open| *open).await;
+            return Ok(Box::pin(futures::stream::iter(
+                ["assigned-review", "repeat-review"]
+                    .map(|id| {
+                        StreamEvent::ToolCall(ToolCall {
+                            id: id.into(),
+                            name: "code_review".into(),
+                            arguments: "{}".into(),
+                        })
+                    })
+                    .into_iter()
+                    .chain([StreamEvent::Done { truncated: false }]),
+            )));
         }
         let text = if slow {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -1128,6 +1156,51 @@ async fn failed_running_resume_leaves_the_foreground_and_slots_unchanged() {
     rig.quit().await;
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn global_resume_rejects_a_duplicate_even_if_one_session_is_retained() {
+    use atomcode_capabilities::session::SessionManager;
+    let rig = Rig::new().await;
+    let retained = rig.client.root();
+    rig.term.type_line("slow task");
+    rig.until("turn started", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until("foreground changed", |rig| rig.client.root() != retained)
+        .await;
+    rig.release();
+    rig.until_background("retained turn finished", |slots| {
+        slots
+            .iter()
+            .any(|s| s.session == retained && s.state == BackgroundState::Done)
+    })
+    .await;
+    let dirs = atomcode_coding::config::product_dirs_from_env();
+    let original = SessionManager::for_project(rig.project.path(), &dirs);
+    let other = tempfile::tempdir().unwrap();
+    let duplicate = SessionManager::for_project(other.path(), &dirs);
+    std::fs::create_dir_all(duplicate.root()).unwrap();
+    for ext in ["events", "index"] {
+        let name = format!("{retained}.{ext}");
+        std::fs::copy(original.root().join(&name), duplicate.root().join(&name)).unwrap();
+    }
+    let live = rig.client.root();
+    let result = rig
+        .control()
+        .call(HostCommand::ResumeAcrossProjects {
+            session: live.clone(),
+            target: retained,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(HostError::Failed { message }) if message.contains("multiple project stores"))
+    );
+    assert_eq!(rig.client.root(), live);
+    rig.quit().await;
+}
+
 /// Even a stale/manual target must be rejected before a busy foreign session
 /// is forked. Its recorded working directory deliberately matches this project:
 /// storage identity, rather than that display field, governs the lease.
@@ -1628,7 +1701,7 @@ async fn listed(rig: &Rig) -> Vec<String> {
         .call(HostCommand::ListSessions { working_dir: None })
         .await
     {
-        Ok(HostReply::Sessions { sessions }) => sessions.into_iter().map(|s| s.id).collect(),
+        Ok(HostReply::Sessions { sessions, .. }) => sessions.into_iter().map(|s| s.id).collect(),
         other => panic!("the session list: {other:?}"),
     }
 }
@@ -1903,9 +1976,7 @@ model = "scripted"
 
 /// A stored conversation belonging to another project: its own working
 /// directory and its own storage bucket, leased while it is written and
-/// released before the caller navigates to it. Shared WebUI/App navigation is
-/// the only path allowed to prepare such a target — an ordinary `/resume` stays
-/// project-scoped (`2026-10-27-resume-project-scope.md`).
+/// released before the caller navigates to it.
 async fn a_foreign_project_session() -> (tempfile::TempDir, &'static str) {
     use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
     use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
@@ -1950,6 +2021,67 @@ async fn a_foreign_project_session() -> (tempfile::TempDir, &'static str) {
         .unwrap();
     drop(lease);
     (project, target)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_tab_can_browse_an_empty_global_catalog_and_escape() {
+    use atomcode_i18n::screen::{t, Msg};
+    let rig = Rig::new().await;
+    let original = rig.client.root();
+    rig.term.type_line("/resume");
+    rig.until_screen(&t(Msg::ResumeNoOthers)).await;
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(&t(Msg::ResumeNoneAll)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.term.press(KeyPress::plain(Key::Esc));
+    rig.until_screen_lacks(&t(Msg::ResumeNoneAll)).await;
+    assert_eq!(rig.client.root(), original);
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[serial_test::serial(atomcode_home)]
+async fn resume_tab_browses_other_projects_before_enter_switches_the_runtime() {
+    let rig = Rig::new().await;
+    let (project, target) = a_foreign_project_session().await;
+    let live = rig.client.root();
+    // Its name is the untouched placeholder, so the picker row reads its first
+    // prompt, not `session-<id>`.
+    let row = "FOREIGN PROJECT HISTORY";
+    rig.term.type_line("/resume");
+    rig.until_screen("Tab").await;
+    assert!(!rig.term.text().contains(row));
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(row).await;
+    assert_eq!(rig.client.root(), live);
+
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen_lacks(row).await;
+    rig.term.press(KeyPress::plain(Key::Tab));
+    rig.until_screen(row).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the global selection is foreground", |rig| {
+        rig.client.root() == target
+    })
+    .await;
+    rig.until_screen("FOREIGN PROJECT HISTORY").await;
+    let HostReply::Context { working_dir, .. } = rig
+        .control()
+        .call(HostCommand::Context {
+            session: target.into(),
+            prompt: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected context")
+    };
+    assert_eq!(
+        std::fs::canonicalize(working_dir).unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+    rig.quit().await;
 }
 
 /// Navigating back is the same navigation in reverse: the destination project
@@ -2091,6 +2223,51 @@ async fn an_unopened_running_review_is_hidden_but_its_disk_record_remains_recove
         &review
     ));
     until_listed(&rig, &review, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn opening_a_review_keeps_its_assignment_folded_and_runs_it_once() {
+    use atomcode_kernel::session::SessionEvent;
+
+    let rig = Rig::new().await;
+    changed_repo(rig.project.path());
+    let parent = rig.client.root();
+    rig.term.type_line("review it before foreground");
+    rig.until("assignment reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) != 0
+    })
+    .await;
+    let assignment = rig.background().await[0].session.clone();
+    rig.term.type_line("/bg 1");
+    rig.until("review in foreground", |rig| {
+        rig.client.root() == assignment
+    })
+    .await;
+    rig.until_screen("代码审查 · 工作区改动").await;
+    assert!(!rig.term.text().contains("ASSIGNED READ-ONLY REVIEW"));
+
+    rig.release();
+    rig.until_screen("no issues found").await;
+    rig.until("review turn finished", |rig| {
+        rig.client
+            .events()
+            .iter()
+            .any(|entry| matches!(entry.event, SessionEvent::TurnEnd { .. }))
+    })
+    .await;
+    let events = rig.client.events();
+    assert!(events.iter().any(|entry| matches!(
+        &entry.event,
+        SessionEvent::ToolResultLogged { call_id, is_error: true, content, .. }
+            if call_id == "repeat-review" && content.contains("runs code_review once")
+    )));
+    assert!(rig
+        .background()
+        .await
+        .iter()
+        .all(|slot| slot.session == parent));
+    rig.quit().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2435,11 +2612,18 @@ async fn taking_the_review_row_leaves_it_on_the_line() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(atomcode_home)]
 async fn a_finished_background_run_delivers_its_answer_home() {
+    use atomcode_capabilities::session::manager::SessionOrigin;
+
     let rig = Rig::new().await;
     rig.term.type_line("/background quiet job");
     rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
     let list = rig.background().await;
     assert_eq!(list.len(), 1, "{list:#?}");
+    let task = &list[0].session;
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
 
     // It arrives folded to its one line — the report (`answer 1`) waits behind
     // a click, because the conversation that started it answers right under it
@@ -2452,6 +2636,11 @@ async fn a_finished_background_run_delivers_its_answer_home() {
         rig.term.text().contains("answer 2")
     })
     .await;
+    assert_eq!(
+        store.read_meta(task).unwrap().origin,
+        SessionOrigin::Delegated,
+        "the committed report settled before the home answered it"
+    );
     assert!(
         !rig.term.text().contains("answer 1"),
         "the report is folded, not printed a second time:\n{}",

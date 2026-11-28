@@ -13,7 +13,59 @@
 //! 另一个窗口里敲没有区别。上一代前端也是这样。真正的区别是输出会进模型的
 //! 上下文——所以这件事要说出来，不能让人以为自己只是在本地看一眼。
 
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
+
+const MAX_VISIBLE_BYTES: usize = 256 * 1024;
+const MAX_VISIBLE_LINES: usize = 2048;
+
+/// The recent lines shown for a local shell command. The separate byte and
+/// line limits also bound streams of very long lines or empty lines.
+#[derive(Default)]
+pub(crate) struct ShellLines {
+    lines: VecDeque<String>,
+    bytes: usize,
+    omitted: usize,
+}
+
+impl ShellLines {
+    pub(crate) fn push(&mut self, line: String) {
+        let line = if line.len() > MAX_VISIBLE_BYTES {
+            let marker = " [atomcode: line truncated]";
+            let end = line.floor_char_boundary(MAX_VISIBLE_BYTES - marker.len());
+            let mut preview = line.get(..end).expect("valid UTF-8 boundary").to_owned();
+            preview.push_str(marker);
+            preview
+        } else {
+            line
+        };
+        while self.lines.len() == MAX_VISIBLE_LINES || self.bytes + line.len() > MAX_VISIBLE_BYTES {
+            let old = self
+                .lines
+                .pop_front()
+                .expect("incoming line fits the byte limit");
+            self.bytes -= old.len();
+            self.omitted = self.omitted.saturating_add(1);
+        }
+        self.bytes += line.len();
+        self.lines.push_back(line);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        let mut visible = Vec::with_capacity(self.lines.len() + usize::from(self.omitted > 0));
+        if self.omitted > 0 {
+            visible.push(format!(
+                "[atomcode: {} earlier shell lines omitted]",
+                self.omitted
+            ));
+        }
+        visible.extend(self.lines.iter().cloned());
+        visible
+    }
+}
 
 /// 一条跑完了的本地命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +216,25 @@ fn scrub(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_output_bounds_both_tiny_and_large_live_lines() {
+        let mut visible = ShellLines::default();
+        for _ in 0..MAX_VISIBLE_LINES + 1 {
+            visible.push(String::new());
+        }
+        assert_eq!(visible.lines.len(), MAX_VISIBLE_LINES);
+        assert_eq!(visible.omitted, 1);
+        visible.push("中".repeat(MAX_VISIBLE_BYTES / 3 + 1));
+        visible.push("latest".into());
+        let lines = visible.snapshot();
+        assert!(lines
+            .first()
+            .unwrap()
+            .contains("earlier shell lines omitted"));
+        assert_eq!(lines.last().unwrap(), "latest");
+        assert!(visible.bytes <= MAX_VISIBLE_BYTES);
+    }
 
     /// `!` 是行首的手势，不是句子里的标点。
     ///

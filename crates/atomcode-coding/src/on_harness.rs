@@ -2386,6 +2386,60 @@ fn compose_hosted(
 // unverified edit and the row list stopped at two. Nothing else in the scenario
 // list edits a file and then walks away, so it was invisible until asked.
 
+fn can_run_verification(ctx: &Context) -> bool {
+    ctx.service::<atomcode_harness::seams::ToolsSvc>()
+        .is_some_and(|tools| {
+            tools.get("bash").is_some()
+                || (tools.get("bash_start").is_some() && tools.get("bash_poll").is_some())
+        })
+}
+
+fn member_verification_note(
+    member: &atomcode_harness::agent::Agent,
+    lead: &atomcode_harness::agent::Agent,
+    workspace: &Path,
+) -> Option<atomcode_harness::seams::MemberReportNote> {
+    if can_run_verification(member.ctx())
+        || member
+            .ctx()
+            .service::<crate::quality::QualitySvc>()
+            .is_some_and(|q| q.enabled())
+    {
+        return None;
+    }
+    let log = member.session();
+    let (_, start) = log.current_turn_start()?;
+    let messages = atomcode_kernel::session::derive_messages(&log.since(start.saturating_sub(1)));
+    let cwd = member.cwd().map(|p| p.as_path()).unwrap_or(workspace);
+    let edit = crate::discipline::unverified_edit(&messages, cwd)?;
+    if crate::execution_policy::execution_policy_for_messages(&lead.session().derive_messages())
+        .skips_verification()
+    {
+        return None;
+    }
+    let mut text = String::from("Verification pending for this member's code changes");
+    if let Some(path) = edit.path {
+        text.push_str(&format!(" (latest edit: {path})"));
+    }
+    if let Some(tree) = log
+        .header()
+        .member
+        .as_ref()
+        .and_then(|m| m.worktree.as_ref())
+    {
+        text.push_str(&format!(" in checkout {tree}"));
+    }
+    text.push_str(if can_run_verification(lead.ctx()) {
+        ". Run the relevant check on the changed code before reporting it verified."
+    } else {
+        ". Report the outstanding check; this session cannot run it."
+    });
+    Some(atomcode_harness::seams::MemberReportNote {
+        key: edit.edit_id,
+        text,
+    })
+}
+
 /// Asks the model to check code it edited and did not verify.
 struct VerifyCadence {
     ctx: Context,
@@ -2414,6 +2468,16 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Veri
         // on by itself. The cadence is about the round where the model says it
         // is done.
         if !response.tool_calls.is_empty() || response.truncated {
+            return Ok(response);
+        }
+        // Use the member's live catalog. A text-only closing request hides all
+        // tools for that round, even when the agent itself still owns a shell.
+        let realm = atomcode_harness::agent::scoped(&self.ctx);
+        if realm
+            .service::<atomcode_harness::seams::SessionSvc>()
+            .is_some_and(|s| s.header().member.is_some())
+            && !can_run_verification(&realm)
+        {
             return Ok(response);
         }
         // A user who said "don't run tests" is not asking to be nudged into
@@ -2479,6 +2543,9 @@ impl Plugin for VerifyCadencePlugin {
     fn name(&self) -> &'static str {
         "verify-cadence"
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["member-report-note"]
+    }
     fn description(&self) -> &'static str {
         "ask the model to check code it edited and walked away from"
     }
@@ -2491,6 +2558,18 @@ impl Plugin for VerifyCadencePlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
+        let workspace = std::path::PathBuf::from(&row.working_dir);
+        let _ = ctx
+            .provide::<atomcode_harness::seams::MemberReportNoteSvc>(Arc::new(
+                move |member, lead| {
+                    if row.force {
+                        member_verification_note(member, lead, &workspace)
+                    } else {
+                        None
+                    }
+                },
+            ))
+            .map_err(|e| e.to_string())?;
         if !row.force {
             return Ok(());
         }

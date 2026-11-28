@@ -499,11 +499,17 @@ impl Default for SubAgentConfig {
 pub struct TeamConfig {
     /// Maximum members retained by one lead, including idle members. Default 6.
     pub max_members: usize,
+    /// Per-role provider calls per member turn, plus at most one text-only closing call.
+    /// An omitted role or zero has no request limit of its own.
+    pub role_request_budgets: std::collections::BTreeMap<String, u32>,
 }
 
 impl Default for TeamConfig {
     fn default() -> Self {
-        Self { max_members: 6 }
+        Self {
+            max_members: 6,
+            role_request_budgets: Default::default(),
+        }
     }
 }
 
@@ -743,6 +749,11 @@ pub struct Config {
     /// Dynamic debugging; runtime sessions are never persisted.
     #[serde(default)]
     pub dap: DapConfig,
+    /// CUE — AI inline completion (the ghost-text suggestions an IDE shows at
+    /// the cursor). Off by default: it spends the user's model quota on every
+    /// pause in typing, so it is opt-in.
+    #[serde(default)]
+    pub cue: CueConfig,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
     /// [`SubAgentConfig`], including an optional per-subtask round budget (default unbounded).
     #[serde(default)]
@@ -1277,6 +1288,7 @@ impl Default for Config {
             telemetry: Default::default(),
             lsp: Default::default(),
             dap: Default::default(),
+            cue: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),
@@ -2350,6 +2362,40 @@ pub struct LspConfig {
 
 fn default_diagnostics_settle_delay_ms() -> u64 {
     150
+}
+
+/// `[cue]` — AI inline completion settings.
+///
+/// CUE is the ghost-text suggestion an IDE shows at the cursor while you
+/// type. It is OFF by default because every suggestion spends model quota:
+/// a user who did not ask for it should not pay for it.
+///
+/// The model is chosen separately from the agent's model. A completion wants
+/// a FAST model that answers in a few hundred milliseconds, while the agent
+/// wants a strong model that can plan — so `model` names a completion model
+/// when set, and the agent's own model answers when it is not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CueConfig {
+    /// Whether CUE answers completion requests at all.
+    pub enabled: bool,
+    /// The model selection that answers completions. Empty = use the agent's
+    /// configured default model.
+    pub model: String,
+    /// How long one completion request may take, in seconds. Clamped to
+    /// 1..=120. A suggestion that arrives after the user kept typing is
+    /// worse than no suggestion.
+    pub timeout_secs: u64,
+}
+
+impl Default for CueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            timeout_secs: 10,
+        }
+    }
 }
 
 impl Default for LspConfig {
@@ -4221,6 +4267,7 @@ model = "missing-type"
             telemetry: Default::default(),
             lsp: Default::default(),
             dap: Default::default(),
+            cue: Default::default(),
             subagent: Default::default(),
             team: Default::default(),
             loop_config: Default::default(),

@@ -94,7 +94,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── 当下 ──
-        Msg::MomentHistoryClear => "已填入历史消息 · Ctrl+C 清空输入 · Esc 停止任务".into(),
         Msg::UpgradeProgressDownloading => "正在下载更新".into(),
         Msg::UpgradeProgressEta { seconds } => format!("剩余约 {seconds} 秒").into(),
         Msg::UpgradeProgressEtaUnknown => "剩余时间 —".into(),
@@ -360,31 +359,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
         Msg::RecapLabel => "※ 回顾:".into(),
-        Msg::ProviderDiscoverNothingNew => "服务端列出的模型这个账号都已经加过了;要加别的就手动输入。".into(),
         Msg::ProviderDiscoverUnsupported => "这个协议没有模型列表接口,请手动输入模型 ID。".into(),
         Msg::ProviderDiscovering => "正在从服务端拉取模型列表…(Esc 取消)".into(),
-        Msg::ProviderBatchCount { n } => format!("已选择 {n} 个模型").into(),
-        Msg::ProviderWillUse => "当前将使用".into(),
-        Msg::ProviderSetUse => "设为使用模型".into(),
-        Msg::ProviderBatchChoose => "设为使用模型".into(),
         Msg::ProviderCatalogCandidates => "models.dev 目录候选 · 账号可用性未验证".into(),
         Msg::ProviderNotProvided => "未提供".into(),
         Msg::ProviderManualAdd => "手动添加".into(),
-        Msg::ProviderEdit => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::ProviderMenuEdit),
-        Msg::ProviderAdvanced => "高级设置".into(),
-        Msg::ProviderContinue => "继续".into(),
-        Msg::ProviderConnectUse => "连接并使用".into(),
-        Msg::ProviderSaveOnly => "仅保存".into(),
         Msg::ProviderConnected => crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::McpStatusConnected),
         Msg::ProviderAvailable => "添加连接".into(),
         Msg::ProviderCapabilitiesUnknown => "能力未声明".into(),
         Msg::ProviderOutputLimit => "最大输出".into(),
-        Msg::ProviderSavedSwitchFailed { id, error } => format!("已保存 {id}，未能发起切换：{error}。可在模型列表重试。").into(),
-        Msg::ProviderSavedSwitching { id } => format!("已保存 {id}，正在切换…").into(),
         Msg::ProviderConnectTitle { id } => format!("连接 {id}").into(),
-        Msg::ProviderDiscoverHint => "从服务端拉取".into(),
-        Msg::ProviderPickKeys => "↑↓ 选 · 空格多选 · Enter 确认（当前项优先使用）· Esc 返回 · 打字筛选".into(),
-        Msg::ProviderPickFilter { query } => format!("筛选:{query}").into(),
         Msg::DiscoverNotAListing => "服务端返回的不是模型列表".into(),
         Msg::DiscoverTimedOut => "服务端没在 10 秒内回答".into(),
         Msg::DiscoverTooLarge => "返回的列表超过 4 MiB".into(),
@@ -538,8 +522,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 到当前行首 / 行尾
     Ctrl+U / Ctrl+K                 删除到当前行首 / 行尾
     Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
-    Up / Down                       在输入里移动游标，到头翻历史（HiShell：到头滚动对话）
-    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（HiShell 请使用这组快捷键）
+    Up / Down                       移动游标，到头翻历史；网页终端交还鼠标时滚动对话（HiShell 到头滚动）
+    Ctrl+P / Ctrl+N                 上一条 / 下一条输入历史（网页终端和 HiShell 中，方向键滚动时请用这组键翻历史）
     点击输入框                      定位游标
     Ctrl+R                          搜索这个项目里以前打过的东西；继续打字缩小范围，再按往更老翻，Enter 接受，Esc 还回草稿
 
@@ -614,12 +598,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
         Msg::AgentsLead => "main · 这个会话本身".into(),
         Msg::AgentsStopped { name } => format!("{name} · 已停,日志还在").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "这个会话底下还没有别的 agent".into(),
         Msg::AgentsPickerHint => "看谁 · enter 切过去".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("需要更新版本才能打开 · {id}").into(),
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} 轮 · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} 轮 · {when}").into(),
-        Msg::ResumeNoOthers => "没有别的存下的会话".into(),
+        Msg::ResumeNoOthers => "当前项目没有列出其他会话。".into(),
+        Msg::ResumeAllProjects => "所有项目".into(),
+        Msg::ResumeThisProject => "当前项目".into(),
+        Msg::ResumeLoadingAll => "正在加载所有项目…".into(),
+        Msg::ResumeNoneAll => "所有项目中都没有列出其他会话。".into(),
+        Msg::ResumeHistoryElsewhere => "当前项目没有其他会话，其他项目有历史会话。".into(),
+        Msg::ResumeScanIssue { path } => format!("扫描会话目录时发现异常，列表可能不完整。请检查 {path}").into(),
         Msg::ResumePickerHint => "回到哪个会话 · enter 打开 · ctrl+d 删掉(按两次)".into(),
 
         // ── background sessions ──
@@ -1040,11 +1031,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolImage { ordinal } => format!("图片 {ordinal} · 点击打开").into(),
         Msg::ImageGone => "这张图已经找不到了".into(),
         Msg::ImageCorrupt => "图片数据损坏".into(),
+        Msg::MouseHandedBackArrowScroll => "鼠标已交还终端 · ↑/↓ 滚动对话 · Ctrl+P/N 翻历史 · Ctrl+G 收回".into(),
         Msg::MouseTaken => "鼠标已收回 · ctrl+g 交还终端".into(),
         Msg::RawTop => "── atomcode · 本会话全文 ──".into(),
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ↑↓/ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · 保留原生鼠标 · 在 tmux 启用鼠标并重启后可用应用滚动".into(),
+        Msg::MouseHandedBackArrowScrollAtStart => "↑/↓ 滚动对话 · Ctrl+P / Ctrl+N 翻历史 · Ctrl+R 搜索\n终端保留鼠标，可直接拖选 · Ctrl+G 收回".into(),
         Msg::MouseUnreportedAtStart => "输入历史：Ctrl+P 上一条 · Ctrl+N 下一条 · Ctrl+R 搜索\n/keys 查看全部快捷键 · 终端保留鼠标，可直接拖选".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮翻页 · Ctrl+P/N 翻输入历史".into(),
         Msg::MouseHandedBackAtStart => "鼠标已交还终端 · 拖选复制、右键粘贴 · Ctrl+T 展开/收起工具输出".into(),
@@ -1137,6 +1130,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "模型服务身份验证失败".into(),
         Msg::ProviderRateLimitError => "模型服务限流".into(),
         Msg::ProviderConnectionError => "无法连接模型服务".into(),
+        Msg::ProviderSystemProxyReadFailed => "无法读取系统代理设置。".into(),
+        Msg::ProviderCheckSystemProxy => "请检查系统代理的地址和端口。如果当前网络允许直连，可输入 /proxy no_proxy 后重试。".into(),
         Msg::ProviderResponseTimeout => "模型服务未及时响应".into(),
         Msg::ProviderConnectionTimeout => "连接模型服务超时".into(),
         Msg::ProviderTlsInterrupted => "TLS 连接异常中断".into(),
@@ -1170,13 +1165,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "内部错误".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
-        Msg::StopWithOpenItems { count } => {
-            format!("已停下 · 任务清单还有 {count} 项没完成 —— 发一句「继续」接着做").into()
-        }
         Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-        Msg::StopWithMembersRunning { n } => format!("本轮结束 · 仍有 {n} 个子 agent 工作").into(),
         Msg::LiveWaitingForMember { n } => format!("等待 {n} 个子 agent 完成").into(),
         Msg::LiveStopping => "正在停止".into(),
         Msg::LiveRecognizingImage => "正在识别图片".into(),
@@ -1232,14 +1223,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderFormEdit { id } => format!("改 {id}").into(),
         Msg::ProviderFormAddAccount => "添加 provider".into(),
         Msg::ProviderFormAddModelTo { account } => format!("给 {account} 添加模型").into(),
-        Msg::ProviderFormAddModel => "添加模型".into(),
         Msg::ProviderModelCount { n } => format!("{n} 个模型").into(),
         Msg::ProviderHasKey => "有密钥".into(),
         Msg::ProviderNoKey => "没有密钥".into(),
         Msg::ProviderManaged => "登录管理".into(),
-        Msg::ProviderUnconfigured => "未配置".into(),
         Msg::ProviderVision => "视觉".into(),
-        Msg::ArmedDelete => "再按一次 ^d 删除".into(),
         Msg::FieldName => "名字".into(),
         Msg::FieldProtocol => "协议".into(),
         Msg::FieldKey => "密钥".into(),
@@ -1249,7 +1237,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FieldWindow => "上下文预算".into(),
         Msg::ContextBudgetSource => "预算来源：当前模型配置或默认值，并非服务端实测容量。".into(),
         Msg::AutoContextBudgetNote => "auto 路由的实际窗口未知，请设置保守预算；上次响应模型不保证下一次仍使用同一模型。".into(),
-        Msg::FieldUseAfterSaving => "存完就用".into(),
         Msg::VisionYes => "能".into(),
         Msg::VisionNo => "不能".into(),
         Msg::EffortUnsupported => "不支持".into(),
@@ -1269,9 +1256,34 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendTypeWindow => "输入 token 数，如 200000、200k、1m".into(),
         Msg::LegendBackToPresets => "换回预设".into(),
         Msg::LegendPressAgainToDelete => "再按一次删除".into(),
-        Msg::LegendSeeItsModels => "看它的模型".into(),
-        Msg::LegendSwitchToIt => "换过去".into(),
         Msg::LegendChange => "修改".into(),
+        Msg::ProviderSectionAdded => "已添加".into(),
+        Msg::ProviderSectionServer => "服务端还有".into(),
+        Msg::ProviderConnectionRow => "连接".into(),
+        Msg::ProviderAddProviderRow => "＋ 添加提供商".into(),
+        Msg::ProviderAddModelRow => "＋ 添加模型…".into(),
+        Msg::ProviderManualRow => "＋ 手动添加模型…".into(),
+        Msg::ProviderManualRowWith { query } => format!("＋ 手动添加「{query}」").into(),
+        Msg::ProviderAdding => "添加中…".into(),
+        Msg::ProviderDiscoveryLoading => "正在获取服务端模型…".into(),
+        Msg::ProviderManagedHint => "登录管理 · /login 重新登录 · /logout 退出".into(),
+        Msg::ProviderConnectionChanged => "连接已变更，未添加".into(),
+        Msg::ProviderArmedDelete => "再按一次 Ctrl+D 删除".into(),
+        Msg::LegendEditIt => {
+            crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::ProviderMenuEdit)
+        }
+        Msg::LegendDelete => "删除".into(),
+        Msg::LegendRemove => "移除".into(),
+        Msg::LegendSwitch => "切换".into(),
+        Msg::LegendAddIt => "添加".into(),
+        Msg::LegendEditThenAdd => "编辑后添加".into(),
+        Msg::LegendRetry => "重试".into(),
+        Msg::LegendAddAndUse => "添加并使用".into(),
+        Msg::ProviderMoreSettings => "更多设置 ▸".into(),
+        Msg::ProviderEffortFailed { why } => format!("推理强度设置失败：{why}").into(),
+        Msg::LegendShowAll => "展开全部".into(),
+        Msg::ProviderSwitching => "切换中…".into(),
+        Msg::ProviderSwitchFailedOnRow { why } => format!("已添加，切换失败：{why}").into(),
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "这个宿主的配置不能从屏幕上改".into(),
@@ -1515,6 +1527,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "增删用 `atomcode schedule add` / `remove`；到点执行的是操作系统的调度器。".into()
         }
         Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
+        Msg::GcAbout => "预览旧会话清理".into(),
+        Msg::GcUsage => "输入 /gc 预览，或输入 /gc --apply 执行已预览的清理。".into(),
+        Msg::GcBusy => "会话清理正在进行。".into(),
+        Msg::GcPreviewFirst => "请先输入 /gc 预览清理范围。".into(),
+        Msg::GcApplyHint => "输入 /gc --apply 将永久删除这些会话及其附件。".into(),
+        Msg::GcLowSpace { free } => format!("会话目录所在磁盘仅剩 {free}。输入 /gc 预览清理范围。").into(),
+        Msg::GcFailed { error } => format!("会话清理失败（{error}）。").into(),
+        Msg::GcPreview { used, count, estimated, skipped } => format!("会话目录文件大小 {used}。{count} 个旧会话符合清理条件，预计可清理 {estimated}，检查时跳过 {skipped} 个。迁移备份和独立的代码回退仓库会保留。").into(),
+        Msg::GcApplied { deleted, skipped, failed, removed } => format!("已删除 {deleted} 个旧会话，跳过 {skipped} 个，{failed} 个未能完成。移除了 {removed} 的会话文件。").into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),
         Msg::ProxyFollowSystemAbout => "跟随环境和系统代理；模型请求在本地代理关闭时自动直连，恢复后重新使用（默认）".into(),
@@ -1568,12 +1589,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "追加指令：未知".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerContinueTodo { title } => format!("接着做完「{title}」").into(),
         Msg::ComposerPlaceholder => "使用 AtomCode 开始工作".into(),
         Msg::WaitsForTheTurn { command } => {
             format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
         }
         Msg::CompactAfterTurn => "这一轮结束后就压缩".into(),
-        Msg::ModelNextTurn { model } => format!("当前回合继续使用 {model}；新选择的模型从下回合生效。").into(),
+        Msg::ModelNextTurn { model } => format!("本回合仍用 {model}，下回合生效（Esc 可立即切换）").into(),
         Msg::RuntimeBusy => "正在忙(回复、压缩或重新装配进行中),稍后再试".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()

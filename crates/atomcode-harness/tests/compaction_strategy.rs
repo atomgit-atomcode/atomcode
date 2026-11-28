@@ -141,6 +141,23 @@ impl Writer {
         })
     }
 
+    /// A turn a team member's lead starts: the work arrives as another agent's
+    /// message, never as the person's.
+    fn delegated(&mut self, text: &str) -> SeqNo {
+        self.turn = self.log.next_turn();
+        self.round = 0;
+        self.log.append(SessionEvent::TurnStart { turn: self.turn });
+        self.log.append(SessionEvent::Injected {
+            turn: self.turn,
+            text: text.into(),
+            origin: InjectionOrigin::Peer {
+                from: "lead".into(),
+                source_turn: None,
+                outside: false,
+            },
+        })
+    }
+
     fn answer(&mut self, text: &str) -> SeqNo {
         self.round += 1;
         self.log.append(SessionEvent::AssistantMessage {
@@ -253,6 +270,43 @@ fn harness_overflow_compresses_raw_output_with_stub_like_headers() {
             .map(|rewrite| rewrite.seq)
             .collect::<Vec<_>>(),
         vec![raw_preview, raw_first_line]
+    );
+}
+
+/// An already-stubbed result is not raw output worth stubbing: the builder
+/// returns it unchanged (idempotent early exit) and the strict-shrink check
+/// drops it, so a second overflow pass yields nothing for it and the rung
+/// stands down (`None`) to let the compactor fold the settled history.
+#[test]
+fn harness_overflow_skips_already_stubbed_results() {
+    let mut writer = Writer::new();
+    writer.ask("inspect output");
+    // A kernel-shaped head+tail stub (~1.9KB) — well over `WORTH_STUBBING`,
+    // so the old size-only filter kept selecting it every pass. Built by the
+    // real generator, so kernel budget changes cannot drift the fixture.
+    let stub_text = atomcode_kernel::session::build_compact_stub(
+        "bash",
+        &format!("{}TAIL-MARKER exit: 0", "x".repeat(3_000)),
+        true,
+    );
+    assert!(stub_text.len() > 500, "the stub clears the size filter");
+    let _stubbed = writer.call("bash", &stub_text);
+    let overflow = ask(CompactTrigger::Overflow { attempt: 1 }, 1_000, 0);
+    assert!(
+        stub_on_overflow(&writer.log, &overflow).is_none(),
+        "a log of only stubs has nothing for this rung"
+    );
+
+    // Mixed log: only the raw result is rewritten, the stub is left alone.
+    let raw = writer.call("grep", &"z".repeat(2_000));
+    let rewrites = stub_on_overflow(&writer.log, &overflow).unwrap().rewrites;
+    assert_eq!(
+        rewrites
+            .iter()
+            .map(|rewrite| rewrite.seq)
+            .collect::<Vec<_>>(),
+        vec![raw],
+        "only the not-yet-stubbed result is rewritten"
     );
 }
 
@@ -808,4 +862,103 @@ async fn a_nonshrinking_proposal_is_distinct_from_nothing_to_compact() {
     .await;
     assert!(result.decision.is_none());
     assert!(result.diagnostic.is_none());
+}
+
+/// A team member is only ever spoken to by its lead, so its log has no request
+/// from the person. Its first delegation is its request: kept, and everything
+/// after it compacts like any other conversation — before, every compaction
+/// of a member was a silent no-op until it overflowed for good.
+#[tokio::test]
+async fn a_member_spoken_to_only_by_its_lead_still_compacts() {
+    let mut w = Writer::new();
+    let task = w.delegated("the task the lead delegated");
+    let mut outputs = Vec::new();
+    for n in 0..4 {
+        outputs.push(w.call("bash", &bulk(&format!("run {n}"), 3_000)));
+    }
+    w.answer(&bulk("one", 20_000));
+    w.delegated("the lead's follow-up");
+    w.answer(&bulk("two", 20_000));
+    w.delegated("the lead's next follow-up");
+    w.answer(&bulk("three", 20_000));
+    w.delegated("the lead's latest message");
+
+    let summarizer = Summarizer::new();
+    let strategy = strategy(Some(summarizer.clone()));
+
+    let stubbed = decide_with_strategy(&strategy, &w.log, &overflow(0, 16_000))
+        .await
+        .expect("an overflowing member has tool output to stub");
+    let seqs: Vec<SeqNo> = stubbed.rewrites.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, outputs);
+
+    let ask = pressure(16_000, 13_000);
+    assert!(strategy_would_summarize(&strategy, &w.log, &ask));
+    let decision = decide_with_strategy(&strategy, &w.log, &ask)
+        .await
+        .expect("past the mark, a member's older turns are summarized");
+    assert_eq!(decision.from, task, "the delegated task is kept");
+    w.apply(decision);
+    let seen: Vec<String> = w
+        .seen()
+        .iter()
+        .map(|m| m.display_text().to_owned())
+        .collect();
+    assert!(seen[0].contains("SUMMARY 1"), "{seen:?}");
+    assert!(
+        seen[1].contains("the task the lead delegated"),
+        "the task stays right under the summary: {seen:?}"
+    );
+    assert!(!seen.iter().any(|t| t.contains("the lead's follow-up")));
+    assert!(seen.iter().any(|t| t.contains("the lead's latest message")));
+    // Kept under a summary, the delegation is history like a person's first
+    // request, and is framed as such: unframed, a member reads its original
+    // task as a fresh instruction and starts it over.
+    let sent = w.seen();
+    assert!(
+        sent[1]
+            .text
+            .starts_with(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING),
+        "{:?}",
+        sent[1].text
+    );
+    let latest = sent.last().unwrap();
+    assert!(
+        !latest
+            .text
+            .contains(atomcode_kernel::message::COMPACTION_RETAINED_FRAMING),
+        "the lead's latest message is a live instruction: {:?}",
+        latest.text
+    );
+}
+
+/// The person may speak to a member directly, long after its lead delegated.
+/// That later request must not become the protected head and wall off the
+/// whole history before it.
+#[tokio::test]
+async fn a_person_speaking_to_a_member_later_does_not_protect_its_history() {
+    let mut w = Writer::new();
+    let task = w.delegated("the task the lead delegated");
+    w.answer(&bulk("one", 20_000));
+    w.delegated("the lead's follow-up");
+    w.answer(&bulk("two", 20_000));
+    w.ask("the person speaking to the member");
+    w.answer(&bulk("three", 20_000));
+    w.delegated("the lead's latest message");
+
+    let strategy = strategy(Some(Summarizer::new()));
+    let decision = decide_with_strategy(&strategy, &w.log, &pressure(16_000, 13_000))
+        .await
+        .expect("the member's older turns are summarized");
+    assert_eq!(decision.from, task, "the delegated task is the head");
+    w.apply(decision);
+    let seen: Vec<String> = w
+        .seen()
+        .iter()
+        .map(|m| m.display_text().to_owned())
+        .collect();
+    assert!(
+        !seen.iter().any(|t| t.contains("the lead's follow-up")),
+        "{seen:?}"
+    );
 }

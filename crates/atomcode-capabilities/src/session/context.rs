@@ -168,14 +168,21 @@ impl SessionContextHook {
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
         };
-        format!(
+        let mut block = format!(
             "Working directory: {}\nPlatform: {}\nShell: {}",
             // Forward-slash on Windows so the model's cwd anchor is bash-safe
             // (matches the bash tool's "use forward slashes" guidance).
             crate::pathnorm::to_display(&self.working_dir),
             std::env::consts::OS,
             shell
-        )
+        );
+        if let Some(line) =
+            privileges_line(cfg!(windows), crate::process_utils::is_running_as_admin())
+        {
+            block.push('\n');
+            block.push_str(&line);
+        }
+        block
     }
 
     /// `Some(block)` when `working_dir` is inside a git work tree, else `None`. A
@@ -333,6 +340,43 @@ fn snapshot_status(raw: Option<String>) -> String {
         "(working tree clean)".to_string()
     } else {
         status
+    }
+}
+
+/// What the commands this agent runs may do, said once at session start.
+///
+/// The model could not tell. Started from an administrator terminal it still
+/// wrapped work in `Start-Process -Verb RunAs` — a UAC prompt the person had to
+/// click and a round to read the result back — and not elevated it spent rounds
+/// probing (`whoami /groups`) before deciding. Stated as a fact, and with the
+/// other causes of "access denied" beside it: a directory a security product or
+/// a failed installer has locked refuses an administrator too, and a line that
+/// read as "denied means not elevated" would send the model into elevation
+/// retries that cannot help (seen on a Windows machine running 360).
+///
+/// Windows says both states. Elsewhere only root is said: an ordinary user is
+/// what a model assumes, and a line every session would be noise.
+fn privileges_line(windows: bool, elevated: bool) -> Option<String> {
+    const OTHER_CAUSES: &str = "a file in use, or a lock held by another program, \
+                                an installer or security software";
+    match (windows, elevated) {
+        (true, true) => Some(format!(
+            "Privileges: elevated (Administrator). Commands already run as administrator; \
+             do not wrap them in `-Verb RunAs`. Access denied here is not a missing \
+             privilege: look for {OTHER_CAUSES}."
+        )),
+        (true, false) => Some(format!(
+            "Privileges: not elevated. Changes that need an administrator (under Program \
+             Files or Windows, HKLM, services) are refused at this level, and `-Verb RunAs` \
+             asks the person on a UAC prompt each time. Access denied has other causes too \
+             ({OTHER_CAUSES}); tell which it is before elevating, and if a task needs an \
+             administrator for many steps, say so: the person can restart this agent from \
+             an administrator terminal instead."
+        )),
+        (false, true) => {
+            Some("Privileges: root. Commands already run as root; do not prefix sudo.".into())
+        }
+        (false, false) => None,
     }
 }
 
@@ -506,6 +550,26 @@ mod tests {
             "env block always present"
         );
         assert!(ctx.text.contains("Platform:"));
+    }
+
+    /// Windows says both states; elsewhere only root. Neither reads "access
+    /// denied" as "not elevated": a lock refuses an administrator too.
+    #[test]
+    fn the_privilege_line_states_the_level_and_the_other_causes_of_a_refusal() {
+        let elevated = privileges_line(true, true).unwrap();
+        assert!(elevated.contains("elevated (Administrator)"), "{elevated}");
+        assert!(
+            elevated.contains("do not wrap them in `-Verb RunAs`"),
+            "{elevated}"
+        );
+        let not = privileges_line(true, false).unwrap();
+        assert!(not.starts_with("Privileges: not elevated"), "{not}");
+        assert!(not.contains("UAC"), "{not}");
+        for line in [&elevated, &not] {
+            assert!(line.contains("security software"), "{line}");
+        }
+        assert!(privileges_line(false, true).unwrap().contains("root"));
+        assert_eq!(privileges_line(false, false), None);
     }
 
     #[tokio::test]

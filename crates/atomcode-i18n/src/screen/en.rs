@@ -108,7 +108,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
 
         // ── the moment ──
-        Msg::MomentHistoryClear => "History recalled · Ctrl+C clears input · Esc stops the task".into(),
         Msg::UpgradeProgressDownloading => "Downloading update".into(),
         Msg::UpgradeProgressEta { seconds } => format!("~{seconds}s remaining").into(),
         Msg::UpgradeProgressEtaUnknown => "ETA —".into(),
@@ -391,35 +390,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
         Msg::RecapLabel => "※ recap:".into(),
-        Msg::ProviderDiscoverNothingNew => {
-            "Every model the endpoint lists is already on this account; type another by hand.".into()
-        }
         Msg::ProviderDiscoverUnsupported => {
             "This protocol has no model listing; type the model id by hand.".into()
         }
         Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
-        Msg::ProviderBatchCount { n } => format!("{n} models selected").into(),
-        Msg::ProviderWillUse => "Will use".into(),
-        Msg::ProviderSetUse => "Use this model".into(),
-        Msg::ProviderBatchChoose => "Use focused model".into(),
         Msg::ProviderCatalogCandidates => "models.dev suggestions · account access unverified".into(),
         Msg::ProviderNotProvided => "Not provided".into(),
         Msg::ProviderManualAdd => "Manual add".into(),
-        Msg::ProviderEdit => crate::product::t_with(crate::Locale::En, crate::product::Msg::ProviderMenuEdit),
-        Msg::ProviderAdvanced => "advanced settings".into(),
-        Msg::ProviderContinue => "continue".into(),
-        Msg::ProviderConnectUse => "connect and use".into(),
-        Msg::ProviderSaveOnly => "save only".into(),
         Msg::ProviderConnected => crate::product::t_with(crate::Locale::En, crate::product::Msg::McpStatusConnected),
         Msg::ProviderAvailable => "add a connection".into(),
         Msg::ProviderCapabilitiesUnknown => "capabilities not declared".into(),
         Msg::ProviderOutputLimit => "max output".into(),
-        Msg::ProviderSavedSwitchFailed { id, error } => format!("Saved {id}, but could not start switching: {error}. Retry from the model list.").into(),
-        Msg::ProviderSavedSwitching { id } => format!("Saved {id}; switching…").into(),
         Msg::ProviderConnectTitle { id } => format!("connect {id}").into(),
-        Msg::ProviderDiscoverHint => "fetch from the endpoint".into(),
-        Msg::ProviderPickKeys => "↑↓ pick · Space select · Enter confirm (current first) · Esc back · type to filter".into(),
-        Msg::ProviderPickFilter { query } => format!("filter: {query}").into(),
         Msg::DiscoverNotAListing => "the endpoint did not answer with a model list".into(),
         Msg::DiscoverTimedOut => "the endpoint did not answer within 10 seconds".into(),
         Msg::DiscoverTooLarge => "the list is over 4 MiB".into(),
@@ -575,8 +557,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Ctrl+A / Ctrl+E                 start / end of the current line
     Ctrl+U / Ctrl+K                 delete to line start / end
     Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
-    Up / Down                       move the caret, then history (HiShell: scroll chat at the edge)
-    Ctrl+P / Ctrl+N                 previous / next input history (use these keys in HiShell)
+    Up / Down                       Move the caret or recall history at the boundary; scroll when the browser terminal owns the mouse (at the boundary in HiShell)
+    Ctrl+P / Ctrl+N                 previous / next input history (use these in browser terminals and HiShell when arrows scroll)
     click the composer              put the caret where you clicked
     Ctrl+R                          search what you have typed in this project before; type to narrow, ctrl-r again for older, enter takes it, esc gives your draft back
 
@@ -654,12 +636,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "this screen has no agent roster: the launcher provided no `tui-team-roster`".into(),
         Msg::AgentsLead => "main · this session itself".into(),
         Msg::AgentsStopped { name } => format!("{name} · stopped; its log is still here").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "there is no other agent under this session yet".into(),
         Msg::AgentsPickerHint => "read which one · enter switches to it".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("a newer version is needed to open it · {id}").into(),
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} turns · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} turns · {when}").into(),
-        Msg::ResumeNoOthers => "there is no other stored session".into(),
+        Msg::ResumeNoOthers => "No other session was listed for this project.".into(),
+        Msg::ResumeAllProjects => "All projects".into(),
+        Msg::ResumeThisProject => "This project".into(),
+        Msg::ResumeLoadingAll => "Loading all projects…".into(),
+        Msg::ResumeNoneAll => "No other sessions found across projects.".into(),
+        Msg::ResumeHistoryElsewhere => "No other session here. Other projects have history.".into(),
+        Msg::ResumeScanIssue { path } => format!("The session scan reported a problem at {path}. The list may be incomplete.").into(),
         Msg::ResumePickerHint => "back to which session · enter opens it · ctrl+d throws it away (press twice)".into(),
 
         // ── background sessions ──
@@ -1100,11 +1089,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolImage { ordinal } => format!("Image {ordinal} · click to open").into(),
         Msg::ImageGone => "that image is no longer available".into(),
         Msg::ImageCorrupt => "the image data is corrupt".into(),
+        Msg::MouseHandedBackArrowScroll => "Mouse handed to terminal · ↑/↓ scroll · Ctrl+P/N history · Ctrl+G take mouse".into(),
         Msg::MouseTaken => "mouse taken back · ctrl+g hands it to the terminal".into(),
         Msg::RawTop => "── atomcode · the whole conversation ──".into(),
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel scroll · ↑↓/ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseDisabledByTmux => "tmux mouse=off · application mouse stays off · enable mouse in tmux and restart to use application scrolling".into(),
+        Msg::MouseHandedBackArrowScrollAtStart => "↑/↓ scroll · Ctrl+P / Ctrl+N history · Ctrl+R search\nTerminal keeps mouse for selection · Ctrl+G take mouse".into(),
         Msg::MouseUnreportedAtStart => "Input history: Ctrl+P previous · Ctrl+N next · Ctrl+R search\n/keys for all shortcuts · terminal keeps mouse; drag to select".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel scroll · Ctrl+P/N input history".into(),
         Msg::MouseHandedBackAtStart => "Mouse handed to terminal · drag to copy, right-click to paste · Ctrl+T expands/collapses tool output".into(),
@@ -1200,6 +1191,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderAuthenticationFailed => "Model service authentication failed".into(),
         Msg::ProviderRateLimitError => "Model service rate limit reached".into(),
         Msg::ProviderConnectionError => "Cannot connect to the model service".into(),
+        Msg::ProviderSystemProxyReadFailed => "Could not read the system proxy settings.".into(),
+        Msg::ProviderCheckSystemProxy => "Check the system proxy address and port. If your network allows direct connections, run /proxy no_proxy and try again.".into(),
         Msg::ProviderResponseTimeout => "The model service did not respond in time".into(),
         Msg::ProviderConnectionTimeout => "Connection to the model service timed out".into(),
         Msg::ProviderTlsInterrupted => "The TLS connection was interrupted".into(),
@@ -1235,14 +1228,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "Internal error".into(),
         Msg::StopInvariantViolated => "stopped · an internal invariant was broken; this session should not be carried on".into(),
         Msg::StopMaxContinuations => "stopped · the automatic continuations ran out".into(),
-        Msg::StopWithOpenItems { count } => format!(
-            "stopped · {count} item(s) on the task list are still open — send \"continue\" to pick them up"
-        )
-        .into(),
         Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-        Msg::StopWithMembersRunning { n } => format!("Turn ended · {n} sub-agents still working").into(),
         Msg::LiveWaitingForMember { n } => format!("Waiting for {n} sub-agents").into(),
         Msg::LiveStopping => "stopping".into(),
         Msg::LiveRecognizingImage => "recognizing image".into(),
@@ -1301,14 +1289,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderFormEdit { id } => format!("change {id}").into(),
         Msg::ProviderFormAddAccount => "add a provider".into(),
         Msg::ProviderFormAddModelTo { account } => format!("add a model to {account}").into(),
-        Msg::ProviderFormAddModel => "add a model".into(),
         Msg::ProviderModelCount { n } => format!("{n} models").into(),
         Msg::ProviderHasKey => "has a key".into(),
         Msg::ProviderNoKey => "no key".into(),
         Msg::ProviderManaged => "managed by signing in".into(),
-        Msg::ProviderUnconfigured => "not configured".into(),
         Msg::ProviderVision => "vision".into(),
-        Msg::ArmedDelete => "press ^d again to delete".into(),
         Msg::FieldName => "name".into(),
         Msg::FieldProtocol => "protocol".into(),
         Msg::FieldKey => "key".into(),
@@ -1318,7 +1303,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FieldWindow => "context budget".into(),
         Msg::ContextBudgetSource => "Budget source: current model configuration or defaults; not measured server capacity.".into(),
         Msg::AutoContextBudgetNote => "For auto routing, the actual window is unknown. Set a conservative budget; the last response model does not guarantee the next route.".into(),
-        Msg::FieldUseAfterSaving => "use it once saved".into(),
         Msg::VisionYes => "yes".into(),
         Msg::VisionNo => "no".into(),
         Msg::EffortUnsupported => "unsupported".into(),
@@ -1338,9 +1322,32 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LegendTypeWindow => "type the tokens, e.g. 200000, 200k, 1m".into(),
         Msg::LegendBackToPresets => "back to presets".into(),
         Msg::LegendPressAgainToDelete => "press again to delete".into(),
-        Msg::LegendSeeItsModels => "see its models".into(),
-        Msg::LegendSwitchToIt => "switch to it".into(),
         Msg::LegendChange => "change".into(),
+        Msg::ProviderSectionAdded => "Added".into(),
+        Msg::ProviderSectionServer => "Also on the server".into(),
+        Msg::ProviderConnectionRow => "Connection".into(),
+        Msg::ProviderAddProviderRow => "+ Add provider".into(),
+        Msg::ProviderAddModelRow => "+ Add model…".into(),
+        Msg::ProviderManualRow => "+ Add a model by hand…".into(),
+        Msg::ProviderManualRowWith { query } => format!("+ Add “{query}” by hand").into(),
+        Msg::ProviderAdding => "adding…".into(),
+        Msg::ProviderDiscoveryLoading => "Fetching models from the server…".into(),
+        Msg::ProviderManagedHint => "Managed by sign-in · /login to sign in again · /logout to sign out".into(),
+        Msg::ProviderConnectionChanged => "The connection changed; not added".into(),
+        Msg::ProviderArmedDelete => "press Ctrl+D again to delete".into(),
+        Msg::LegendEditIt => "edit".into(),
+        Msg::LegendDelete => "delete".into(),
+        Msg::LegendRemove => "remove".into(),
+        Msg::LegendSwitch => "switch".into(),
+        Msg::LegendAddIt => "add".into(),
+        Msg::LegendEditThenAdd => "edit, then add".into(),
+        Msg::LegendRetry => "retry".into(),
+        Msg::LegendAddAndUse => "add and use".into(),
+        Msg::ProviderMoreSettings => "More settings ▸".into(),
+        Msg::ProviderEffortFailed { why } => format!("Setting the reasoning effort failed: {why}").into(),
+        Msg::LegendShowAll => "show all".into(),
+        Msg::ProviderSwitching => "switching…".into(),
+        Msg::ProviderSwitchFailedOnRow { why } => format!("added; switching failed: {why}").into(),
 
         // ── the host side of the screen (`atomcode-cli`) ──
         Msg::HostConfigNotEditable => "this host's configuration cannot be changed from the screen".into(),
@@ -1606,6 +1613,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 .into()
         }
         Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
+        Msg::GcAbout => "preview cleanup of old session history".into(),
+        Msg::GcUsage => "Use /gc to preview or /gc --apply to run the previewed cleanup.".into(),
+        Msg::GcBusy => "Session cleanup is already running.".into(),
+        Msg::GcPreviewFirst => "Run /gc to preview the cleanup first.".into(),
+        Msg::GcApplyHint => "Run /gc --apply to permanently delete these sessions and their attachments.".into(),
+        Msg::GcLowSpace { free } => format!("The session disk has {free} free. Run /gc to preview cleanup.").into(),
+        Msg::GcFailed { error } => format!("Session cleanup failed ({error}).").into(),
+        Msg::GcPreview { used, count, estimated, skipped } => format!("Session history size {used}. Eligible old sessions: {count}. Estimated reclaimable file size: {estimated}. Skipped during inspection: {skipped}. Migration backups and separate Code Rewind stores are kept.").into(),
+        Msg::GcApplied { deleted, skipped, failed, removed } => format!("Deleted {deleted} old sessions, skipped {skipped}, and could not finish {failed}. Removed {removed} of session files.").into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
         Msg::ProxyFollowSystemAbout => {
@@ -1672,13 +1688,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PersonaAppendUnknown => "Appended instructions: unknown".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::ComposerContinueTodo { title } => format!("Continue with {title}").into(),
         Msg::ComposerPlaceholder => "Ask AtomCode to do Anything".into(),
         Msg::WaitsForTheTurn { command } => format!(
             "A reply is in progress: /{command} has to wait for this turn to end; Esc stops the turn now"
         )
         .into(),
         Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
-        Msg::ModelNextTurn { model } => format!("Current turn continues with {model}; the selected model applies next turn.").into(),
+        Msg::ModelNextTurn { model } => format!("{model} finishes this turn; new model applies next turn (Esc to switch now)").into(),
         Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()

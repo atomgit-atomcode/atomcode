@@ -14,15 +14,19 @@ use atomcode_kernel::tool::ToolCall;
 use support::{allow, mount_parts, turn, Turn};
 
 fn malformed_write_provider(file_path: &Path) -> Arc<MockProvider> {
+    // The path is spliced in as an already-encoded JSON string, not via
+    // `format!` on its display form: a Windows path carries backslashes, and
+    // dropping it into JSON raw turns `\\?\C:\…` into a sequence of illegal
+    // escapes — the fixture would then be testing backslash recovery rather
+    // than the trailing comma it is named for.
+    let encoded_path = serde_json::Value::String(file_path.to_string_lossy().into_owned());
     Arc::new(MockProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "write-1".into(),
                 name: "write_file".into(),
-                arguments: format!(
-                    r#"{{"file_path":"{}","content":"repaired",}}"#,
-                    file_path.display()
-                ),
+                // Deliberately malformed: a trailing comma before the brace.
+                arguments: format!(r#"{{"file_path":{encoded_path},"content":"repaired",}}"#),
             }),
             StreamEvent::Done { truncated: false },
         ],

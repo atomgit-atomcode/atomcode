@@ -1042,6 +1042,7 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    team_read_only_tools: Default::default(),
                     allowed_tools: None,
                     required_experimental_capabilities: Default::default(),
                 });
@@ -1069,6 +1070,7 @@ fn v2_mcp_server_configs(mcp_servers: &[McpServer]) -> (Vec<McpServerConfig>, Ve
                     source: McpConfigSource::Driver,
                     trust: false,
                     auto_approve: Vec::new(),
+                    team_read_only_tools: Default::default(),
                     allowed_tools: None,
                     required_experimental_capabilities: Default::default(),
                 });

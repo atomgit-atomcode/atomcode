@@ -844,7 +844,7 @@ fn with_skill_notice(output: String, events: &[LoggedEvent], names: &[String]) -
 /// start with a word — but a person reading "loaded: plan" when they asked for
 /// two can.
 ///
-/// Marked `$name` / `¥name` tokens in this leading run are explicit references:
+/// Marked `$name`, `¥name` and `￥name` tokens in this leading run are explicit references:
 /// unknown ones fail the entire preparation before anything can be queued.
 /// After ordinary task text begins, markers in prose are left alone.
 ///
@@ -861,7 +861,7 @@ fn skills_and_task<'a>(
             Some(token) => token,
             None => break,
         };
-        let explicit = token.strip_prefix('$').or_else(|| token.strip_prefix('¥'));
+        let explicit = atomcode_capabilities::skills::strip_skill_marker(token);
         let Some(name) = known(explicit.unwrap_or(token)) else {
             if let Some(name) = explicit {
                 return Err(t(Msg::CmdSkillUnknownExplicit { name }).into_owned());
@@ -1836,13 +1836,15 @@ mod tests {
             _ => None,
         };
         let (names, task) =
-            skills_and_task("$plan ¥review $plugin:plan fix  the bug", known).unwrap();
+            skills_and_task("$plan ¥review ￥plugin:plan fix  the bug", known).unwrap();
         assert_eq!(names, ["plugin:plan", "review"]);
         assert_eq!(task, "fix  the bug");
-        let error = skills_and_task("plan $typo task", known).unwrap_err();
-        assert!(error.contains("typo") && error.contains("no skills were submitted"));
-        let (_, task) = skills_and_task("plan use $HOME and $unknown", known).unwrap();
-        assert_eq!(task, "use $HOME and $unknown");
+        for args in ["plan $typo task", "plan ￥typo task"] {
+            let error = skills_and_task(args, known).unwrap_err();
+            assert!(error.contains("typo") && error.contains("no skills were submitted"));
+        }
+        let (_, task) = skills_and_task("plan use $HOME and ￥100", known).unwrap();
+        assert_eq!(task, "use $HOME and ￥100");
         assert!(skills_and_task("plan $ task", known).is_err());
     }
 

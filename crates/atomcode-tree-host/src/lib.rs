@@ -255,10 +255,12 @@ impl TreeHost {
         let Some(store) = ctx.service::<SessionPersistenceSvc>() else {
             return Ok(HostReply::Sessions {
                 sessions: Vec::new(),
+                hints: Default::default(),
             });
         };
         let failed = |message: String| HostError::Failed { message };
         let mut sessions = Vec::new();
+        let mut hints = atomcode_host_api::SessionListHints::default();
         for id in store.list().await.map_err(failed)? {
             let Some(summary) = store.describe(&id).await.map_err(failed)? else {
                 continue;
@@ -266,6 +268,7 @@ impl TreeHost {
             let header = summary.header;
             let dir = header.as_ref().and_then(|h| h.cwd.clone());
             if working_dir.is_some() && dir != working_dir {
+                hints.other_projects_have_history |= dir.is_some() && summary.turns > 0;
                 continue;
             }
             sessions.push(StoredSession {
@@ -282,7 +285,7 @@ impl TreeHost {
                     .is_some_and(|h| h.version > atomcode_harness::session::SESSION_FORMAT_VERSION),
             });
         }
-        Ok(HostReply::Sessions { sessions })
+        Ok(HostReply::Sessions { sessions, hints })
     }
 }
 
@@ -307,13 +310,38 @@ impl HostControl for TreeHost {
     async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
         match command {
             HostCommand::NewSession { session } => self.replace(&session, Opening::Fresh).await,
-            HostCommand::Resume { session, target } => {
+            HostCommand::Resume { session, target }
+            | HostCommand::ResumeAcrossProjects { session, target } => {
                 self.replace(&session, Opening::Resume(target)).await
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.set_effort(&session, level).await
             }
             HostCommand::ListSessions { working_dir } => self.list(working_dir).await,
+            HostCommand::ListTaskSessions { session } => {
+                let live = self.live.lock().await;
+                let current = live.as_ref().ok_or(HostError::Unavailable)?;
+                if current.session != session {
+                    return Err(HostError::NotFound);
+                }
+                let store = current
+                    .app
+                    .context()
+                    .service::<atomcode_harness::seams::SessionPersistenceSvc>();
+                let sessions = match store {
+                    Some(store) => store
+                        .children(&session)
+                        .await
+                        .map_err(|message| HostError::Failed { message })?
+                        .into_iter()
+                        .filter_map(|header| {
+                            atomcode_host_api::TaskSession::from_header(header, &session)
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                Ok(HostReply::TaskSessions { sessions })
+            }
             // `None`, and that is the honest answer rather than a shrug: the
             // trees this host mounts carry no execution mode at all. `modes` is
             // a host-provided seam (`atomcode_harness::seam_map::HOST_PROVIDED`)

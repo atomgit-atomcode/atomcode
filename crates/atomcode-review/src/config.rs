@@ -22,11 +22,13 @@ pub struct ReviewAgentConfig {
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
     /// Liveness: max byte-idle wait for the next stream event AFTER the first content
-    /// byte (inter-token). Default 120s.
+    /// byte (inter-token). Default: the product-wide
+    /// [`default_stream_timeout`](atomcode_capabilities::provider::default_stream_timeout) (300s).
     pub stream_timeout: Duration,
     /// Liveness: max wait for the FIRST content byte (prefill / TTFB). Separate from (and
-    /// ≥) `stream_timeout` so a slow local model is not cut off mid-prefill. Default 120s
-    /// (seeded from the coding-layer `first_token_timeout` in production).
+    /// ≥) `stream_timeout` so a slow local model is not cut off mid-prefill. Default: the
+    /// product-wide
+    /// [`default_first_token_timeout`](atomcode_capabilities::provider::default_first_token_timeout) (600s).
     pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver response before degrade-to-deny. Default 300s.
     pub request_timeout: Duration,
@@ -121,8 +123,8 @@ impl ReviewAgentConfig {
             working_dir: working_dir.into(),
             dirs,
             context_window: 128_000,
-            stream_timeout: Duration::from_secs(120),
-            first_token_timeout: Duration::from_secs(120),
+            stream_timeout: atomcode_capabilities::provider::default_stream_timeout(),
+            first_token_timeout: atomcode_capabilities::provider::default_first_token_timeout(),
             request_timeout: Duration::from_secs(300),
             persona: None,
             persona_append: None,

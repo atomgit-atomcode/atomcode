@@ -38,6 +38,7 @@ pub mod relay;
 pub mod tui_bg;
 pub mod tui_changelog;
 pub mod tui_command_meter;
+mod tui_gc;
 pub mod tui_git_auth;
 pub mod tui_grape;
 pub mod tui_login;
@@ -315,6 +316,7 @@ pub mod tui_front {
             crate::tui_opening::row_layer(),
             crate::tui_shell::row_layer(),
             crate::tui_upgrade::row_layer(),
+            crate::tui_gc::row_layer(),
             crate::tui_changelog::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
@@ -324,11 +326,20 @@ pub mod tui_front {
         ];
         let hint_root = working_dir.clone();
         let hint_dirs = dirs.clone();
-        let capabilities = tokio::task::spawn_blocking(move || {
-            crate::project_setup::startup_hint(&hint_root, &hint_dirs)
+        let sessions_root = atomcode_capabilities::session::SessionManager::sessions_root(&dirs);
+        let notice_root = sessions_root.clone();
+        let (capabilities, low_space) = tokio::task::spawn_blocking(move || {
+            (
+                crate::project_setup::startup_hint(&hint_root, &hint_dirs),
+                crate::tui_gc::low_space_notice(&notice_root),
+            )
         })
         .await
-        .unwrap_or(None);
+        .unwrap_or_default();
+        let opening_notice = match (opening_notice, low_space) {
+            (Some(notice), Some(low_space)) => Some(format!("{notice}\n{low_space}")),
+            (notice, low_space) => notice.or(low_space),
+        };
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
             Arc::new(crate::tui_providers::ProvidersRow),
@@ -358,6 +369,7 @@ pub mod tui_front {
                 capabilities,
             }),
             Arc::new(crate::tui_upgrade::UpgradeRow),
+            Arc::new(crate::tui_gc::GcRow { sessions_root }),
             Arc::new(crate::tui_changelog::ChangelogRow {
                 seen: atomcode_config::changelog::seen_path(
                     &atomcode_config::config::Config::config_dir(),
@@ -439,9 +451,9 @@ pub mod tui_front {
             selection: &str,
             key: &str,
             value: toml_edit::Item,
-        ) -> Result<(), String> {
+        ) -> Result<Option<crate::host::ConfigFingerprintChange>, String> {
             atomcode_config::store::ConfigStore::new(&self.path)
-                .update_document_with_snapshot(|document, snapshot| {
+                .update_document_with_base_revision(|document, snapshot| {
                     let section = if document
                         .get("models")
                         .and_then(|models| models.get(selection))
@@ -475,8 +487,23 @@ pub mod tui_front {
                     document[section][selection][key] = value;
                     Ok(())
                 })
-                .map(|_| ())
+                .map(|(base, commit)| base.map(|base| crate::host::ConfigFingerprintChange {
+                    before: self.fingerprint_for(Some(base)),
+                    after: self.fingerprint_for(Some(commit.snapshot.revision)),
+                }))
                 .map_err(|error| format!("{error:#}"))
+        }
+
+        fn fingerprint_for(
+            &self,
+            revision: Option<atomcode_config::store::ConfigRevision>,
+        ) -> String {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            revision.hash(&mut hasher);
+            self.provider_override.hash(&mut hasher);
+            self.skip_permissions.hash(&mut hasher);
+            format!("{:x}", hasher.finish())
         }
 
         fn resolve(&self, model: Option<&str>) -> Result<CodingAgentConfig, String> {
@@ -627,7 +654,7 @@ pub mod tui_front {
             &self,
             selection: &str,
             effort: Option<atomcode_kernel::provider::ReasoningEffort>,
-        ) -> Result<(), String> {
+        ) -> Result<Option<crate::host::ConfigFingerprintChange>, String> {
             self.persist_reasoning(
                 selection,
                 "reasoning_effort",
@@ -635,7 +662,11 @@ pub mod tui_front {
             )
         }
 
-        fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+        fn set_thinking_enabled(
+            &self,
+            selection: &str,
+            on: bool,
+        ) -> Result<Option<crate::host::ConfigFingerprintChange>, String> {
             self.persist_reasoning(selection, "thinking_enabled", toml_edit::value(on))
         }
 
@@ -758,17 +789,14 @@ pub mod tui_front {
         /// No file is its own answer — `default` is a configuration too, and it
         /// is the same one until a file appears.
         fn fingerprint(&self) -> Option<String> {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            match std::fs::read(&self.path) {
-                Ok(bytes) => bytes.hash(&mut hasher),
-                Err(_) => "no file".hash(&mut hasher),
-            }
             // What a model id resolves to also depends on what was asked for at
             // launch, which is not in the file.
-            self.provider_override.hash(&mut hasher);
-            self.skip_permissions.hash(&mut hasher);
-            Some(format!("{:x}", hasher.finish()))
+            let revision = match std::fs::read(&self.path) {
+                Ok(bytes) => Some(atomcode_config::store::ConfigRevision::from_bytes(&bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return None,
+            };
+            Some(self.fingerprint_for(revision))
         }
     }
 
@@ -839,7 +867,10 @@ model = "vendor-b"
                     document["ui"]["theme"] = toml_edit::value("light");
                     Ok(())
                 }).unwrap();
-                file.set_thinking_enabled(selection, true).unwrap();
+                let before = file.fingerprint().unwrap();
+                let change = file.set_thinking_enabled(selection, true).unwrap().unwrap();
+                assert_eq!(change.before, before);
+                assert_eq!(Some(change.after), file.fingerprint());
                 let fresh = file.for_model(selection).unwrap();
                 assert_eq!(fresh.chat_options.reasoning_effort, Some(ReasoningEffort::High));
                 assert_eq!(fresh.thinking_enabled, Some(true));

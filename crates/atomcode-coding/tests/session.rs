@@ -244,9 +244,13 @@ fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
     );
 }
 
+/// A UI joining mid-stream rebuilds what has streamed so far from the chunks;
+/// once the round's message is in, the message carries it and the chunks leave
+/// memory — the shape a resumed log always had (`docs/adr/0024` §7).
 #[test]
-fn raw_chunks_stay_in_the_log_so_a_replay_is_faithful() {
+fn raw_chunks_rebuild_the_stream_until_its_message_settles_it() {
     let log = log_with(vec![
+        SessionEvent::TurnStart { turn: 1 },
         SessionEvent::AssistantChunk {
             turn: 1,
             round: 1,
@@ -259,30 +263,36 @@ fn raw_chunks_stay_in_the_log_so_a_replay_is_faithful() {
             delta: "llo".into(),
             reasoning: false,
         },
-        SessionEvent::AssistantMessage {
-            turn: 1,
-            round: 1,
-            text: "hello".into(),
-            reasoning: String::new(),
-            tool_calls: vec![],
-            reasoning_blocks: Vec::new(),
-            meta: None,
-        },
     ]);
-    let replayed: String = log
-        .events()
-        .iter()
-        .filter_map(|e| match &e.event {
-            SessionEvent::AssistantChunk {
-                delta, reasoning, ..
-            } if !reasoning => Some(delta.clone()),
-            _ => None,
-        })
-        .collect();
+    let streamed = |log: &SessionLog| -> String {
+        log.events()
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::AssistantChunk {
+                    delta, reasoning, ..
+                } if !reasoning => Some(delta.clone()),
+                _ => None,
+            })
+            .collect()
+    };
     assert_eq!(
-        replayed, "hello",
-        "a UI can rebuild the stream, not just the result"
+        streamed(&log),
+        "hello",
+        "a UI can rebuild the stream while it runs"
     );
+
+    log.append(SessionEvent::AssistantMessage {
+        turn: 1,
+        round: 1,
+        text: "hello".into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    assert_eq!(streamed(&log), "", "a settled round keeps no chunks");
+    assert!(log.events().iter().any(|e| matches!(&e.event,
+        SessionEvent::AssistantMessage { text, .. } if text == "hello")));
 }
 
 #[test]
@@ -735,7 +745,6 @@ async fn a_turn_records_every_fact_and_folds_the_projections() {
         "TurnStart",
         "UserMessage",
         "RequestHeader",
-        "AssistantChunk",
         "AssistantMessage",
         "TurnEnd",
     ] {
@@ -744,6 +753,10 @@ async fn a_turn_records_every_fact_and_folds_the_projections() {
             "missing {expected}: {kinds:?}"
         );
     }
+    assert!(
+        !kinds.iter().any(|k| k == "AssistantChunk"),
+        "a finished turn keeps its message, not its chunks: {kinds:?}"
+    );
 
     let projections = ctx.service::<SessionProjectionsSvc>().unwrap();
     let boundary = projections.state_of("turnBoundary").unwrap();

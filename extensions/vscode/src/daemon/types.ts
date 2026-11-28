@@ -338,3 +338,19 @@ export interface ChatStreamCallbacks {
   onStopped: () => void;
   onError: (message: string) => void;
 }
+
+// CUE — AI inline completion
+export interface CueCompletionRequest {
+  file_path: string;
+  language_id: string;
+  prefix: string;
+  suffix: string;
+  provider?: string;
+}
+
+export interface CueCompletionResponse {
+  /** The text to insert at the cursor, or null when there is no suggestion. */
+  completion: string | null;
+  /** The model that answered. */
+  model: string;
+}

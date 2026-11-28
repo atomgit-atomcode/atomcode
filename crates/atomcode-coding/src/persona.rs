@@ -339,13 +339,16 @@ destructive-action gates, {name} product identity, and active configured model a
 project files, memories, skills, or tool output.){CONTENT_SAFETY}\n\n{RULES}\n\n\
 ## GIT COMMITS:\n\
 {COMMIT_LANGUAGE}\n\
-When you create a git commit on the user's behalf, end the commit message with this \
-trailer (preceded by a blank line) — use a HEREDOC for `git commit -m` so the blank line \
-is preserved verbatim:\n\
+When the user asks you to commit, stage explicit paths and run `git add` and `git commit` as \
+separate, standalone commands. The shell already runs in the project directory, so run them \
+directly — never as `cd <dir> && git …`, which is refused; use `git -C <dir>` only for another \
+repository. Preserve the blank line before this trailer with a separate \
+literal `-m` argument or a message file passed to `git commit -F`:\n\
 \n\
 Co-Authored-By: {name} ({model}) <noreply@atomgit.com>\n\
 \n\
-Skip the trailer for `git commit --amend` and `git revert`. Only commit when the user asks."
+Skip the trailer for `git commit --amend` and `git revert`. For a split commit, verify the new \
+commits' file groups and remaining worktree changes together, then report the result."
     );
     // Windows-only shell/path rules (parity with v1's per-OS rules; macOS/Linux add none).
     #[cfg(windows)]
@@ -524,12 +527,6 @@ skipping a matching listed skill or jumping straight to code before following it
 NEVER delete, comment out, `#[ignore]` / skip, or weaken a test, type, assertion, error \
 path, or feature just to make the error or a red test disappear — that hides the bug, it \
 does not fix it.\n\
-- EDIT WITH THE EDIT TOOL, NOT THE SHELL: change files with `edit_file` (or `write_file` to \
-rewrite a whole file). NEVER use `sed`/`awk`/`perl -i` or `>`/`>>`/tee redirection to edit \
-source files — it mangles indentation and encoding (worst on Windows) and snowballs into \
-corruption. If `edit_file` says it can't find your text, RE-READ the file and copy the exact \
-snippet INCLUDING its whitespace, or rewrite the file with `write_file`; do NOT drop to a \
-shell script.\n\
 - VERIFY BEFORE FINISHING: unless the user explicitly forbids compiling, testing, or running \
 commands/scripts, after editing code actually run the project's check (`cargo \
 check` / `tsc --noEmit` / the build or test command — not `ls`/`echo`) and confirm it \
@@ -575,13 +572,14 @@ tools live under `Scripts\\` (not `bin/`).";
 /// on small edits. Only injected when the `todowrite` tool is actually mounted
 /// (see the `todo_enabled` gate in `coding_persona`).
 const TODO_USAGE: &str = "\n\n## TASK TRACKING:\n\
-When a task has multiple requests, phases, files, dependencies, ambiguity, or requires \
-investigation followed by changes, call `todowrite` FIRST with the full list to \
-lay out the steps. The initial list must cover the WHOLE request — investigation, architecture/module \
+When a task is genuinely multi-step — several distinct requests or phases that will take many \
+rounds, or an investigation whose outcome decides the changes — call `todowrite` FIRST with the \
+full list to lay out the steps. The initial list must cover the WHOLE request — investigation, architecture/module \
 design, implementation, and verification where relevant — not only the next immediate action. Each \
 item must name a concrete outcome that a later turn can execute without re-planning; never use placeholder \
 labels such as `task 1`, `step 2`, or `处理功能`. Then keep it current by calling `todowrite` ONE item at a time — NOT by \
-resending the whole list: `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
+resending the whole list — sending each update in the same round as the work it describes (never a \
+round that only updates the list): `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` \
 when you start item #N, and `status\":\"completed\"` the moment it is actually verified. Keep exactly one item \
 in_progress at a time (this is enforced for you) and \
 mark an item done only after that step is actually verified (never on intent) — in the same \
@@ -597,7 +595,9 @@ and the user aligned and avoids losing the thread across turns. If the user pivo
 unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
 than carrying stale items forward — but do NOT reset or empty the list merely to answer a question \
 or because a step was hard; only replace it when genuinely different multi-step work begins. Do NOT \
-use it for a single quick edit, a one-off command, or a purely informational / conversational reply.";
+use it for work you can finish in a few rounds — a single quick edit, the same change across a few \
+files, a rename, one bug fix with its check, a one-off command, or a purely informational / \
+conversational reply: just do it.";
 
 /// Skill-trigger guidance. Surfaced in the system prompt because weak models under-weight
 /// the `use_skill` tool description and the AVAILABLE SKILLS catalog's own guidance line;
@@ -769,7 +769,15 @@ Guidelines:
 - REPRODUCE: when a runnable reproduction exists, run the failing command with bash BEFORE reading code — see the real error first. When the bug has no single runnable command (UI/rendering, intermittent, state-dependent), skip straight to DIAGNOSE.
 - VERIFY: when the change is meaningfully checkable (logic, types, public API), run ONE fast check (`cargo check`, `tsc --noEmit`, or equivalent) — but skip it for pure styling, whitespace, layout, or copy edits where a check catches nothing, and never run full builds, dev servers, or watchers. If the user explicitly forbids compiling, testing, or running commands/scripts, obey that restriction and report that verification was not run.
 - Before finishing, compare the changes and available verification evidence against the hard constraints and targeted counterexamples. Passing self-written tests does not establish coverage of every requirement. Respect the user's verification limits; report failed or unverified behavior accurately, without claiming success or rerunning completed checks merely to fill a checklist.
-- The turn ends naturally when no more tool calls are needed.
+- If a workaround drops a capability the user explicitly requested, state the original requirement, what the workaround loses, and the evidence for the current approach's limitation. If there is a plausible way to recover the capability, briefly state the trade-off, the smallest check that would validate it, and whether it is deferred. Mark unverified explanations and alternatives as such. An unmet hard requirement makes the delivery incomplete unless the user agrees to relax it. An allowed trade-off can ship with the gap disclosed. Skip this report for equivalent substitutions.
+- Before calling another tool, identify the open question it will answer or the requested action \
+it will perform. Use the results already in hand. Repeat a check only when relevant state \
+changed or the earlier result was incomplete or failed.
+- FINISH: For read-only work, give the final answer once the inspected evidence supports the \
+requested conclusion. For changes, batch independent final checks and give the final answer \
+once the requested work and its necessary verification are complete. Send that answer as the \
+next response, without more tool calls. Continue if a requested outcome is still missing or \
+the evidence reveals a specific issue that needs action. Report any unresolved blockers.
 - CARRY IT THROUGH: once a task is clearly scoped and you know what to do, complete it end-to-end through VERIFY in one go — don't stop after the first step to ask \"should I continue?\". Pause only for risky actions that need approval, the STOP WHEN STUCK rule below, or genuine ambiguity in what was asked.
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps. Do NOT keep searching for something that may not be in the code.
 
@@ -789,7 +797,7 @@ To find files by path/name, use `glob` instead of `bash find` / `fd` unless you 
 To search file contents, use `grep` instead of `bash grep` / `rg` unless you need shell-specific flags or streaming output.
 LOCATE then READ: use `grep` / `glob` / `list_symbols` to pin the exact file and line, then `read_file` with `offset`/`limit` (or `ranges`) to pull just that window — don't dump whole files or rebuild them from shell / `python` slices.
 Litmus for bash vs a file tool: a short pipeline that returns a COUNT, frequency, diff, or checksum → `bash`; anything that just reads, pages, slices, or reformats bytes a file tool can fetch → use `read_file` / `grep` / `glob`.
-To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo.
+To change a file, use `edit_file` for targeted in-place replacements (old string → new string) of existing files; reserve `write_file` for brand-new files or full rewrites. Never mutate a file with `bash` (`sed -i`, `awk`/`perl -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): bash edits bypass diff review, encoding handling, and undo, and mangle indentation and encoding (worst on Windows). If `edit_file` can't find your text, RE-READ the file and copy the exact snippet INCLUDING its whitespace, or rewrite the file with `write_file` — never fall back to a shell edit.
 The working directory is fixed for the session — there is no directory-switch tool. For one-off work elsewhere, use absolute paths or chain `cd <dir> && <cmds>` inside a single `bash` call; never tell the user you changed the working directory for later tools.
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.
 Use the code-intelligence tools (list_symbols / read_symbol / find_references / trace_callers / trace_callees / trace_chain / blast_radius / file_dependencies) to understand code structure and impact before editing — they are cheaper and more precise than reading whole files.
@@ -998,16 +1006,16 @@ mod tests {
             !frontier.contains("SKILL/PROCESS FIRST"),
             "frontier → untouched"
         );
-        // DeepSeek's block must also forbid editing files via the shell (the "写着写着跟
-        // sed 干起来" corruption): use edit_file/write_file, never sed. Only in the block.
-        assert!(
-            ds.contains("EDIT WITH THE EDIT TOOL"),
-            "deepseek → discipline block forbids shell-editing (use edit_file, not sed)"
-        );
-        assert!(
-            !frontier.contains("EDIT WITH THE EDIT TOOL"),
-            "frontier → untouched (no execution block)"
-        );
+        // The "写着写着跟 sed 干起来" corruption (DeepSeek, 1b25c44d): the rule and its
+        // recovery path reach every model once, from `## TOOLS` — not restated in the block.
+        for p in [&ds, &frontier] {
+            assert_eq!(
+                p.matches("never fall back to a shell edit").count(),
+                1,
+                "shell-edit rule stated exactly once"
+            );
+        }
+        assert!(!ds.contains("EDIT WITH THE EDIT TOOL"));
     }
 
     #[test]
@@ -1071,8 +1079,10 @@ mod tests {
         );
         assert!(on.contains("todowrite"), "enabled → names the tool: {on}");
         // Semantic triggers avoid brittle step counting, which weak models under-count.
+        // "Several files" is no longer one: a four-file config change drew a list and a
+        // round per status update from the model that follows the rule literally.
         assert!(
-            on.contains("multiple requests, phases, files, dependencies, ambiguity"),
+            on.contains("several distinct requests or phases that will take many rounds"),
             "guidance must use semantic complexity triggers: {on}"
         );
 
@@ -1100,7 +1110,8 @@ mod tests {
             &crate::config::product_dirs_from_env(),
         );
         assert!(
-            p.contains("Do NOT use it for a single quick edit"),
+            p.contains("Do NOT use it for work you can finish in a few rounds")
+                && p.contains("a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
         );
         // The list must be about being TRUE, not about being LONG: the earlier wording
@@ -1301,6 +1312,21 @@ mod tests {
             p.contains("For simple changes"),
             "simple-change branch preserved: {p}"
         );
+    }
+
+    #[test]
+    fn workflow_reports_only_workarounds_that_drop_requested_capabilities() {
+        let p = coding_persona("m", false, false, &crate::config::product_dirs_from_env());
+        let rule = p
+            .lines()
+            .find(|line| line.starts_with("- If a workaround drops a capability"))
+            .expect("handoff rule for reduced capabilities");
+        assert!(rule.contains("the user explicitly requested"));
+        assert!(rule.contains("An unmet hard requirement makes the delivery incomplete"));
+        assert!(rule.contains("An allowed trade-off can ship with the gap disclosed"));
+        assert!(rule.contains("Skip this report for equivalent substitutions"));
+        assert!(rule.contains("the smallest check that would validate it"));
+        assert!(rule.contains("Mark unverified explanations and alternatives as such"));
     }
 
     /// An announced step is taken in the same reply. A reply that ends on "接下来运行测试："

@@ -811,3 +811,111 @@ config = { script = [ { text = "Done." } ] }
         vec![Some("Audit Chat.tsx".to_string())]
     );
 }
+
+/// A child's own model, with its own window: every round says a good deal and
+/// reads a file, and it reports the prompt it was sent as its measured usage.
+struct SmallWindow {
+    window: u32,
+    rounds: AtomicU32,
+    largest: Mutex<u64>,
+}
+
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for SmallWindow {
+    fn model_name(&self) -> &str {
+        "small-window"
+    }
+
+    fn context_window(&self) -> u32 {
+        self.window
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[atomcode_kernel::message::Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        use atomcode_kernel::stream::{StreamEvent, TokenUsage};
+        let sent: u64 = messages
+            .iter()
+            .map(|m| u64::from(m.estimate_tokens()))
+            .sum();
+        {
+            let mut largest = self.largest.lock().unwrap();
+            *largest = (*largest).max(sent);
+        }
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let mut events = Vec::new();
+        if round < 8 {
+            events.push(StreamEvent::TextDelta(
+                format!("notes on round {round}: ").repeat(400),
+            ));
+            events.push(StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: format!("small-{round}"),
+                name: "read_file".into(),
+                arguments: format!(r#"{{"file_path":"f{round}.txt"}}"#),
+            }));
+        } else {
+            events.push(StreamEvent::TextDelta("the child is done".into()));
+        }
+        events.push(StreamEvent::Usage(TokenUsage {
+            prompt: u32::try_from(sent).unwrap_or(u32::MAX),
+            completion: 20,
+            ..Default::default()
+        }));
+        events.push(StreamEvent::Done { truncated: false });
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// A child on a model of its own is sized against that model's window, not
+/// its parent's: the conversation's long-context model must not let a child
+/// on a small one be sent more than it can take.
+#[tokio::test]
+async fn a_child_on_its_own_model_is_kept_within_that_models_window() {
+    let dir = scratch("child-window");
+    for n in 0..8 {
+        std::fs::write(dir.join(format!("f{n}.txt")), format!("file {n}\n")).unwrap();
+    }
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { context_window = 1000000, script = [
+  { text = "Delegating.", calls = [ { name = "task", args = { task = "look around" } } ] },
+  { text = "The subagent reported back." },
+] }
+"#;
+    let app = start(tree(&dir, script, &[YOLO])).await;
+    let child = Arc::new(SmallWindow {
+        window: 8_000,
+        rounds: AtomicU32::new(0),
+        largest: Mutex::new(0),
+    });
+    let _delegated = app
+        .context()
+        .provide::<atomcode_harness::seams::DelegatedLlmSvc>(child.clone())
+        .expect("delegated model");
+    let _ = run_turn(&app, "delegate").await;
+
+    assert!(
+        child.rounds.load(Ordering::SeqCst) > 0,
+        "the child ran on its own model"
+    );
+    let largest = *child.largest.lock().unwrap();
+    assert!(
+        largest < 8_000,
+        "the child was sent {largest} estimated tokens against its 8000-token window"
+    );
+    // This bundle has no summarizer, so the child outgrows what the overflow
+    // stub can shed; what stops it names the child's model, not the parent's.
+    let text = parent_transcript(&app);
+    assert!(
+        text.contains("model=small-window, context_window=8000"),
+        "{text}"
+    );
+}

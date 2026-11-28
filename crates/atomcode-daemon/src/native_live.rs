@@ -357,6 +357,14 @@ pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
 }
 
+pub(crate) async fn control_goal(
+    session_id: &str,
+    control_id: uuid::Uuid,
+    action: crate::live_hub::LiveGoalAction,
+) -> Result<(), HubError> {
+    hub().control_goal(session_id, control_id, action).await
+}
+
 pub async fn update_mode_bindings(
     bindings: atomcode_config::mode_models::ModeModels,
 ) -> Result<(), HubError> {

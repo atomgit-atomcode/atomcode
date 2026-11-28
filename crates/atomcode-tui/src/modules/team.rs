@@ -1089,6 +1089,7 @@ mod tests {
                 origin: InjectionOrigin::Peer {
                     from: "lead-1/scout".into(),
                     outside: false,
+                    source_turn: None,
                 },
             },
         ]);
@@ -1246,6 +1247,7 @@ mod tests {
                 origin: InjectionOrigin::Peer {
                     from: "l/lib".into(),
                     outside: false,
+                    source_turn: None,
                 },
             },
         ]);

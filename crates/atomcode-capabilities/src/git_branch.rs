@@ -16,6 +16,8 @@ fn small_text(path: &Path) -> Option<String> {
 }
 
 pub fn read(cwd: &Path) -> Option<String> {
+    // Git walks from the physical directory when entered through a symlink.
+    let cwd = cwd.canonicalize().ok()?;
     if !cwd.is_dir() {
         return None;
     }
@@ -64,10 +66,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let git = root.path().join(".git");
         std::fs::create_dir(&git).unwrap();
-        std::fs::write(git.join("HEAD"), "ref: refs/heads/release/v5.2.8\n").unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/release/v5.2.9\n").unwrap();
         let child = root.path().join("src");
         std::fs::create_dir(&child).unwrap();
-        assert_eq!(read(&child).as_deref(), Some("release/v5.2.8"));
+        assert_eq!(read(&child).as_deref(), Some("release/v5.2.9"));
         std::fs::write(git.join("HEAD"), "0123456789abcdef\n").unwrap();
         assert_eq!(read(&child), None);
         std::fs::remove_dir_all(&git).unwrap();
@@ -77,5 +79,28 @@ mod tests {
         std::fs::write(metadata.join("HEAD"), "ref: refs/heads/feature/test\n").unwrap();
         std::fs::write(&git, "gitdir: metadata\n").unwrap();
         assert_eq!(read(&child).as_deref(), Some("feature/test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_worktree_subdirectory_uses_the_target_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        let main_git = repo.path().join(".git");
+        let metadata = main_git.join("worktrees/linked");
+        let checkout = repo.path().join("linked");
+        let child = checkout.join("src");
+        std::fs::create_dir_all(&metadata).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(main_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(metadata.join("HEAD"), "ref: refs/heads/feature/linked\n").unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", metadata.display()),
+        )
+        .unwrap();
+        let alias = repo.path().join("src-link");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        assert_eq!(read(repo.path()).as_deref(), Some("main"));
+        assert_eq!(read(&alias).as_deref(), Some("feature/linked"));
     }
 }

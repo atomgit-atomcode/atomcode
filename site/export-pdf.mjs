@@ -26,16 +26,9 @@ const port = server.address().port;
 
 await page.goto(`http://127.0.0.1:${port}`, { waitUntil: 'networkidle0', timeout: 30000 });
 
-// Wait for Tailwind CDN to finish compiling
-await page.waitForFunction(() => {
-  // Check if Tailwind has injected styles by testing a known class
-  const el = document.querySelector('.bg-surface-950');
-  if (!el) return false;
-  const style = getComputedStyle(el);
-  return style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== '';
-}, { timeout: 15000 });
-
-await page.waitForFunction(() => document.fonts.ready, { timeout: 10000 });
+// The homepage styles are inline. Wait for its install tabs and fonts.
+await page.waitForSelector('#synTabs button', { timeout: 15000 });
+await page.evaluate(() => document.fonts.ready);
 await new Promise(r => setTimeout(r, 3000));
 
 // Force screen media

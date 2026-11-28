@@ -128,6 +128,20 @@ impl ArtifactStore {
         )
     }
 
+    /// Query records are readable by their own team after resume, and never
+    /// double as input grants for patch execution.
+    pub fn team_evidence(&self, lead: &str, member: &str) -> Self {
+        let mut hash = Sha256::new();
+        hash.update((lead.len() as u64).to_be_bytes());
+        hash.update(lead.as_bytes());
+        hash.update(member.as_bytes());
+        Self::new(
+            self.dir
+                .join("team-evidence")
+                .join(format!("{:x}", hash.finalize())),
+        )
+    }
+
     /// Immutable input records use full SHA-256 and a separate namespace. They
     /// cannot be fetched as ordinary model-visible output artifacts.
     pub fn put_input(&self, bytes: &[u8]) -> std::io::Result<String> {
@@ -230,7 +244,7 @@ pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated
 /// shrinks below the original.
 const PREVIEW_HEAD: usize = 32 * 1024;
 const PREVIEW_TAIL: usize = 12 * 1024;
-const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Override the spill threshold. Data-dense scenarios (financial reports,
 /// whole-market scans) truncate constantly at the 50 KB default; this lets an
