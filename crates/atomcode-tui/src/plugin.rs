@@ -1322,6 +1322,9 @@ async fn answer_prompts(
 /// the new provider. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Give slow host replies time to land beyond one polling interval.
+const ALLOWANCE_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Where a key goes while an approval or question panel waits: the panel, or —
 /// when the composer is still on screen AND holds text the person was
 /// mid-typing — the composer, so the tail of an interrupted IME composition
@@ -7052,18 +7055,20 @@ impl Tui {
             // The cheap form — the windows and nothing else. The plan behind
             // them and what has been spent are two more round trips, and
             // neither is on this row.
-            let windows = match control
-                .call(HostCommand::Usage {
+            let windows = match tokio::time::timeout(
+                ALLOWANCE_HOST_TIMEOUT,
+                control.call(HostCommand::Usage {
                     session,
                     windows_only: true,
-                })
-                .await
+                }),
+            )
+            .await
             {
-                Ok(HostReply::Usage {
+                Ok(Ok(HostReply::Usage {
                     windows,
                     unavailable: None,
                     ..
-                }) => windows,
+                })) => windows,
                 // A host that will not say leaves the row as it was. Blanking
                 // it on a failed question would read as "you are back to zero"
                 // — but the failure is remembered while it is still the
@@ -20196,8 +20201,8 @@ mod allowance_switch_tests {
             "one idle ask in flight at a time — a second would be its \
              same-generation out-of-order twin"
         );
-        // The slow reply is NOT retired: the idle ask rides the current
-        // generation, so the badge follows it however long it takes.
+        // The idle ask rides the current generation, so a reply within the
+        // host deadline can still update the badge after the throttle interval.
         let refreshed = vec![atomcode_host_api::UsageWindow {
             label: "5h".into(),
             exhausted: false,
@@ -20222,6 +20227,37 @@ mod allowance_switch_tests {
             pending.try_recv().is_ok(),
             "the in-flight marker cleared with the ask"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_unanswered_allowance_ask_releases_the_next_idle_poll() {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().unwrap() = Some(app.context());
+        tui.client.follow("lead");
+        let (commands, _received) = mpsc::unbounded_channel();
+        let (requests, mut pending) = mpsc::unbounded_channel();
+        tui.client.connect(commands, Arc::new(Meter { requests }));
+        let allowance = crate::moment::Allowance {
+            label: "5h".into(),
+            percent: 99,
+            resets_at: String::new(),
+            resets_by: None,
+        };
+        host.moment.write().unwrap().allowance = Some(allowance.clone());
+
+        tui.idle_beat();
+        let unanswered = pending.recv().await.unwrap();
+        tokio::time::advance(ALLOWANCE_HOST_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(unanswered.is_closed());
+        assert_eq!(host.moment.read().unwrap().allowance, Some(allowance));
+
+        tui.idle_beat();
+        tokio::task::yield_now().await;
+        pending.try_recv().unwrap().send(reply(vec![])).unwrap();
+        tokio::task::yield_now().await;
+        assert!(host.moment.read().unwrap().allowance.is_none());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
