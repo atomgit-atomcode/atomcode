@@ -8121,8 +8121,10 @@ impl Tui {
                         // generation as the figures mark blocks replies older
                         // than the switch while still letting post-switch
                         // pre-run replies through.
-                        self.allowance_figures_generation
-                            .store(self.allowance_generation.load(Ordering::SeqCst), Ordering::SeqCst);
+                        self.allowance_figures_generation.store(
+                            self.allowance_generation.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
                     }
                     moment.ctx_window = window;
                     moment.model = model;
@@ -8598,11 +8600,11 @@ impl Tui {
                         event,
                         AgentEvent::TurnComplete {
                             reason: atomcode_kernel::event::StopReason::Stopped,
-                        ..
-                    }
-                ),
-                false,
-            );
+                            ..
+                        }
+                    ),
+                    false,
+                );
                 // A summary the turn outlived would leave 正在压缩 up on an idle
                 // screen. An interrupted one arrives as a said line rather than
                 // as `Compacted`/`CompactionFailed`, so the turn's own end is
