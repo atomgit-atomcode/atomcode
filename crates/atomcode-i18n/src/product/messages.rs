@@ -720,6 +720,36 @@ pub enum Msg<'a> {
     SessionDeleteFailed {
         error: &'a str,
     },
+    HarnessJournalTooLarge {
+        max_bytes: u64,
+        max_mib: u64,
+    },
+    HarnessJournalExpectedFile,
+    HarnessJournalExpectedDirectory,
+    HarnessJournalChangedBeforeAppend,
+    HarnessJournalRollbackFailed {
+        error: &'a str,
+        rollback: &'a str,
+    },
+    HarnessJournalInUse,
+    HarnessJournalNativeConflict,
+    HarnessJournalUnknownOwner,
+    HarnessJournalLegacyConflict,
+    SessionStoreDeleteUnsupported,
+    HarnessJournalWriteStopped {
+        error: &'a str,
+    },
+    HarnessJournalWriterStartFailed {
+        error: &'a str,
+    },
+    HarnessJournalWriterTerminated,
+    HarnessJournalNewerFormat {
+        version: u32,
+        supported: u32,
+    },
+    HarnessJournalInvalidHeader {
+        error: &'a str,
+    },
     SessionNoneSelected,
     /// Persistent footer hint in the `/resume` picker advertising the key
     /// actions (open / delete / search) so they're discoverable.

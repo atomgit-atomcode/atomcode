@@ -2019,12 +2019,27 @@ impl Host {
             .is_some_and(|rect| rect.h == 1 && rect.contains(x, y))
     }
 
+    /// A press on the task list. Folded, any of its rows opens it — the
+    /// header that says `点击展开`, an item, and the `+N 更多` row, which is the
+    /// one that most says there is more to see and was the one that did
+    /// nothing. Open, only the header folds it again: the rows under it are
+    /// what the wheel scrolls, and a press while reading one should not take
+    /// the list away. The margin above the header is not the panel.
     pub fn toggle_todo_at(&self, x: u16, y: u16) -> bool {
-        let rect = self.hits.lock().expect("hits poisoned").todo;
-        if !rect.is_some_and(|rect| rect.contains(x, y) && y == rect.y + u16::from(rect.h >= 2)) {
+        let Some(rect) = self.hits.lock().expect("hits poisoned").todo else {
+            return false;
+        };
+        let header = rect.y + u16::from(rect.h >= 2);
+        let mut moment = self.moment.write().expect("moment poisoned");
+        let hit = rect.contains(x, y)
+            && if moment.todo_expanded {
+                y == header
+            } else {
+                y >= header
+            };
+        if !hit {
             return false;
         }
-        let mut moment = self.moment.write().expect("moment poisoned");
         moment.todo_expanded = !moment.todo_expanded;
         moment.todo_offset = 0;
         true
@@ -2351,11 +2366,6 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb_logged(&self, logged: &LoggedEvent) {
-        self.absorb_logged_with_members(logged, 0);
-    }
-
-    /// Live-only context, captured before immutable transcript blocks are emitted.
-    pub fn absorb_logged_with_members(&self, logged: &LoggedEvent, members_working: usize) {
         let fact = &logged.event;
         {
             let mut m = self.moment.write().expect("moment poisoned");
@@ -2433,7 +2443,7 @@ impl Host {
         // result landing on that lid can still change how many rows the lid
         // draws, since it carries the result (`summary_lines`).
         self.pinned(true, || {
-            self.fold(logged, members_working);
+            self.fold(logged);
         });
     }
 
@@ -2442,7 +2452,7 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, logged: &LoggedEvent, members_working: usize) {
+    fn fold(&self, logged: &LoggedEvent) {
         let fact = &logged.event;
         // What this fold appended, as the blocks themselves: a fact may open
         // several at once (one per tool call in a message), and each of them is a
@@ -2454,10 +2464,7 @@ impl Host {
             let before = stream.len();
             let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream
-                    .writer(p.id())
-                    .in_dir(dir.clone())
-                    .with_members_working(members_working);
+                let mut w = stream.writer(p.id()).in_dir(dir.clone());
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -11428,6 +11435,23 @@ mod tests {
         assert!(!h.todo_wheel(3, 6, 1));
     }
 
+    /// Folded, the `+N 更多` row (and any item) opens the list; open, a press on
+    /// an item is not a fold — only the header folds it.
+    #[test]
+    fn the_more_row_opens_the_folded_todo_list() {
+        let h = host_with_real_todo();
+        h.hits.lock().unwrap().todo = Some(Rect::new(2, 3, 60, 6));
+        // Margin at 3, header at 4, three items at 5..=7, `+N 更多` at 8.
+        assert!(h.toggle_todo_at(3, 8), "the more row opens it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(!h.toggle_todo_at(3, 6), "an item does not fold it");
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 4), "the header does");
+        assert!(!h.moment.read().unwrap().todo_expanded);
+        assert!(h.toggle_todo_at(3, 6), "folded, an item opens it too");
+        assert!(!h.toggle_todo_at(3, 3), "the margin is not the panel");
+    }
+
     fn host_with_real_todo() -> Host {
         let mods = Arc::new(Modules::new());
         mods.add_producer(transcript::Transcript::new()).unwrap();
@@ -14168,22 +14192,38 @@ mod tests {
     }
 
     #[test]
-    fn live_turn_end_captures_member_work_without_rewriting_history() {
+    fn a_clean_turn_ends_normally_while_the_live_line_waits_for_members() {
         use crate::block::RenderCtx;
         use crate::i18n::{t, Msg};
+        use crate::modules::live;
         let h = host();
-        h.absorb(&SessionEvent::TurnStart { turn: 1 });
-        let end = LoggedEvent {
-            seq: 2,
-            at: 0,
-            event: SessionEvent::TurnEnd {
-                turn: 1,
-                stop: atomcode_harness::seams::StopReason::Stopped,
-                error: None,
-            },
+        h.modules
+            .add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        {
+            let mut moment = h.moment.write().unwrap();
+            moment.lead = "lead".into();
+            moment.viewing = "lead".into();
+            moment.model = "test-model".into();
+            moment.members = vec![crate::moment::MemberNow {
+                activity: crate::moment::Activity::Working,
+                session: "lead/member".into(),
+                ..Default::default()
+            }];
+        }
+        let finish = |h: &Host| {
+            h.absorb(&SessionEvent::TurnStart { turn: 1 });
+            h.absorb_logged(&LoggedEvent {
+                seq: 2,
+                at: 0,
+                event: SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: atomcode_harness::seams::StopReason::Stopped,
+                    error: None,
+                },
+            });
         };
-        h.absorb_logged_with_members(&end, 2);
-        let endings = |h: &Host| -> Vec<String> {
+        let endings = |h: &Host| {
             h.stream
                 .read()
                 .unwrap()
@@ -14191,35 +14231,29 @@ mod tests {
                 .iter()
                 .filter(|slot| slot.block().kind() == "turn_end")
                 .flat_map(|slot| slot.block().content.lines(&RenderCtx::bare(160)))
-                .map(|line| line.plain())
-                .collect()
+                .collect::<Vec<_>>()
         };
-        let captured = endings(&h);
-        let expected = t(Msg::StopWithMembersRunning { n: 2 }).into_owned();
-        assert!(
-            captured.iter().any(|line| line.contains(&expected)),
-            "{captured:?}"
-        );
-        h.moment.write().unwrap().members.clear();
-        assert_eq!(endings(&h), captured, "settled history retains its meaning");
+        finish(&h);
         let replay = host();
-        replay.absorb(&SessionEvent::TurnStart { turn: 1 });
-        replay.absorb_logged(&end);
-        assert!(!endings(&replay).iter().any(|line| line.contains(&expected)));
-        let failed = host();
-        failed.absorb(&SessionEvent::TurnStart { turn: 1 });
-        failed.absorb_logged_with_members(
-            &LoggedEvent {
-                event: SessionEvent::TurnEnd {
-                    turn: 1,
-                    stop: atomcode_harness::seams::StopReason::ProviderError,
-                    error: Some("failure".into()),
-                },
-                ..end
-            },
-            2,
+        finish(&replay);
+        let ending = endings(&h);
+        assert_eq!(
+            ending,
+            endings(&replay),
+            "same text and style as an ordinary turn"
         );
-        assert!(!endings(&failed).iter().any(|line| line.contains(&expected)));
+        assert!(ending.iter().any(|line| line.plain().contains("✻ Done")));
+
+        let frame = h.compose((160, 24));
+        let waiting = t(Msg::LiveWaitingForMember { n: 1 });
+        let shows_waiting = |line: &Line| line.plain().contains(waiting.as_ref());
+        assert!(frame.part("live").unwrap().lines.iter().any(shows_waiting));
+        assert!(!frame
+            .part("status")
+            .unwrap()
+            .lines
+            .iter()
+            .any(shows_waiting));
     }
 
     #[test]

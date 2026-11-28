@@ -26,9 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_kernel::message::{
-    CompactTrigger, CompactionStrategy, CompactionView, Conversation, Message, Role,
-};
+use atomcode_kernel::message::{CompactTrigger, CompactionStrategy, CompactionView, Message, Role};
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_plexus::{Context, Plugin};
@@ -299,9 +297,15 @@ impl StrategyView {
         let (summaries, rest): (Vec<_>, Vec<_>) = traced
             .into_iter()
             .partition(|t| matches!(t.source, Provenance::Summary(_)));
-        let first = rest
-            .iter()
-            .position(|t| t.message.role == Role::User && !t.message.synthetic)?;
+        // The first request is the person's — or, in a team member's log, the
+        // lead's first delegation: another agent's message, projected as a
+        // note, but the work this conversation is for. Whichever came first: a
+        // person speaking to a member later must not protect all before it.
+        let first = rest.iter().position(|t| {
+            t.message.role == Role::User
+                && (!t.message.synthetic
+                    || matches!(t.source, Provenance::Derived(seq) if is_peer(events, seq)))
+        })?;
         let mut ordered = Vec::with_capacity(rest.len() + summaries.len());
         let mut rest = rest.into_iter();
         ordered.extend(rest.by_ref().take(first + 1));
@@ -312,11 +316,9 @@ impl StrategyView {
         ordered.extend(rest);
         let (messages, sources): (Vec<_>, Vec<_>) =
             ordered.into_iter().map(|t| (t.message, t.source)).unzip();
-        let floor = Conversation {
-            messages: messages.clone(),
-            cache_epoch: 0,
-        }
-        .sacred_floor();
+        // Through the first request — what `Conversation::sacred_floor` keeps,
+        // for a request it would not count as one too.
+        let floor = first + 1;
         Some(Self {
             messages,
             sources,
@@ -340,6 +342,21 @@ impl StrategyView {
             parent: self.parent.clone(),
         }
     }
+}
+
+/// Whether the fact at `seq` is another agent's message.
+fn is_peer(events: &[LoggedEvent], seq: crate::session::SeqNo) -> bool {
+    events
+        .binary_search_by_key(&seq, |logged| logged.seq)
+        .is_ok_and(|index| {
+            matches!(
+                events[index].event,
+                SessionEvent::Injected {
+                    origin: atomcode_kernel::session::InjectionOrigin::Peer { .. },
+                    ..
+                }
+            )
+        })
 }
 
 /// Whether `strategy` would write a summary for this ask — the slow path.
@@ -395,6 +412,14 @@ pub async fn attempt_with_sent_prompt(
     let events = log.events();
     let sent = provider.and_then(|provider| log.sent_prompt(provider));
     let Some(view) = StrategyView::of(&events, sent) else {
+        // Nothing in the log reads as a request to keep at the head, so no
+        // strategy can be shown the conversation. Said, because it looks
+        // exactly like a conversation with nothing to compact.
+        tracing::warn!(
+            session_id = log.id(),
+            events = events.len(),
+            "compaction skipped: no request to keep at the head of the conversation"
+        );
         return CompactionAttempt::default();
     };
     let plan = strategy.plan(&view.kernel_view(ask)).await;

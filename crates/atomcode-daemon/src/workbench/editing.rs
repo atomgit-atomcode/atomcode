@@ -1812,7 +1812,7 @@ mod tests {
     #[test]
     fn branch_names_cannot_become_git_options() {
         assert!(safe_ref_name("feat/git-panel"));
-        assert!(safe_ref_name("v5.2.8"));
+        assert!(safe_ref_name("v5.2.9"));
         assert!(!safe_ref_name(""));
         assert!(!safe_ref_name("-D"));
         assert!(!safe_ref_name("--force"));

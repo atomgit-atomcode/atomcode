@@ -2046,17 +2046,20 @@ async fn resume_tab_browses_other_projects_before_enter_switches_the_runtime() {
     let rig = Rig::new().await;
     let (project, target) = a_foreign_project_session().await;
     let live = rig.client.root();
+    // Its name is the untouched placeholder, so the picker row reads its first
+    // prompt, not `session-<id>`.
+    let row = "FOREIGN PROJECT HISTORY";
     rig.term.type_line("/resume");
     rig.until_screen("Tab").await;
-    assert!(!rig.term.text().contains(target));
+    assert!(!rig.term.text().contains(row));
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen(target).await;
+    rig.until_screen(row).await;
     assert_eq!(rig.client.root(), live);
 
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen_lacks(target).await;
+    rig.until_screen_lacks(row).await;
     rig.term.press(KeyPress::plain(Key::Tab));
-    rig.until_screen(target).await;
+    rig.until_screen(row).await;
     rig.term.press(KeyPress::plain(Key::Enter));
     rig.until("the global selection is foreground", |rig| {
         rig.client.root() == target
@@ -2609,11 +2612,18 @@ async fn taking_the_review_row_leaves_it_on_the_line() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(atomcode_home)]
 async fn a_finished_background_run_delivers_its_answer_home() {
+    use atomcode_capabilities::session::manager::SessionOrigin;
+
     let rig = Rig::new().await;
     rig.term.type_line("/background quiet job");
     rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
     let list = rig.background().await;
     assert_eq!(list.len(), 1, "{list:#?}");
+    let task = &list[0].session;
+    let store = atomcode_capabilities::session::SessionManager::for_project(
+        rig.project.path(),
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
 
     // It arrives folded to its one line — the report (`answer 1`) waits behind
     // a click, because the conversation that started it answers right under it
@@ -2626,6 +2636,11 @@ async fn a_finished_background_run_delivers_its_answer_home() {
         rig.term.text().contains("answer 2")
     })
     .await;
+    assert_eq!(
+        store.read_meta(task).unwrap().origin,
+        SessionOrigin::Delegated,
+        "the committed report settled before the home answered it"
+    );
     assert!(
         !rig.term.text().contains("answer 1"),
         "the report is folded, not printed a second time:\n{}",

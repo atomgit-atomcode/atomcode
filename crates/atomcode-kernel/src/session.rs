@@ -688,6 +688,12 @@ pub struct SessionHeader {
     /// role as it is defined then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberHeader>,
+    /// A one-line description of what a delegated child was asked to do — the
+    /// task's own short label, cut to listing width. Only a delegated child
+    /// carries one; its session's first user message is the task, but the
+    /// header is what a picker reads, one line per file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// What a team member was created with.
@@ -725,6 +731,7 @@ impl SessionHeader {
             inherited: 0,
             context: None,
             member: None,
+            label: None,
         }
     }
 }
@@ -1430,6 +1437,23 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                     }
                 };
                 message.synthetic = true;
+                // A team member's first request is its lead's delegation. Kept
+                // under a summary it is history, exactly as a person's first
+                // request is, and says so: unframed, the member reads the task
+                // it already worked on as a fresh instruction.
+                if matches!(origin, InjectionOrigin::Peer { .. })
+                    && folded.iter().any(|(from, _)| *from > 0 && seq <= *from)
+                {
+                    message.internal_origin =
+                        Some(crate::message::COMPACTION_RETAINED_ORIGIN.into());
+                    if !with_meta {
+                        message.internal_origin =
+                            Some(crate::message::COMPACTION_RETAINED_MODEL_ORIGIN.into());
+                        message
+                            .text
+                            .insert_str(0, crate::message::COMPACTION_RETAINED_FRAMING);
+                    }
+                }
                 let source = match origin {
                     InjectionOrigin::CompactionSummary => Provenance::Summary(seq),
                     _ => Provenance::Derived(seq),

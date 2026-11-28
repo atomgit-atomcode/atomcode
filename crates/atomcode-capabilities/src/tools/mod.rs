@@ -356,7 +356,7 @@ pub(crate) fn file_target_arg_values(args: &str) -> Vec<String> {
 /// trust-model note). `~` expansion (via the crate-shared [`crate::pathutil`], so
 /// `tools` and `codeintel` agree) gives parity with the shell the `bash` tool relies
 /// on — fixing `read_file("~/.atomcode/x")` resolving to the broken `<cwd>/~/…`.
-pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+pub fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
     if let Some(home) = crate::pathutil::expand_tilde(raw) {
         return home;
     }

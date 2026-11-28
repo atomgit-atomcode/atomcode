@@ -72,6 +72,8 @@ struct Role {
     when: String,
     /// An explicit tool list, instead of the permission's default set.
     tools: Option<Vec<String>>,
+    denied_tools: Vec<String>,
+    allowed_mcp_servers: Option<Vec<String>>,
     /// A selection id this role should run on, overriding `difficulty`.
     ///
     /// `difficulty` says "cheap or the conversation's", which is all a generic
@@ -112,6 +114,8 @@ fn built_in(
         persona: persona.into(),
         when: when.into(),
         tools: None,
+        denied_tools: Vec::new(),
+        allowed_mcp_servers: None,
         // Built-in roles name no model: which models exist is a fact about the
         // deployment, and a shipped default naming one would be wrong everywhere
         // but where it was written.
@@ -323,6 +327,8 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     let mut difficulty_said = false;
     let mut when = String::new();
     let mut tools: Option<Vec<String>> = None;
+    let mut denied_tools = None;
+    let mut allowed_mcp_servers = None;
     let mut model = None;
     let mut body = String::new();
     let mut in_front = true;
@@ -377,15 +383,30 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
                 // file is read at mount. An id that is not on offer fails at
                 // `delegate`, with the list of what is.
                 "model" => model = Some(value.to_string()).filter(|m: &String| !m.is_empty()),
-                "tools" => {
-                    tools = Some(
-                        value
-                            .trim_matches(|c| c == '[' || c == ']')
-                            .split(',')
-                            .map(|t| t.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
-                            .filter(|t| !t.is_empty())
-                            .collect(),
-                    )
+                key @ ("tools" | "allowed_tools" | "denied_tools" | "allowed_mcp_servers") => {
+                    let slot = match key {
+                        "denied_tools" => &mut denied_tools,
+                        "allowed_mcp_servers" => &mut allowed_mcp_servers,
+                        _ => &mut tools,
+                    };
+                    if slot.is_some() {
+                        problems.push(format!(
+                            "duplicate `{key}` list (tools and allowed_tools are aliases)"
+                        ));
+                    } else if key != "tools" && !(value.starts_with('[') && value.ends_with(']')) {
+                        problems.push(format!("`{key}` must be an inline list, such as []"));
+                    } else {
+                        *slot = Some(
+                            value
+                                .trim_matches(|c| c == '[' || c == ']')
+                                .split(',')
+                                .map(|t| {
+                                    t.trim().trim_matches(|c| c == '"' || c == '\'').to_string()
+                                })
+                                .filter(|t| !t.is_empty())
+                                .collect(),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -446,6 +467,8 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
         persona,
         when,
         tools,
+        denied_tools: denied_tools.unwrap_or_default(),
+        allowed_mcp_servers,
         model,
         from_project: false,
         effort,
@@ -584,10 +607,31 @@ fn default_tools(permission: Permission) -> Vec<String> {
 }
 
 fn tools_for(role: &Role) -> Vec<String> {
-    match &role.tools {
+    let mut tools = match &role.tools {
         Some(explicit) => explicit.clone(),
         None => default_tools(role.permission),
+    };
+    tools.retain(|tool| {
+        !role.denied_tools.contains(tool)
+            && !(role.allowed_mcp_servers.is_some() && query::is_query_name(tool))
+    });
+    tools
+}
+
+fn auto_model(models: &dyn crate::seams::Models, difficulty: Difficulty) -> Option<String> {
+    let current = models.current()?;
+    let ranked: Vec<_> = crate::seams::delegatable(models)
+        .into_iter()
+        .filter(|model| model.capable_rank.is_some())
+        .collect();
+    if ranked.len() < 2 || !ranked.iter().any(|model| model.id == current) {
+        return None;
     }
+    let selected = match difficulty {
+        Difficulty::Simple => ranked.first(),
+        Difficulty::Hard => ranked.last(),
+    }?;
+    Some(selected.id.clone())
 }
 
 // ---- the members ----------------------------------------------------------
@@ -595,6 +639,12 @@ fn tools_for(role: &Role) -> Vec<String> {
 #[derive(Default)]
 struct ReportReceipt {
     sent: bool,
+    /// The last thing told was only progress: the turn ending after it is the
+    /// member going idle with the task unreported, which the lead must hear.
+    progress: bool,
+    /// The last thing told was a final report (`kind: "done"`, the default) —
+    /// not progress, not blocked.
+    done: bool,
     note_key: Option<String>,
 }
 
@@ -633,6 +683,12 @@ struct Member {
     /// has undone takes its members with it; a member brought back by a resume
     /// has none.
     delegated_in: Option<u64>,
+    /// When it ended a turn on a final report and went idle; cleared when the
+    /// lead tells it more. A full team makes room by stopping the member that
+    /// has been finished longest (`TeamTool::make_room`). `None` for a member
+    /// still working, one that stopped without reporting done, or one brought
+    /// back by a resume — none of those is known to be finished.
+    done_since: Mutex<Option<std::time::Instant>>,
     /// Its pump. Dropped with the member, which stops the pump and any turn
     /// it is running.
     _driven: super::handle::Driven,
@@ -769,13 +825,21 @@ impl Tool for TellParent {
     }
     fn description(&self) -> &str {
         "Send a message to the lead agent that delegated to you: a progress note, a question, \
-         or your final report. The lead is the only agent you can address."
+         or your final report. The lead is the only agent you can address, and `text` is all \
+         it receives: your other replies never reach it, so put everything it needs — \
+         results, findings, content to deliver — in `text`. A progress note does not end \
+         your task: keep working after it."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "What to tell the lead" }
+                "text": { "type": "string", "description": "What to tell the lead" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["progress", "done", "blocked"],
+                    "description": "`progress` for a note on the way, after which you keep working; `done` for your final report (the default); `blocked` when you cannot go on without the lead."
+                }
             },
             "required": ["text"]
         })
@@ -787,9 +851,18 @@ impl Tool for TellParent {
         #[derive(Deserialize)]
         struct Args {
             text: String,
+            #[serde(default)]
+            kind: Option<String>,
         }
-        let text = match serde_json::from_str::<Args>(args) {
-            Ok(a) => a.text,
+        let (text, progress, done) = match serde_json::from_str::<Args>(args) {
+            Ok(a) => {
+                let kind = a.kind.as_deref();
+                (
+                    a.text,
+                    kind == Some("progress"),
+                    matches!(kind, None | Some("done")),
+                )
+            }
             Err(e) => return fail(format!("invalid arguments: {e}")),
         };
         let Some(lead) = self.agents.get(self.lead) else {
@@ -797,10 +870,27 @@ impl Tool for TellParent {
         };
         let member = self.agents.get(self.me);
         let note = member.as_ref().and_then(|m| report_note(m, &lead));
-        let mut report = format!("[{}] {text}", self.name);
+        let mut report = if progress {
+            format!("[{}] (progress) {text}", self.name)
+        } else {
+            format!("[{}] {text}", self.name)
+        };
+        // The lead's prompt already says to stop a member whose work is done;
+        // leads act on the report in front of them and skip it, so the report
+        // says it too. A finished member left idle keeps a team place and its
+        // row in the panel.
+        if done {
+            report.push_str(&format!(
+                "\n\n({} reports its task done. Once you have checked it and need nothing more \
+                 from it, `stop` it.)",
+                self.name
+            ));
+        }
         {
             let mut receipt = self.told.lock().expect("told poisoned");
             receipt.sent = true;
+            receipt.progress = progress;
+            receipt.done = done;
             if let Some(note) = note.filter(|n| Some(&n.key) != receipt.note_key.as_ref()) {
                 append_report_note(&mut report, Some(&note));
                 receipt.note_key = Some(note.key);
@@ -992,6 +1082,9 @@ impl TeamTool {
                  relative to the workspace (for example `src/auth/**`)"
             ));
         }
+        let made_room = self
+            .make_room(lead, &lead_session, &name, args.to.as_deref())
+            .await?;
         let peer_target = {
             let all = self.members.by_lead.lock().expect("members poisoned");
             let mine = all.get(&lead_session);
@@ -1013,9 +1106,11 @@ impl TeamTool {
                     })
                     .unwrap_or_default();
                 return Err(format!(
-                    "the team is full ({} members: {names}). A member keeps its place until \
-                     stopped, idle or not — places never free up on their own. Use `status` to \
-                     see which are idle, `stop` one whose work is done, then delegate again.",
+                    "the team is full ({} members: {names}), and none is idle on a finished \
+                     task, which a new delegation would stop to make room. A member that is \
+                     working, or stopped without reporting done, keeps its place until you \
+                     stop it. Use `status` to see which are idle, `stop` one whose work is \
+                     done, then delegate again.",
                     self.max_members
                 ));
             }
@@ -1088,26 +1183,29 @@ impl TeamTool {
             vec!["**".to_string()]
         };
 
-        // A writing member gets a checkout of its own, so two members never
-        // edit the same tree and the lead merges branches, not diffs.
-        let worktree = if self.worktrees && role.permission == Permission::Worker {
-            Some(self.make_worktree(lead, &name).await?)
-        } else {
-            None
-        };
         // `args.model` the model produced this turn; `role.model` a person wrote
         // into their own `agents/<role>.md` before the run and is theirs to point
         // wherever they like — including at their own second account. A role that
         // came with the project is held to what the model may pick.
-        let (named, chose) = match args
+        let requested_model = args
             .model
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
+            .filter(|m| !m.is_empty());
+        if let Some(mode @ ("inherit" | "auto")) = role.model.as_deref() {
+            if requested_model.is_some() {
+                return Err(format!(
+                    "Role `{}` uses model: {mode}; omit the delegation model override.",
+                    role.id
+                ));
+            }
+        }
+        let (named, chose) = match requested_model {
             Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
             None => (
-                role.model.clone(),
+                role.model
+                    .clone()
+                    .filter(|model| !matches!(model.as_str(), "inherit" | "auto")),
                 if role.from_project {
                     crate::seams::Chose::Model
                 } else {
@@ -1121,6 +1219,11 @@ impl TeamTool {
             .map(str::trim)
             .filter(|e| !e.is_empty())
             .map(str::to_string);
+        let worktree = if self.worktrees && role.permission == Permission::Worker {
+            Some(self.make_worktree(lead, &name).await?)
+        } else {
+            None
+        };
         let follow_up = if self.headless_wait {
             "Use `wait` with a bounded timeout when you need its result before this one-shot run ends."
         } else {
@@ -1130,8 +1233,24 @@ impl TeamTool {
             .as_ref()
             .map(|(to, _)| format!(" It can hand off directly to `{to}` from its first turn."))
             .unwrap_or_default();
+        // Said now, while the lead can still pick another role: a read-only
+        // member handed writing finds out only after reading the whole task.
+        let read_only = if role.permission == Permission::Explore {
+            " — read-only: it cannot create or edit files"
+        } else {
+            ""
+        };
+        // The member stopped to seat this one, said where the lead reads it.
+        let made_room = made_room
+            .map(|old| {
+                format!(
+                    " The team was full, so `{old}` — idle since it reported its task done, \
+                     the longest of those — was stopped to make room."
+                )
+            })
+            .unwrap_or_default();
         let report = format!(
-            "delegated to `{name}` ({}{}){}.{direct_handoff} It will report through `tell_parent`. {follow_up}",
+            "delegated to `{name}` ({}{}{read_only}){}.{direct_handoff}{made_room} It will report through `tell_parent`. {follow_up}",
             role.id,
             match &named {
                 Some(model) => format!(" on {model}"),
@@ -1309,7 +1428,30 @@ impl TeamTool {
             .service::<ToolsSvc>()
             .ok_or("the lead has no tool catalog")?;
         let restricted = Arc::new(ToolBox::new());
-        for tool_name in tools_for(&role) {
+        let mut tool_names = tools_for(&role);
+        if let (Some(servers), Some(registry)) = (
+            &role.allowed_mcp_servers,
+            lead.ctx().service::<crate::seams::McpSvc>(),
+        ) {
+            let listed_queries = role
+                .tools
+                .iter()
+                .flatten()
+                .any(|name| query::is_query_name(name));
+            tool_names.extend(
+                registry
+                    .team_query_aliases(&role.id, servers)
+                    .into_iter()
+                    .filter(|name| {
+                        (!listed_queries
+                            || role.tools.iter().flatten().any(|listed| listed == name))
+                            && !role.denied_tools.contains(name)
+                            && parent_tools.get(name).is_some()
+                    }),
+            );
+        }
+        let has_queries = tool_names.iter().any(|name| query::is_query_name(name));
+        for tool_name in tool_names {
             if query::is_query_name(&tool_name) {
                 let registry = lead
                     .ctx()
@@ -1327,6 +1469,7 @@ impl TeamTool {
                         .unwrap_or_else(|| format!("Read-only query {tool_name}")),
                     name: tool_name,
                     role: role.id.clone(),
+                    allowed_servers: role.allowed_mcp_servers.clone(),
                     member: name.clone(),
                     registry,
                     catalog: Arc::downgrade(&parent_tools),
@@ -1343,8 +1486,10 @@ impl TeamTool {
             0,
             format!(
                 "{}\n\nYou are `{name}`, a {} on a team. The lead delegated this to you. Use \
-                 `tell_parent` for questions and progress, and call it with a compact report \
-                 when you are done. The lead does not see your full activity. If required work is \
+                 `tell_parent` for questions and progress (`kind: \"progress\"`, then keep working: \
+                 a progress note does not end your task), and call it with a compact report \
+                 when you are done. The lead does not see your full activity: only what you pass \
+                 to `tell_parent` reaches it, never your other replies. If required work is \
                  outside your write scope, blocked, or left undone, report non-sensitive affected paths, \
                  reason and remaining work with `tell_parent`; do not silently skip it or assume \
                  another member will handle it. Your scope is a permission boundary, not proof \
@@ -1373,28 +1518,52 @@ impl TeamTool {
         // to the next rule: silently demoting a member the person asked to run on
         // a specific model is the failure nobody would see. The effort is
         // validated against the model it will actually run on.
+        let models = self.ctx.service::<crate::seams::ModelsSvc>();
+        let auto = if named.is_none() && role.model.as_deref() == Some("auto") {
+            models
+                .as_ref()
+                .and_then(|models| auto_model(models.as_ref(), role.difficulty))
+        } else {
+            None
+        };
+        let selected = named.as_deref().or(auto.as_deref());
         let effort_override = super::subagent::resolve_child_effort(
-            self.ctx.service::<crate::seams::ModelsSvc>().as_ref(),
-            named.as_deref(),
+            models.as_ref(),
+            selected,
             asked_effort.as_deref(),
         )?;
-        let chosen =
-            super::subagent::resolve_child_model(&self.ctx, named.as_deref(), chose).await?;
-        let utility = match (chosen, role.difficulty) {
-            (Some(model), _) => Some(model),
-            (None, Difficulty::Simple) => self.ctx.service::<LlmUtilitySvc>(),
+        let chosen = super::subagent::resolve_child_model(
+            &self.ctx,
+            selected,
+            if auto.is_some() {
+                crate::seams::Chose::Model
+            } else {
+                chose
+            },
+        )
+        .await?;
+        let utility = match (chosen, role.difficulty, role.model.as_deref()) {
+            (Some(model), _, _) => Some(model),
+            (None, Difficulty::Simple, None) => self.ctx.service::<LlmUtilitySvc>(),
             // The conversation's model — as the host's delegated provider when
             // it keeps a member's spend apart, else inherited by lookup.
-            (None, Difficulty::Hard) => self.ctx.service::<crate::seams::DelegatedLlmSvc>(),
+            (None, _, _) => self.ctx.service::<crate::seams::DelegatedLlmSvc>(),
         };
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
         let role_effort = effort_override.or(role.effort);
-        if tools_for(&role)
-            .iter()
-            .any(|name| query::is_query_name(name))
-        {
+        if has_queries {
             prompts.contribute("team-query-evidence", 0, "Include the Team evidence reference in your report so the lead can inspect the original query and result.".to_owned());
+        }
+        if role.permission == Permission::Explore {
+            prompts.contribute(
+                "team-read-only",
+                0,
+                "You cannot create or edit files. If your task asks you to write anything, \
+                 tell the lead at once with `tell_parent` (`kind: \"blocked\"`) before doing \
+                 the rest, rather than after."
+                    .to_owned(),
+            );
         }
         let member_id = format!("{lead_session}/{name}");
         let member_session = member_id.clone();
@@ -1536,6 +1705,7 @@ impl TeamTool {
                     last_write_refusal_turn: None,
                     scope,
                     delegated_in: (!resuming).then(|| lead.session().current_turn()),
+                    done_since: Mutex::new(None),
                     _driven: driven,
                 },
             );
@@ -1604,6 +1774,52 @@ impl TeamTool {
         }
     }
 
+    /// A full team makes room for `name` by stopping the member that has been
+    /// idle on a final report the longest. Only such a member: one still
+    /// working, one that stopped without reporting done (its task may be
+    /// unfinished) or one handing off to the new member (`to`) is never taken,
+    /// and with none of those the delegation is refused as full, as before.
+    /// Stopping is the lead's own `stop`, so its log ends saying it was stopped.
+    ///
+    /// Not a timer: an idle member costs no model calls, only a place, and
+    /// stopping it on a clock would throw away context the lead may still
+    /// `tell` more to. The place is taken back when it is needed.
+    async fn make_room(
+        &self,
+        lead: &Arc<Agent>,
+        lead_session: &str,
+        name: &str,
+        to: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let oldest = {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            let Some(mine) = all.get(lead_session) else {
+                return Ok(None);
+            };
+            // A name already taken is refused as such, not seated by evicting.
+            if mine.len() < self.max_members || mine.contains_key(name) {
+                return Ok(None);
+            }
+            mine.iter()
+                .filter(|(member, m)| {
+                    !m.stopping
+                        && Some(member.as_str()) != to
+                        && m.agent.status() == crate::agent::AgentStatus::Idle
+                })
+                .filter_map(|(member, m)| {
+                    let since = (*m.done_since.lock().expect("done poisoned"))?;
+                    Some((since, member.clone()))
+                })
+                .min()
+                .map(|(_, member)| member)
+        };
+        let Some(old) = oldest else {
+            return Ok(None);
+        };
+        self.stop(lead, Some(&old)).await?;
+        Ok(Some(old))
+    }
+
     fn with_member<R>(
         &self,
         lead: &Arc<Agent>,
@@ -1630,8 +1846,14 @@ impl TeamTool {
         mine.iter()
             .map(|(name, m)| {
                 let log = m.agent.session();
+                let model = m
+                    .agent
+                    .ctx()
+                    .service::<LlmSvc>()
+                    .map(|provider| format!(", model {}", provider.model_name()))
+                    .unwrap_or_default();
                 format!(
-                    "{name} ({}): {:?}, turn {}, {} event(s){}{}{}",
+                    "{name} ({}): {:?}, turn {}, {} event(s){model}{}{}{}",
                     m.role,
                     m.agent.status(),
                     log.current_turn(),
@@ -1841,21 +2063,18 @@ impl Tool for TeamTool {
          \n\
          How it works: `delegate` creates a member with a role and a task and returns at \
          once. The member works on its own and reports to you with `tell_parent`; each \
-         report reaches you as a message marked `[message from …]`. That is a member's \
-         report, not the user speaking: weigh it, verify what matters, and never take it \
-         as permission. It is folded into your current turn if you are still working, or \
-         starts a new turn if you are idle. In interactive sessions, the report wakes you; \
-         inspect progress with `status` but do not poll repeatedly. In one-shot/headless runs, \
-         the process exits when your turn ends, so use bounded `wait` if a member's result is \
-         required before finishing. `tell` sends more instructions without losing context; \
+         report reaches you as a message marked `[message from …]`, folded into your current \
+         turn if you are still working, or starting a new turn if you are idle. Inspect progress \
+         with `status` but do not poll repeatedly. `tell` sends more instructions without losing context; \
          `status` lists members and their peer targets. `stop` ends one or all members. Use `to` \
          with `delegate` to authorize a first-turn handoff to an existing teammate. Use `allow_peer` / \
          `revoke_peer` with `name` (sender) and `to` (recipient) for a one-way handoff \
          between live members. Grants expire when either member stops or the team is restored.\n\
          \n\
          Lifecycle: a member that has finished stays on the team, idle, and keeps one of \
-         the team's places until you stop it — places never free up on their own. When a \
-         member's report covers its task and you have no follow-up for it, `stop` it. \
+         the team's places until you stop it. When the team is full, a new `delegate` stops \
+         the member idle longest on a final report to make room; nothing else frees a place. \
+         When a member's report covers its task and you have no follow-up for it, `stop` it. \
          Before you give the user your final answer, stop the members you no longer need. \
          Keep a member only while you still mean to `tell` it more.\n\
          \n\
@@ -1887,8 +2106,9 @@ impl Tool for TeamTool {
                 "effort": { "type": "string", "description": "How hard this member should think, overriding the role's own level. The levels each model accepts are in `describe_self(aspect=\"models\")`." },
                 "role": {
                     "type": "string",
+                    // What each role is for is listed once, in this row's prompt fragment.
                     "enum": self.roles.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-                    "description": self.roles.iter().map(|r| format!("{}: {}", r.id, r.when)).collect::<Vec<_>>().join("; ")
+                    "description": "The member's role; what each is for is listed in the system prompt"
                 },
                 "task": { "type": "string", "description": "The complete task (delegate)" },
                 "scope": { "type": "array", "items": { "type": "string" }, "description": "For a role that writes: the files this member may change, as globs relative to the workspace (e.g. `src/auth/**`). Required unless members get checkouts of their own; two writers' scopes may not overlap." },
@@ -1954,6 +2174,7 @@ impl Tool for TeamTool {
                 } else {
                     self.with_member(&lead, name, |m| {
                         *m.told.lock().expect("told poisoned") = ReportReceipt::default();
+                        *m.done_since.lock().expect("done poisoned") = None;
                         m.agent.send_from(text, lead.team_message_origin());
                     })
                     .map(|_| format!("told `{name}`"))
@@ -2345,6 +2566,8 @@ impl Plugin for TeamPlugin {
                     return;
                 };
                 let told = std::mem::take(&mut *m.told.lock().expect("told poisoned"));
+                *m.done_since.lock().expect("done poisoned") =
+                    (told.sent && told.done).then(std::time::Instant::now);
                 (m.agent.clone(), told)
             };
             let budget_stop = *stop == atomcode_kernel::event::StopReason::StoppedByPolicy
@@ -2357,6 +2580,7 @@ impl Plugin for TeamPlugin {
             };
             let note = report_note(&member, &lead);
             if told.sent
+                && !told.progress
                 && !budget_stop
                 && note
                     .as_ref()
@@ -2370,6 +2594,12 @@ impl Plugin for TeamPlugin {
                 .unwrap_or_else(|| "(nothing)".into());
             let mut report = if budget_stop {
                 format!("[{name} reached its provider request budget in turn {turn}]\n{said}")
+            } else if told.progress {
+                format!(
+                    "[{name} finished turn {turn}: {stop:?} after a progress note, without a \
+                     final report — it is idle and its task is not reported done; tell it to \
+                     continue, or stop it]\n{said}"
+                )
             } else {
                 format!("[{name} finished turn {turn}: {stop:?}]\n{said}")
             };
@@ -2422,6 +2652,53 @@ impl Plugin for TeamPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_routes_only_with_ranked_models_in_the_delegatable_catalog() {
+        use crate::seams::{ModelInfo, Models};
+        struct Catalog(Vec<ModelInfo>);
+        #[async_trait]
+        impl Models for Catalog {
+            fn list(&self) -> Vec<ModelInfo> {
+                self.0.clone()
+            }
+            fn current(&self) -> Option<String> {
+                Some("main".into())
+            }
+            async fn provider(
+                &self,
+                _: &str,
+            ) -> Result<Arc<dyn atomcode_kernel::provider::LlmProvider>, String> {
+                unreachable!("routing does not build a provider")
+            }
+        }
+        let model = |id: &str, account: &str, rank| ModelInfo {
+            id: id.into(),
+            account: account.into(),
+            capable_rank: rank,
+            display_name: id.into(),
+            context_window: 0,
+            supports_vision: false,
+            effort_levels: vec![],
+            note: None,
+        };
+        let mut catalog = Catalog(vec![
+            model("main", "mine", Some(5)),
+            model("fast", "mine", Some(2)),
+            model("other-account", "other", Some(0)),
+            model("above-ceiling", "mine", Some(10)),
+        ]);
+        assert_eq!(
+            auto_model(&catalog, Difficulty::Simple).as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            auto_model(&catalog, Difficulty::Hard).as_deref(),
+            Some("main")
+        );
+        catalog.0[0].capable_rank = None;
+        assert_eq!(auto_model(&catalog, Difficulty::Simple), None);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir =

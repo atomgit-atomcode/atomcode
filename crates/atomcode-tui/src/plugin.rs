@@ -6298,7 +6298,7 @@ impl Tui {
             // 复制一次就是几千次复制。行先攒着,由一个 50ms 的钟去画 —— 而不是
             // 等下一行来了才画:一阵几行、然后安静下来的命令(`npm run dev` 的
             // 开场白),靠「来行才画」的话,那阵的后几行要等命令结束才出现。
-            let shown = std::sync::Mutex::new((Vec::<String>::new(), false));
+            let shown = std::sync::Mutex::new((crate::shell::ShellLines::default(), false));
             let flush = || {
                 let mut held = shown.lock().expect("shown poisoned");
                 if !held.1 {
@@ -6306,7 +6306,7 @@ impl Tui {
                 }
                 held.1 = false;
                 let content = Arc::new(ShellOutput {
-                    lines: held.0.clone(),
+                    lines: held.0.snapshot(),
                     ..ShellOutput::default()
                 });
                 drop(held);
@@ -6338,12 +6338,15 @@ impl Tui {
                     _ = tick.tick() => flush(),
                 }
             };
-            let mut lines = std::mem::take(&mut shown.lock().expect("shown poisoned").0);
+            let mut shown = std::mem::take(&mut shown.lock().expect("shown poisoned").0);
             // 什么都没流出来、却有输出:命令根本没起来(找不到 shell、目录不对),
             // 那句原因只在 `ran.output` 里。不画它的话,人只看到一个「退出码 —」。
-            if lines.is_empty() && !ran.output.trim().is_empty() {
-                lines = ran.output.trim_end().lines().map(str::to_string).collect();
+            if shown.is_empty() && !ran.output.trim().is_empty() {
+                for line in ran.output.trim_end().lines() {
+                    shown.push(line.to_string());
+                }
             }
+            let mut lines = shown.snapshot();
             if ran.failed() && !ran_in.is_empty() {
                 lines.push(t(Msg::ShellWorkingDir { dir: &ran_in }).into_owned());
             }
@@ -7572,10 +7575,16 @@ impl Tui {
 
         {
             let m = self.host.moment.read().expect("moment poisoned");
+            // Work this conversation started is still running: the turn ended to
+            // wait for it, and its result starts the next turn on its own (the
+            // live line says `等待 N 个…完成`). Telling the person to continue
+            // would have them restart what is already coming.
             if m.suggestion.is_some()
                 || !m.input.is_empty()
                 || m.secret.is_some()
                 || m.autonomy.is_some()
+                || m.working_members() > 0
+                || m.bg.working_for(&m.lead) > 0
             {
                 return false;
             }
@@ -7975,30 +7984,12 @@ impl Tui {
                         *self.last_reply.lock().expect("reply poisoned") = text.clone();
                     }
                 }
-                let members_working = if committed.session == self.client.root()
-                    && matches!(
-                        &committed.event,
-                        atomcode_kernel::session::SessionEvent::TurnEnd {
-                            stop: atomcode_kernel::event::StopReason::Stopped,
-                            ..
-                        }
-                    ) {
-                    self.members
-                        .moment_members()
-                        .iter()
-                        .filter(|member| !member.gone && member.activity == Activity::Working)
-                        .count()
-                } else {
-                    0
-                };
-                self.host.absorb_logged_with_members(
-                    &atomcode_kernel::session::LoggedEvent {
+                self.host
+                    .absorb_logged(&atomcode_kernel::session::LoggedEvent {
                         seq: committed.seq,
                         at: committed.at,
                         event: committed.event.clone(),
-                    },
-                    members_working,
-                );
+                    });
                 // What an undo took back is the whole log's to say, so it is
                 // read off the facts rather than folded fact by fact.
                 if matches!(
@@ -13432,6 +13423,72 @@ mod suggestion_tests {
             viewing: session.into(),
             ..Moment::default()
         })
+    }
+
+    /// A turn that stopped to wait for work it started — a member, a background
+    /// review — is woken by that work's result; the composer does not tell the
+    /// person to continue it.
+    #[test]
+    fn no_offer_to_continue_while_work_this_conversation_started_is_running() {
+        use atomcode_kernel::event::{AgentEvent, StopReason};
+        use atomcode_kernel::session::{Committed, SessionEvent};
+        use atomcode_kernel::tool::ToolCall;
+
+        let (host, tui) = super::assemble(crate::surface::Headless::new(100, 24));
+        tui.client.follow("lead");
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+            m.members = vec![crate::moment::MemberNow {
+                activity: crate::moment::Activity::Working,
+                session: "lead/reviewer".into(),
+                ..Default::default()
+            }];
+        }
+        let facts = [
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 0,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "todo-1".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"todos":[{"content":"add tests","status":"pending"}]}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 0,
+                call_id: "todo-1".into(),
+                content: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        ];
+        for (index, event) in facts.into_iter().enumerate() {
+            tui.on_event(AgentEvent::Fact(Box::new(Committed {
+                session: "lead".into(),
+                seq: index as u64 + 1,
+                at: 0,
+                event,
+            })));
+        }
+        host.moment.write().unwrap().turn_open = true;
+        tui.on_event(AgentEvent::TurnComplete {
+            reason: StopReason::Stopped,
+            turn: Some(1),
+            provider_failure: None,
+        });
+        assert!(host.moment.read().unwrap().suggestion.is_none());
     }
 
     #[test]

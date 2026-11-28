@@ -615,6 +615,36 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("再按 Ctrl+D 确认删除「{name}」").into(),
         Msg::SessionDeleteFailed { error } =>
             format!("删除会话失败：{error}").into(),
+        Msg::HarnessJournalTooLarge { max_bytes, max_mib } =>
+            format!("会话 JSONL 超出 {max_bytes} 字节上限（{max_mib} MiB）").into(),
+        Msg::HarnessJournalExpectedFile =>
+            "需要常规文件".into(),
+        Msg::HarnessJournalExpectedDirectory =>
+            "需要目录".into(),
+        Msg::HarnessJournalChangedBeforeAppend =>
+            "会话 JSONL 在追加前已发生变化".into(),
+        Msg::HarnessJournalRollbackFailed { error, rollback } =>
+            format!("{error}。回滚追加写入失败：{rollback}").into(),
+        Msg::HarnessJournalInUse =>
+            "会话正在使用中".into(),
+        Msg::HarnessJournalNativeConflict =>
+            "此会话 ID 也归属于原生会话存储".into(),
+        Msg::HarnessJournalUnknownOwner =>
+            "无法确认日志归属于 harness 会话".into(),
+        Msg::HarnessJournalLegacyConflict =>
+            "存储根目录下存在同一会话 ID 的旧版日志".into(),
+        Msg::SessionStoreDeleteUnsupported =>
+            "此会话存储不支持删除".into(),
+        Msg::HarnessJournalWriteStopped { error } =>
+            format!("{error}。此会话后续事件将停止保存").into(),
+        Msg::HarnessJournalWriterStartFailed { error } =>
+            format!("启动会话日志写入线程失败：{error}").into(),
+        Msg::HarnessJournalWriterTerminated =>
+            "会话日志写入线程意外退出".into(),
+        Msg::HarnessJournalNewerFormat { version, supported } =>
+            format!("会话格式版本为 {version}，当前构建最高支持版本 {supported}").into(),
+        Msg::HarnessJournalInvalidHeader { error } =>
+            format!("会话日志头部无效：{error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
@@ -1703,7 +1733,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::StreamRecoveryPreserved { max_recoveries } => format!("模型响应中断，已保留收到的内容，正在尝试继续（本轮最多自动恢复 {max_recoveries} 次）。").into(),
         Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("连接中断，已保留进度，{delay_secs} 秒后尝试继续（{attempt}/{max_recoveries}）；可按 Esc 取消。").into(),
         Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "自动恢复已禁用。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。".into(),
-        Msg::StreamRecoveryExhausted { max_recoveries } => format!("自动恢复已达到本轮上限（{max_recoveries} 次）。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("自动恢复已达到本轮上限（{max_recoveries} 次）。已保留可安全保存的内容，请检查连接或模型服务后回复「继续」。若对话较长，也可先执行 /compact 压缩历史——请求体变小后，弱网下更容易一次性通过。").into(),
         Msg::StreamRecoveryUnsafeTools => "响应中断，工具调用未完成或执行状态无法确认，为避免重复执行已停止自动恢复。已保留可安全保存的内容，请核对工具结果后再继续。".into(),
         Msg::StreamRecoveryNoProgress => "响应中断，没有足够的安全进度可用于续接；本次未自动续接。请检查连接或模型服务后重试。".into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),

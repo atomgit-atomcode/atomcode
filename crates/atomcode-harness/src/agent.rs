@@ -330,6 +330,10 @@ pub struct CreateAgent {
     pub persist: bool,
     /// For a team member: what it was created with, into its header.
     pub member: Option<crate::session::MemberHeader>,
+    /// For a delegated child: the task's short label, into its header. What
+    /// `/agents` lists the session by when its log's first user message is
+    /// not something a person should have to read.
+    pub label: Option<String>,
     pub setup: Option<Setup>,
 }
 
@@ -369,6 +373,10 @@ impl CreateAgent {
     }
     pub fn parent(mut self, parent: impl Into<String>) -> Self {
         self.parent = Some(parent.into());
+        self
+    }
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
         self
     }
     pub fn seed(mut self, seed: Vec<LoggedEvent>, seed_len: usize) -> Self {
@@ -1225,6 +1233,7 @@ impl Agents {
         header.cwd = req.cwd.as_ref().map(|p| p.display().to_string());
         header.parent = req.parent.clone();
         header.member = req.member.take();
+        header.label = req.label.take();
         if req.parent.is_some() {
             header.inherited = seed_len;
         }

@@ -643,6 +643,36 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Press Ctrl+D again to delete \"{name}\"").into(),
         Msg::SessionDeleteFailed { error } =>
             format!("Failed to delete session: {error}").into(),
+        Msg::HarnessJournalTooLarge { max_bytes, max_mib } =>
+            format!("Session JSONL exceeds the {max_bytes}-byte limit ({max_mib} MiB)").into(),
+        Msg::HarnessJournalExpectedFile =>
+            "Expected a regular file".into(),
+        Msg::HarnessJournalExpectedDirectory =>
+            "Expected a directory".into(),
+        Msg::HarnessJournalChangedBeforeAppend =>
+            "Session JSONL changed before append".into(),
+        Msg::HarnessJournalRollbackFailed { error, rollback } =>
+            format!("{error}. Failed to roll back the append: {rollback}").into(),
+        Msg::HarnessJournalInUse =>
+            "Session is in use".into(),
+        Msg::HarnessJournalNativeConflict =>
+            "Session ID also belongs to the native store".into(),
+        Msg::HarnessJournalUnknownOwner =>
+            "Cannot identify the harness journal".into(),
+        Msg::HarnessJournalLegacyConflict =>
+            "A legacy journal with the same session ID exists in the storage root".into(),
+        Msg::SessionStoreDeleteUnsupported =>
+            "This session store does not support deletion".into(),
+        Msg::HarnessJournalWriteStopped { error } =>
+            format!("{error}. Subsequent events for this session will not be saved").into(),
+        Msg::HarnessJournalWriterStartFailed { error } =>
+            format!("Failed to start the session journal writer: {error}").into(),
+        Msg::HarnessJournalWriterTerminated =>
+            "The session journal writer terminated unexpectedly".into(),
+        Msg::HarnessJournalNewerFormat { version, supported } =>
+            format!("Session format {version} is newer than this build supports ({supported})").into(),
+        Msg::HarnessJournalInvalidHeader { error } =>
+            format!("Invalid session header: {error}").into(),
         Msg::SessionRenameEditing { buffer } =>
             format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
@@ -1767,7 +1797,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::StreamRecoveryPreserved { max_recoveries } => format!("Model response interrupted. Received content was preserved; attempting to continue (up to {max_recoveries} automatic recoveries per turn).").into(),
         Msg::StreamRecoveryRetry { attempt, max_recoveries, delay_secs } => format!("Connection interrupted; progress preserved. Continuing in {delay_secs}s ({attempt}/{max_recoveries}); press Esc to cancel.").into(),
         Msg::StreamRecoveryExhausted { max_recoveries: 0 } => "Automatic recovery is disabled. Safely preservable content was kept. Check the connection or model service, then send 'continue'.".into(),
-        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'.").into(),
+        Msg::StreamRecoveryExhausted { max_recoveries } => format!("Automatic recovery reached this turn's limit ({max_recoveries}). Safely preservable content was kept. Check the connection or model service, then send 'continue'. If the conversation is long, running /compact first shrinks the request body, which helps on a weak network.").into(),
         Msg::StreamRecoveryUnsafeTools => "Response interrupted with incomplete or unconfirmed tool output; automatic recovery stopped to avoid duplicate execution. Safely preservable content was kept. Check tool results before continuing.".into(),
         Msg::StreamRecoveryNoProgress => "Response interrupted without enough safe progress to continue; no automatic continuation was attempted. Check the connection or model service and retry.".into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),

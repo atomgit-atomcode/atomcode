@@ -79,6 +79,8 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// List the retained one-shot tasks directly delegated by this live session.
+    ListTaskSessions { session: String },
     /// Read committed display history only; does not restore or mutate the agent.
     DisplayHistory {
         session: String,
@@ -392,6 +394,7 @@ impl HostCommand {
         match self {
             Self::Browser { session, .. }
             | Self::DisplayHistory { session, .. }
+            | Self::ListTaskSessions { session }
             | Self::NewSession { session }
             | Self::ForkSession { session }
             | Self::Resume { session, .. }
@@ -468,6 +471,26 @@ pub struct PersonaInfo {
     pub text: String,
 }
 
+/// A retained one-shot task in the live session's project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSession {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl TaskSession {
+    pub fn from_header(
+        header: atomcode_kernel::session::SessionHeader,
+        parent: &str,
+    ) -> Option<Self> {
+        (header.parent.as_deref() == Some(parent) && header.member.is_none()).then_some(Self {
+            id: header.id,
+            label: header.label,
+        })
+    }
+}
+
 /// What a command that went through produced.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -515,6 +538,9 @@ pub enum HostReply {
         sessions: Vec<StoredSession>,
         #[serde(default, skip_serializing_if = "SessionListHints::is_empty")]
         hints: SessionListHints,
+    },
+    TaskSessions {
+        sessions: Vec<TaskSession>,
     },
     /// What a stored session last talked about: a few lines, newest last,
     /// already in the order a person reads them.
@@ -1688,6 +1714,9 @@ mod tests {
     /// sampled here.
     fn commands() -> Vec<HostCommand> {
         let all = vec![
+            HostCommand::ListTaskSessions {
+                session: "a".into(),
+            },
             HostCommand::DisplayHistory {
                 session: "a".into(),
                 turns: 8,
@@ -1928,6 +1957,7 @@ mod tests {
             match c {
                 HostCommand::Browser { .. }
                 | HostCommand::DisplayHistory { .. }
+                | HostCommand::ListTaskSessions { .. }
                 | HostCommand::NewSession { .. }
                 | HostCommand::ForkSession { .. }
                 | HostCommand::Resume { .. }
@@ -1991,6 +2021,12 @@ mod tests {
 
     fn replies() -> Vec<HostReply> {
         let all = vec![
+            HostReply::TaskSessions {
+                sessions: vec![TaskSession {
+                    id: "sub-a".into(),
+                    label: Some("Check docs".into()),
+                }],
+            },
             HostReply::DisplayHistory {
                 page: atomcode_kernel::session::history::Page {
                     session: "a".into(),
@@ -2297,6 +2333,7 @@ mod tests {
         for r in &all {
             match r {
                 HostReply::DisplayHistory { .. }
+                | HostReply::TaskSessions { .. }
                 | HostReply::Done
                 | HostReply::TaskSpecs { .. }
                 | HostReply::FollowUp { .. }

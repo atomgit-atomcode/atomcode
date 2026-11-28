@@ -433,6 +433,12 @@ pub struct SessionsByWorkingDirQuery {
 /// Request to create a new session
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Isolation: only effective when `working_dir` is absent — a new UUID is
+    /// generated and used as both the session id and the directory name under
+    /// the current project dir (`{project_dir}/{uuid}`, created if missing).
+    /// When `working_dir` is given, it is used as-is and this flag has no effect.
+    #[serde(default)]
+    pub isolated_workspace: bool,
     /// Optional working directory (uses current project dir if not provided)
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
@@ -3467,33 +3473,47 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // Determine working directory
-    let working_dir = match req.working_dir {
+    let (id, working_dir) = match req.working_dir {
         Some(dir) => {
             let mut proj = state.project.write().await;
             update_project_state(&mut proj, &dir);
-            dir
+            // An explicit working_dir is used as-is; isolated_workspace has no
+            // effect in this branch.
+            (uuid::Uuid::new_v4().to_string(), dir)
         }
         None => {
             // Use current project's working directory
             let project = state.project.read().await;
-            project.working_dir.clone()
+            if req.isolated_workspace {
+                // Isolated workspace without an explicit dir: the generated UUID
+                // is both the session id and the directory name under the
+                // current project dir ({project_dir}/{uuid}, created below if
+                // missing).
+                let id = uuid::Uuid::new_v4().to_string();
+                let dir = project.working_dir.join(&id);
+                (id, dir)
+            } else {
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    project.working_dir.clone(),
+                )
+            }
         }
     };
 
     // Ensure working directory exists
     if !working_dir.exists() {
-        // Create atomchat directory in user's home if default
-        let home = atomcode_config::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let atomchat_dir = home.join("atomchat");
-        if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
-            // Use atomchat directory as working dir
-        } else {
-            let msg = format!("Working directory does not exist: {:?}", working_dir);
-            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        if let Err(error) = std::fs::create_dir_all(&working_dir) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(format!(
+                    "Failed to create working directory {working_dir:?}: {error}"
+                )),
+            )
+                .into_response();
         }
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
     let manager = atomcode_capabilities::session::SessionManager::for_project(
         &working_dir,
         &atomcode_coding::config::product_dirs_from_env(),
@@ -4501,6 +4521,13 @@ pub enum ChatEvent {
     /// `Error` so clients render a muted notice instead of a red error.
     #[serde(rename = "warning")]
     Warning { message: String },
+    /// Internal until the response polls it. Emits the existing warning wire shape.
+    #[serde(skip)]
+    StartupAdvisory {
+        project_bucket: String,
+        session_id: String,
+        message: String,
+    },
     /// Routine automatic retry diagnostics; clients keep these out of live status.
     #[serde(rename = "provider_retry")]
     ProviderRetry { message: String },
@@ -5779,7 +5806,7 @@ async fn chat_stream(
     let active_conns = state.active_connections.clone();
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+    let stream = chat_response_events(rx, live_api::chat_startup_advisories()).map(|event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
@@ -5801,6 +5828,28 @@ async fn chat_stream(
                 .text("ping"),
         )
         .into_response()
+}
+
+fn chat_response_events(
+    receiver: mpsc::UnboundedReceiver<ChatEvent>,
+    advisories: &live_api::StartupAdvisories,
+) -> impl futures::Stream<Item = ChatEvent> + '_ {
+    UnboundedReceiverStream::new(receiver).filter_map(move |event| {
+        futures::future::ready(match event {
+            ChatEvent::StartupAdvisory {
+                project_bucket,
+                session_id,
+                message,
+            } => {
+                if advisories.already_shown((project_bucket, session_id), &message) {
+                    None
+                } else {
+                    Some(ChatEvent::Warning { message })
+                }
+            }
+            event => Some(event),
+        })
+    })
 }
 
 /// Await the inner chat task, translating its outcome into SSE events and
@@ -6048,7 +6097,7 @@ async fn process_chat_request(
         interactive_permission && approval_mode_requires_responder(approval_mode);
     // Native runtime observations stay native until this daemon driver projects
     // them to the HTTP ChatEvent wire model.
-    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel::<CodingRuntimeEvent>();
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
 
     // Check if session was stopped before we started the turn loop.
     // If so, save the current conversation (session messages + user message)
@@ -6172,7 +6221,22 @@ async fn process_chat_request(
         summary_count: summary_baseline,
         ..Default::default()
     };
+    let project_bucket = NativeSessionManager::project_hash(
+        &working_dir,
+        &atomcode_coding::config::product_dirs_from_env(),
+    );
     while let Some(event) = runtime_event_rx.recv().await {
+        let event = match event {
+            live_api::ChatTurnEvent::Runtime(event) => event,
+            live_api::ChatTurnEvent::StartupAdvisory(message) => {
+                let _ = event_tx.send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.clone(),
+                    session_id: perm_session_key.clone(),
+                    message,
+                });
+                continue;
+            }
+        };
         for chat_event in projector.project_runtime(event, &perm_session_key) {
             if matches!(chat_event, ChatEvent::Done { .. }) {
                 terminal_sent.store(true, std::sync::atomic::Ordering::Release);
@@ -11768,6 +11832,182 @@ mod tests {
             json,
             r#"{"type":"warning","message":"conversation compacted"}"#
         );
+    }
+
+    // 回归 #1842：/chat 每条输入都重建一个临时 CodingRuntime，每个 runtime 都
+    // 重新推导同样的启动提示（如 claude.md 被 AGENTS.md 遮蔽），并作为首批
+    // ControllerWarning 重发 —— WebUI 里每发一句话就重复展示一次「claude.md …
+    // not loaded」。修复后：同一会话内已展示过的启动提示只在首个回合出现，
+    // 指令文件状态真的变化产生的新提示仍然展示。
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_shows_each_startup_advisory_once_per_session_until_it_changes() {
+        async fn run_turn(
+            home: &ScopedChatHome,
+            dir: &std::path::Path,
+            session_id: &str,
+            request_id: &str,
+            message: &str,
+        ) -> mpsc::UnboundedReceiver<ChatEvent> {
+            let (main_url, _main_request, main_task) = spawn_openai_sse("turn done").await;
+            let mut config = Config::with_default_provider("main");
+            config
+                .providers
+                .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+            config
+                .save(&Config::default_path())
+                .expect("save chat test config");
+
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let active_chats = ActiveChatRegistry::default();
+            let admission = active_chats.admit(None, Some(request_id)).await.unwrap();
+            let operation_id = admission.operation_id.clone();
+            process_chat_request(
+                ChatRequest {
+                    reasoning_effort: None,
+                    message: message.into(),
+                    working_dir: Some(dir.to_path_buf()),
+                    provider: Some("main".into()),
+                    session_id: Some(session_id.into()),
+                    request_id: Some(request_id.into()),
+                    images: Vec::new(),
+                    approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+                },
+                event_tx,
+                admission.cancellation,
+                operation_id.clone(),
+                active_chats.clone(),
+                chat_test_telemetry(home),
+                permission_bridge::PermissionResponders::new(),
+                permission_bridge::UserInputResponders::new(),
+                false,
+                false,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .expect("chat turn succeeds");
+            active_chats.complete(&operation_id).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), main_task)
+                .await
+                .expect("provider task finishes");
+
+            event_rx
+        }
+
+        async fn warnings(
+            receiver: mpsc::UnboundedReceiver<ChatEvent>,
+            advisories: &live_api::StartupAdvisories,
+        ) -> Vec<String> {
+            chat_response_events(receiver, advisories)
+                .filter_map(|event| {
+                    futures::future::ready(match event {
+                        ChatEvent::Warning { message } => Some(message),
+                        _ => None,
+                    })
+                })
+                .collect()
+                .await
+        }
+
+        let home = ScopedChatHome::new();
+        let dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "claude rules").unwrap();
+        let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        // Seed a native session so every turn continues the SAME session id.
+        {
+            use atomcode_capabilities::session::{
+                PresentationFile, SessionManager, SessionMeta, StorageOwner,
+            };
+            let manager = SessionManager::for_project(
+                &dir,
+                &atomcode_coding::config::product_dirs_from_env(),
+            );
+            let lease = manager.acquire_lease(id).unwrap();
+            let snapshot = atomcode_kernel::message::SessionSnapshot::new(vec![
+                atomcode_kernel::message::Message::user("seed"),
+            ]);
+            let mut meta = SessionMeta::new(id, dir.to_string_lossy(), 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = 1;
+            manager
+                .commit_native_import(
+                    &lease,
+                    Some(&snapshot),
+                    Some(&PresentationFile::default()),
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let advisories = live_api::StartupAdvisories::default();
+        // An unpolled response can be dropped before its queued warning reaches SSE.
+        drop(run_turn(&home, &dir, id, "chat-advisory-abandoned", "abandoned").await);
+
+        // The first consumed response still shows the startup advisory.
+        let first = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-1", "one").await,
+            &advisories,
+        )
+        .await;
+        assert_eq!(
+            first.iter().filter(|w| w.contains("CLAUDE.md")).count(),
+            1,
+            "first turn must show the claude.md advisory once: {first:?}"
+        );
+
+        // 第 2 条输入：同一会话，同样的提示不再重复。
+        let second = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-2", "two").await,
+            &advisories,
+        )
+        .await;
+        assert!(
+            !second.iter().any(|w| w.contains("CLAUDE.md")),
+            "second turn must not repeat the claude.md advisory: {second:?}"
+        );
+
+        // 指令文件状态真的变化：AGENTS.md 变空产生新提示，必须再次展示。
+        std::fs::write(dir.join("AGENTS.md"), "").unwrap();
+        let third = warnings(
+            run_turn(&home, &dir, id, "chat-advisory-turn-3", "three").await,
+            &advisories,
+        )
+        .await;
+        assert!(
+            third
+                .iter()
+                .any(|w| w.contains("AGENTS.md") && w.contains("empty")),
+            "a changed instruction state must surface its new advisory: {third:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_startup_advisories_are_scoped_to_the_project_and_ignore_live_warnings() {
+        let advisories = live_api::StartupAdvisories::default();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for project_bucket in ["project-a", "project-a", "project-b"] {
+            sender
+                .send(ChatEvent::StartupAdvisory {
+                    project_bucket: project_bucket.into(),
+                    session_id: "same-session-id".into(),
+                    message: "same warning".into(),
+                })
+                .unwrap();
+        }
+        sender
+            .send(ChatEvent::Warning {
+                message: "same warning".into(),
+            })
+            .unwrap();
+        drop(sender);
+
+        let events: Vec<_> = chat_response_events(receiver, &advisories).collect().await;
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| {
+            matches!(event, ChatEvent::Warning { message } if message == "same warning")
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]

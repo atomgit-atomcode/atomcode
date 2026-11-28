@@ -1852,15 +1852,34 @@ impl RuntimeControl {
         // Only the rows the picker shows are probed: a lease and a log tail each.
         for session in &mut sessions {
             if let Some(bucket) = buckets.get(&session.id) {
-                session.held = held_activity(
-                    &SessionManager::with_root(sessions_root.join(bucket)),
-                    &session.id,
-                );
+                let bucket = SessionManager::with_root(sessions_root.join(bucket));
+                session.held = held_activity(&bucket, &session.id);
+                session.title = heading(&bucket, &session.id, session.title.take());
             }
         }
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         HostReply::Sessions { sessions, hints }
     }
+}
+
+/// The name a picker row shows. A placeholder (`session-<id>`, `default`) is no
+/// name: a session whose title was never generated — the side call off or
+/// failed — showed its bare id here, while the reference picker and ACP already
+/// read the first prompt in its place. Read the same way here, and only for a
+/// placeholder, so a named session costs nothing.
+fn heading(
+    bucket: &atomcode_capabilities::session::SessionManager,
+    id: &str,
+    title: Option<String>,
+) -> Option<String> {
+    use atomcode_capabilities::session::SessionMeta;
+    let placeholder = title
+        .as_deref()
+        .is_none_or(|t| t.trim().is_empty() || SessionMeta::name_needs_fallback(t, id));
+    if !placeholder {
+        return title;
+    }
+    bucket.first_prompt_preview(id).ok().flatten().or(title)
 }
 
 /// What another runtime holding `id` is doing with it. A failed probe leaves
@@ -2306,6 +2325,31 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::ListSessions { working_dir } => {
                 session_disk(move || Ok(Self::list(working_dir))).await
+            }
+            HostCommand::ListTaskSessions { session } => {
+                self.addressed(&session)?;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                let parent = session.clone();
+                let sessions = session_disk(move || {
+                    let dirs = atomcode_coding::config::product_dirs_from_env();
+                    let manager = SessionManager::for_project(&here, &dirs);
+                    Ok(manager
+                        .children(&parent)
+                        .into_iter()
+                        .filter_map(|meta| manager.read_event_header(&meta.id).ok())
+                        .filter_map(|header| {
+                            atomcode_host_api::TaskSession::from_header(header, &parent)
+                        })
+                        .collect())
+                })
+                .await?;
+                self.addressed(&session)?;
+                Ok(HostReply::TaskSessions { sessions })
             }
             HostCommand::DeleteSession { session } => {
                 self.delete_stored(&session)?;
@@ -4082,5 +4126,51 @@ mod tests {
         assert_eq!(ended(GoalTerminal::Failed, None), None);
         // 人自己停的,命令已经答过「目标停了。」
         assert_eq!(ended(GoalTerminal::Cancelled, None), None);
+    }
+}
+
+#[cfg(test)]
+mod heading_tests {
+    use super::heading;
+    use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
+    use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+    /// A session left with its placeholder name is shown by its first prompt,
+    /// not `session-<id>`; a real name is kept as it is.
+    #[test]
+    fn a_placeholder_name_reads_as_the_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionManager::with_root(dir.path().join("0123456789abcdef"));
+        let id = "7d0c2b1e-0000-4000-8000-000000000001";
+        let lease = store.acquire_lease(id).unwrap();
+        let mut meta = SessionMeta::new(id, "/workspace", 1_000);
+        meta.owner = StorageOwner::Native;
+        store
+            .create_event_session(&lease, &SessionHeader::new(id), &meta)
+            .unwrap();
+        store
+            .append_events(
+                &lease,
+                &[LoggedEvent {
+                    seq: 1,
+                    at: 0,
+                    event: SessionEvent::UserMessage {
+                        turn: 1,
+                        text: "整理 v5.2.9 的更新日志".into(),
+                        images: Vec::new(),
+                    },
+                }],
+            )
+            .unwrap();
+
+        let placeholder = Some(format!("session-{id}"));
+        assert_eq!(
+            heading(&store, id, placeholder).as_deref(),
+            Some("整理 v5.2.9 的更新日志")
+        );
+        assert_eq!(
+            heading(&store, id, Some("发布前检查".into())).as_deref(),
+            Some("发布前检查")
+        );
     }
 }

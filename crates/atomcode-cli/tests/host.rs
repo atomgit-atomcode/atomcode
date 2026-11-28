@@ -90,6 +90,17 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "delegate one task" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "description": "Audit parser",
+                        "task": "Read the parser and report."
+                    })
+                    .to_string(),
+                })
+            }
             // `write <path>`: the call a mode decides about — refused under
             // plan, asked about under ask, through under accept-edits.
             Some(m) if m.role == Role::User && m.text.starts_with("write ") => {
@@ -885,6 +896,91 @@ async fn a_stored_session_is_listed_and_resumed_with_its_history() {
         user_messages(&history, &first),
         vec!["remember pineapple".to_string()],
         "{history:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_lead_can_list_and_replay_a_retained_task() {
+    let env = env();
+    let mut connection = connected_with(&env, SubagentPolicy::Enabled).await;
+    let lead = connection.session.clone();
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session: lead.clone(),
+            mode: atomcode_host_api::Mode::Auto,
+        })
+        .await
+        .unwrap();
+    connection.commands.send(subscribe(&lead)).unwrap();
+    connection
+        .commands
+        .send(message("delegate one task"))
+        .unwrap();
+    through_turn(&mut connection).await;
+
+    let Ok(HostReply::SessionChanged { session: fresh }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: lead.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::ListTaskSessions {
+                session: lead.clone()
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::ListTaskSessions {
+                session: fresh.clone()
+            })
+            .await,
+        Ok(HostReply::TaskSessions {
+            sessions: Vec::new()
+        })
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: fresh,
+                target: lead.clone()
+            })
+            .await,
+        Ok(HostReply::SessionChanged {
+            session: lead.clone()
+        })
+    );
+
+    let reply = connection
+        .control
+        .call(HostCommand::ListTaskSessions { session: lead })
+        .await;
+    let Ok(HostReply::TaskSessions { sessions }) = reply else {
+        panic!("retained tasks: {reply:?}");
+    };
+    let [task] = sessions.as_slice() else {
+        panic!("retained tasks: {sessions:?}");
+    };
+    assert_eq!(task.label.as_deref(), Some("Audit parser"));
+    connection.commands.send(subscribe(&task.id)).unwrap();
+    let history = until(&mut connection, |event| {
+        matches!(event, AgentEvent::Fact(fact) if fact.session == task.id
+            && matches!(fact.event, SessionEvent::TurnEnd { .. }))
+    })
+    .await;
+    assert_eq!(
+        user_messages(&history, &task.id),
+        ["Read the parser and report."]
     );
 }
 

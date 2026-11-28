@@ -83,6 +83,7 @@ pub(super) struct MemberQuery {
     pub name: String,
     pub description: String,
     pub role: String,
+    pub allowed_servers: Option<Vec<String>>,
     pub member: String,
     pub registry: Arc<McpRegistry>,
     pub catalog: std::sync::Weak<ToolBox>,
@@ -92,6 +93,12 @@ pub(super) struct MemberQuery {
 impl MemberQuery {
     fn adapter(&self) -> Option<McpToolAdapter> {
         self.catalog.upgrade()?.get(&self.name)?;
+        if let Some(servers) = &self.allowed_servers {
+            let info = self.registry.team_query_info(&self.name, &self.role)?;
+            if !servers.contains(&info.server_name) {
+                return None;
+            }
+        }
         McpToolAdapter::for_team(self.registry.clone(), &self.name, &self.role)
     }
 }

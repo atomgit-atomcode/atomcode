@@ -1032,8 +1032,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         // Context pressure is measured from what the provider last reported,
         // not estimated from the text: the provider is the authority on its own
         // tokenizer.
-        let window = self
-            .ctx
+        let window = crate::agent::scoped(&self.ctx)
             .service::<crate::seams::LlmSvc>()
             .map(|p| p.context_window())
             .unwrap_or(0);
@@ -1079,6 +1078,19 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             );
         }
         let result = compaction.compact_attempt(&session, &ask).await;
+        if result.decision.is_none() && result.diagnostic.is_none() {
+            // Past the trigger with nothing done is the state a session that
+            // can never be compacted sits in until it overflows; once per
+            // stage and turn (the gate), so a long turn says it once.
+            tracing::info!(
+                session_id = session.id(),
+                turn = session.current_turn(),
+                used_tokens = used,
+                context_window = window,
+                slow,
+                "context past the compaction trigger; nothing to compact"
+            );
+        }
         if result.decision.is_none() {
             if let Some(reason) = result.diagnostic {
                 let bytes = session.derive_messages().iter().map(|m| m.text.len()).sum();
@@ -1205,15 +1217,35 @@ fn default_stop() -> u32 {
     4
 }
 
+/// One session's run of identical calls. Kept per session: a lead, its members
+/// and its `task` children all run through this one guard, and a run or a trip
+/// that is not keyed by session lets one agent's calls stop another's turn.
 #[derive(Default)]
 struct LoopState {
-    /// (call signature, result) -> consecutive repeats.
-    counts: HashMap<String, u32>,
+    /// Hash of the (call signature, result) repeated consecutively — a hash,
+    /// so a session that ends keeps a few bytes here rather than the output.
+    last: u64,
+    count: u32,
     tripped: bool,
 }
 
+/// What a guard keys on: the session whose turn this is.
+fn guarded_session(ctx: &Context) -> String {
+    crate::agent::scoped(ctx)
+        .service::<SessionSvc>()
+        .map(|session| session.id().to_owned())
+        .unwrap_or_default()
+}
+
+fn digest(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 struct ToolLoopGuard {
-    state: Arc<Mutex<LoopState>>,
+    ctx: Context,
+    state: Mutex<HashMap<String, LoopState>>,
     warn_after: u32,
     stop_after: u32,
 }
@@ -1300,23 +1332,22 @@ impl Waterfall<ToolsExecute> for ToolLoopGuard {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
         let signature = format!("{}::{}", exec.call.name, exec.call.arguments);
         let mut result = next.run(exec).await;
+        let session = guarded_session(&self.ctx);
+        let mut states = self.state.lock().expect("loop guard poisoned");
+        let state = states.entry(session).or_default();
         if pending_background_wait(&exec.call, &result) {
-            self.state
-                .lock()
-                .expect("loop guard poisoned")
-                .counts
-                .clear();
+            state.count = 0;
             return result;
         }
-        let key = format!("{signature}=>{}", result.content);
-
-        let mut state = self.state.lock().expect("loop guard poisoned");
+        let key = digest(&format!("{signature}=>{}", result.content));
         // Only consecutive repetition counts: a call that made progress in
-        // between is not a loop, and clearing here keeps it that way.
-        state.counts.retain(|k, _| k == &key);
-        let count = state.counts.entry(key).or_insert(0);
-        *count += 1;
-        let count = *count;
+        // between is not a loop, and starting over here keeps it that way.
+        if state.count == 0 || state.last != key {
+            state.last = key;
+            state.count = 0;
+        }
+        state.count += 1;
+        let count = state.count;
         if count >= self.stop_after {
             state.tripped = true;
             result.is_error = true;
@@ -1336,10 +1367,10 @@ impl Waterfall<ToolsExecute> for ToolLoopGuard {
 #[async_trait]
 impl Listener<TurnStopping> for ToolLoopGuard {
     async fn call(&self, _progress: &TurnProgress) -> Option<StopReason> {
-        let mut state = self.state.lock().expect("loop guard poisoned");
-        if state.tripped {
-            state.tripped = false;
-            state.counts.clear();
+        let session = guarded_session(&self.ctx);
+        let mut states = self.state.lock().expect("loop guard poisoned");
+        if states.get(&session).is_some_and(|state| state.tripped) {
+            states.remove(&session);
             return Some(StopReason::ToolLoopDetected);
         }
         None
@@ -1374,7 +1405,8 @@ struct RepeatFuse {
     stop_at: u32,
     /// `None`: every round counts, however long it ran.
     poll_after: Option<std::time::Duration>,
-    state: Mutex<RepeatState>,
+    /// Per session, for the same reason as the exact guard's.
+    state: Mutex<HashMap<String, RepeatState>>,
     malformed: Mutex<HashMap<String, MalformedRound>>,
 }
 
@@ -1386,7 +1418,8 @@ struct MalformedRound {
 
 #[derive(Default)]
 struct RepeatState {
-    signature: String,
+    /// Hash of the round's signature: a session that ends keeps a few bytes.
+    signature: u64,
     rounds: u32,
     nudged: bool,
     /// The session owed the nudge, said once its round's results are logged.
@@ -1426,9 +1459,11 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
         if batch.calls.is_empty() {
             return next.run(batch).await;
         }
-        let signature = round_signature(&batch.calls);
+        let signature = digest(&round_signature(&batch.calls));
+        let session_id = guarded_session(&self.ctx);
         let rounds = {
-            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            let mut states = self.state.lock().expect("repeat fuse poisoned");
+            let state = states.entry(session_id.clone()).or_default();
             if state.signature == signature {
                 state.rounds += 1;
             } else {
@@ -1483,15 +1518,19 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
                 })
             })
         {
-            let mut state = self.state.lock().expect("repeat fuse poisoned");
-            if state.signature == round_signature(&batch.calls) {
+            let mut states = self.state.lock().expect("repeat fuse poisoned");
+            if let Some(state) = states
+                .get_mut(&session_id)
+                .filter(|state| state.signature == signature)
+            {
                 state.rounds = 0;
             }
             return results;
         }
 
         if rounds >= self.nudge_at {
-            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            let mut states = self.state.lock().expect("repeat fuse poisoned");
+            let state = states.entry(session_id).or_default();
             if !state.nudged {
                 state.nudged = true;
                 // Owed, not said: this batch's results are logged only after
@@ -1525,11 +1564,10 @@ impl RepeatFuse {
         // Taken under the lock, said outside it: committing re-enters this
         // listener through `SessionEventCommitted`.
         let session = {
-            let mut state = self.state.lock().expect("repeat fuse poisoned");
-            match &state.owed {
-                Some(owed) if owed.id() == committed.session => state.owed.take(),
-                _ => None,
-            }
+            let mut states = self.state.lock().expect("repeat fuse poisoned");
+            states
+                .get_mut(&committed.session)
+                .and_then(|state| state.owed.take())
         };
         let session = session.filter(|_| !ends_turn);
         let Some(session) = session else {
@@ -1561,9 +1599,13 @@ impl Listener<TurnStopping> for RepeatFuse {
                 return Some(StopReason::ToolLoopDetected);
             }
         }
-        let mut state = self.state.lock().expect("repeat fuse poisoned");
-        if state.rounds >= self.stop_at {
-            *state = RepeatState::default();
+        let session = guarded_session(&self.ctx);
+        let mut states = self.state.lock().expect("repeat fuse poisoned");
+        if states
+            .get(&session)
+            .is_some_and(|state| state.rounds >= self.stop_at)
+        {
+            states.remove(&session);
             return Some(StopReason::ToolLoopDetected);
         }
         None
@@ -1625,7 +1667,7 @@ impl Plugin for RepeatFusePlugin {
             stop_at,
             poll_after: (poll_after_secs > 0)
                 .then(|| std::time::Duration::from_secs(poll_after_secs)),
-            state: Mutex::new(RepeatState::default()),
+            state: Mutex::new(HashMap::new()),
             malformed: Mutex::new(HashMap::new()),
         });
         let _ = ctx.on_waterfall::<ToolsExecuteBatch>(fuse.clone(), false);
@@ -1656,7 +1698,8 @@ impl Plugin for ToolLoopGuardPlugin {
             return Err("warn_after must be lower than stop_after".into());
         }
         let guard = Arc::new(ToolLoopGuard {
-            state: Arc::new(Mutex::new(LoopState::default())),
+            ctx: ctx.clone(),
+            state: Mutex::new(HashMap::new()),
             warn_after: row.warn_after,
             stop_after: row.stop_after,
         });

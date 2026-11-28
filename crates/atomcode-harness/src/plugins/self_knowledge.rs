@@ -249,18 +249,11 @@ impl Tool for DescribeSelf {
          how to change things and add capabilities — model, memory, skills, MCP \
          servers, plugins, layout — with the files and commands involved \
          (`aspect: operations`), and the user-settings catalog including language \
-         (`aspect: settings`). Call this FIRST — before you answer, and instead \
-         of guessing or searching the repository — whenever you are asked what you \
-         are, what you are made of, what you can do, which tools or models you \
-         have, how to change or extend something about yourself, which session \
-         this is, or where your own state is kept, and before helping someone \
-         install a skill or an MCP server. This reports YOU, the running agent — \
-         not the project you are working in. Every answer is generated from the \
-         running system, so none of it can be out of date; it is read-only and \
-         cheap when queried narrowly. For a simple identity question use `aspect: overview` \
-         (the default); it returns session information and tool names without repeating tool \
-         descriptions or setup documentation. Select a specific aspect for follow-up questions. \
-         Use `all` only when the person needs the full report."
+         (`aspect: settings`). It reports YOU, the running agent, not the project. \
+         Every answer is generated from the running system, so none of it can be \
+         out of date; it is read-only and cheap when queried narrowly. \
+         `aspect: overview` (the default) returns session information and tool names \
+         without repeating tool descriptions or setup documentation."
     }
 
     fn parameters_schema(&self) -> Value {

@@ -436,7 +436,17 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     let body = &after_open[close_pos + skip..];
     let mut tools_block = false;
     let mut tools_seen = false;
+    // `description: >` / `|` / an empty value continue on the indented lines below.
+    let mut desc_block: Option<(bool, Vec<&str>)> = None;
     for line in block.lines() {
+        if let Some((_, lines)) = desc_block.as_mut() {
+            if line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+                lines.push(line.trim());
+                continue;
+            }
+            let (literal, lines) = desc_block.take().expect("checked above");
+            fm.description = block_scalar(literal, &lines);
+        }
         if tools_block && (line.trim().is_empty() || line.trim_start().starts_with('#')) {
             continue;
         }
@@ -471,7 +481,11 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
         } else if let Some(v) = line.strip_prefix("display-name:") {
             fm.display_name = Some(fm_value(v));
         } else if let Some(v) = line.strip_prefix("description:") {
-            fm.description = fm_value(v);
+            match without_yaml_comment(v).trim() {
+                "" | ">" | ">-" | ">+" => desc_block = Some((false, Vec::new())),
+                "|" | "|-" | "|+" => desc_block = Some((true, Vec::new())),
+                _ => fm.description = fm_value(v),
+            }
         } else if let Some(v) = line
             .strip_prefix("allowed-tools:")
             .or_else(|| line.strip_prefix("allowed_tools:"))
@@ -534,7 +548,27 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
             }
         }
     }
+    if let Some((literal, lines)) = desc_block {
+        fm.description = block_scalar(literal, &lines);
+    }
     (fm, body.to_string())
+}
+
+/// The value of a multi-line YAML scalar from its trimmed lines: a literal (`|`)
+/// keeps its line breaks; a folded (`>`) or plain one joins lines with spaces, a
+/// blank line standing for a break.
+fn block_scalar(literal: bool, lines: &[&str]) -> String {
+    let text = if literal {
+        lines.join("\n")
+    } else {
+        lines
+            .split(|line| line.is_empty())
+            .filter(|paragraph| !paragraph.is_empty())
+            .map(|paragraph| paragraph.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    text.trim().to_string()
 }
 
 /// Locate the closing `---`. Returns `(offset_of_close_newline, bytes_to_skip)`.
@@ -1110,6 +1144,42 @@ mod tests {
             vec!["read_file".to_string(), "bash".to_string()]
         );
         assert_eq!(body.trim(), "body here");
+    }
+
+    /// Published skills write long descriptions as YAML block scalars. Read as one
+    /// line they became the catalog entries `ponytail: >` and `feishu-perm: |`, and an
+    /// empty `description:` fell back to the body's heading.
+    #[test]
+    fn frontmatter_reads_multi_line_descriptions() {
+        let folded = "---\nname: a\ndescription: >\n  Lazy senior dev mode:\n  smallest change.\n\n  Levels: lite.\nuser-invocable: false\n---\nbody\n";
+        let (fm, _) = parse_frontmatter(folded);
+        assert_eq!(
+            fm.description,
+            "Lazy senior dev mode: smallest change.\nLevels: lite."
+        );
+        assert!(!fm.user_invocable, "the key after the block is still read");
+
+        let literal =
+            "---\nname: b\ndescription: |\n  Feishu permissions.\n  Activate on sharing.\n---\n";
+        assert_eq!(
+            parse_frontmatter(literal).0.description,
+            "Feishu permissions.\nActivate on sharing."
+        );
+
+        let plain = "---\nname: c\ndescription:\n  所有联网操作必须通过此 skill 处理。\n---\n# web-access Skill\n";
+        assert_eq!(
+            parse_frontmatter(plain).0.description,
+            "所有联网操作必须通过此 skill 处理。"
+        );
+
+        for chomp in [">-", "|-", "> # folded"] {
+            let text = format!("---\ndescription: {chomp}\n  x\n---\n");
+            assert_eq!(parse_frontmatter(&text).0.description, "x", "{chomp}");
+        }
+        let empty = "---\ndescription:\nname: d\n---\n";
+        let (fm, _) = parse_frontmatter(empty);
+        assert_eq!(fm.description, "");
+        assert_eq!(fm.name.as_deref(), Some("d"));
     }
 
     #[test]

@@ -592,6 +592,201 @@ pub struct Collected {
     pub exit: Exit,
 }
 
+/// The retained bytes of one process stream. A gap is kept out of the bytes
+/// so the shell can decode both sides before adding the display marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapturedOutput {
+    Whole(Vec<u8>),
+    Truncated {
+        head: Vec<u8>,
+        tail: Vec<u8>,
+        omitted: u64,
+    },
+}
+
+impl CapturedOutput {
+    fn into_whole(self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Whole(bytes) => Ok(bytes),
+            Self::Truncated { .. } => Err("uncapped process output was truncated".into()),
+        }
+    }
+
+    fn decode_with(self, decode: impl Fn(&[u8]) -> String) -> String {
+        match self {
+            Self::Whole(bytes) => decode(&bytes),
+            Self::Truncated {
+                head,
+                tail,
+                omitted,
+            } => with_capture_gap(decode(&head), decode(&tail), omitted),
+        }
+    }
+}
+
+pub(crate) fn with_capture_gap(mut head: String, tail: String, omitted: u64) -> String {
+    use std::fmt::Write;
+    let _ = write!(
+        head,
+        "\n[atomcode: captured output truncated - {omitted} bytes omitted]\n"
+    );
+    head.push_str(&tail);
+    head
+}
+
+/// Process exit status and the retained portions of both streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CappedCollected {
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+    pub exit: Exit,
+}
+
+/// A byte stream that keeps at most `cap` bytes: the head and the tail.
+///
+/// A command that prints without end (`yes`, `cat /dev/urandom`) must not grow
+/// this process without bound. The caller chooses `cap`; the head gets the
+/// larger share — the opening (a diff header, a log's first lines) is usually
+/// the more useful half — and the tail keeps the most recent bytes (the error,
+/// the status). [`CappedBytes::finish`] reports the dropped bytes separately.
+///
+/// A small delta merges into the back chunk, so a world that yields one byte at
+/// a time costs one entry per [`TAIL_CHUNK_BYTES`], not one per byte.
+const TAIL_CHUNK_BYTES: usize = 4 * 1024;
+
+pub(crate) struct CappedBytes {
+    head: Vec<u8>,
+    /// Tail chunks, oldest first. Whole chunks are dropped from the front, so a
+    /// steady stream costs a memcpy per chunk rather than two ring operations
+    /// per byte.
+    tail: std::collections::VecDeque<Vec<u8>>,
+    tail_bytes: usize,
+    head_cap: usize,
+    tail_cap: usize,
+    total: u64,
+}
+
+impl CappedBytes {
+    pub(crate) fn new(cap: usize) -> Self {
+        let head_cap = cap - cap / 4;
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            tail_bytes: 0,
+            head_cap,
+            tail_cap: cap.saturating_sub(head_cap),
+            total: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len() as u64);
+        let mut rest = bytes;
+        if self.head.len() < self.head_cap {
+            let take = (self.head_cap - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() || self.tail_cap == 0 {
+            return;
+        }
+        if rest.len() >= self.tail_cap {
+            // The new bytes alone are at least the whole tail: keep only their
+            // last `tail_cap`. Pushing them all first would defeat the bound.
+            self.tail.clear();
+            self.tail_bytes = 0;
+            self.tail
+                .push_back(rest[rest.len() - self.tail_cap..].to_vec());
+            self.tail_bytes = self.tail_cap;
+            return;
+        }
+        // Merge a small delta into the back chunk. One byte at a time would
+        // otherwise create one heap entry per byte. The chunk stops growing at
+        // `TAIL_CHUNK_BYTES`; the next delta starts a new one.
+        if let Some(back) = self.tail.back_mut() {
+            if back.len() < TAIL_CHUNK_BYTES {
+                back.extend_from_slice(rest);
+                self.tail_bytes += rest.len();
+                self.trim_tail();
+                return;
+            }
+        }
+        self.tail.push_back(rest.to_vec());
+        self.tail_bytes += rest.len();
+        self.trim_tail();
+    }
+
+    /// Drop whole front chunks while the tail still covers `tail_cap` without
+    /// them. The retained bytes may exceed `tail_cap` by less than one chunk;
+    /// [`CappedBytes::finish`] trims that excess. No partial drain here, so a
+    /// steady stream never memmoves the tail.
+    fn trim_tail(&mut self) {
+        while let Some(front) = self.tail.front() {
+            if self.tail_bytes - front.len() < self.tail_cap {
+                break;
+            }
+            self.tail_bytes -= front.len();
+            self.tail.pop_front();
+        }
+    }
+
+    pub(crate) fn finish(self) -> CapturedOutput {
+        let total = self.total;
+        let tail_bytes = self.tail_bytes;
+        let mut tail = Vec::with_capacity(tail_bytes);
+        for chunk in self.tail {
+            tail.extend_from_slice(&chunk);
+        }
+        // The buffer may exceed `tail_cap` by less than one chunk; keep the
+        // most recent `tail_cap` bytes.
+        let excess = tail_bytes.saturating_sub(self.tail_cap);
+        if excess > 0 {
+            tail.drain(..excess);
+        }
+        let mut head = self.head;
+        let omitted = total.saturating_sub((head.len() + tail.len()) as u64);
+        if omitted == 0 {
+            head.extend(tail);
+            CapturedOutput::Whole(head)
+        } else {
+            CapturedOutput::Truncated {
+                head,
+                tail,
+                omitted,
+            }
+        }
+    }
+}
+
+/// One output stream while it is being collected: whole, or bounded.
+enum Retained {
+    Whole(Vec<u8>),
+    Capped(CappedBytes),
+}
+
+impl Retained {
+    fn new(cap: Option<usize>) -> Self {
+        match cap {
+            Some(cap) => Retained::Capped(CappedBytes::new(cap)),
+            None => Retained::Whole(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Retained::Whole(out) => out.extend_from_slice(bytes),
+            Retained::Capped(out) => out.push(bytes),
+        }
+    }
+
+    fn finish(self) -> CapturedOutput {
+        match self {
+            Retained::Whole(out) => CapturedOutput::Whole(out),
+            Retained::Capped(out) => out.finish(),
+        }
+    }
+}
+
 /// A command that is already running.
 ///
 /// # Why a handle and not `run() -> Output`
@@ -676,6 +871,26 @@ pub trait Process: Send + Sync {
         &self,
         limit: Option<std::time::Duration>,
     ) -> Result<Option<Collected>, String> {
+        let Some(output) = self.collect_within_capped(limit, None).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Collected {
+            stdout: output.stdout.into_whole()?,
+            stderr: output.stderr.into_whole()?,
+            exit: output.exit,
+        }))
+    }
+
+    /// [`collect_within`](Self::collect_within) that retains at most `cap` bytes
+    /// of each stream.
+    ///
+    /// The head and tail stay separate when bytes are dropped. `None` keeps
+    /// everything, as in [`collect_within`](Self::collect_within).
+    async fn collect_within_capped(
+        &self,
+        limit: Option<std::time::Duration>,
+        cap: Option<usize>,
+    ) -> Result<Option<CappedCollected>, String> {
         let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
         let running_out = || async move {
             match deadline {
@@ -683,11 +898,11 @@ pub trait Process: Send + Sync {
                 None => std::future::pending().await,
             }
         };
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let mut stdout = Retained::new(cap);
+        let mut stderr = Retained::new(cap);
         let mut take = |chunk: Chunk| match chunk {
-            Chunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
-            Chunk::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+            Chunk::Stdout(bytes) => stdout.push(&bytes),
+            Chunk::Stderr(bytes) => stderr.push(&bytes),
         };
         let exit = loop {
             tokio::select! {
@@ -716,9 +931,9 @@ pub trait Process: Send + Sync {
                 _ = running_out() => return Ok(None),
             }
         };
-        Ok(Some(Collected {
-            stdout,
-            stderr,
+        Ok(Some(CappedCollected {
+            stdout: stdout.finish(),
+            stderr: stderr.finish(),
             exit,
         }))
     }
@@ -814,6 +1029,12 @@ pub trait Shell: Send + Sync {
     /// need: UTF-8.
     fn decode(&self, bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Decode captured output and render any gap as text. Shells that detect
+    /// encoding from a stream header can reuse that encoding for the tail.
+    fn decode_capture(&self, output: CapturedOutput) -> String {
+        output.decode_with(|bytes| self.decode(bytes))
     }
 } // ---- the local world -----------------------------------------------------
 
@@ -2397,5 +2618,156 @@ mod bounded_line_tests {
         assert!(count_reader_lines(b"first\n".as_slice().chain(Fails), 100)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod capped_output_tests {
+    use super::*;
+
+    fn display(output: CapturedOutput) -> String {
+        output.decode_with(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    #[test]
+    fn capped_bytes_keeps_the_head_and_tail_and_marks_the_middle() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'a'; 60]);
+        bytes.push(&[b'b'; 60]);
+        let output = bytes.finish();
+        assert_eq!(
+            output,
+            CapturedOutput::Truncated {
+                head: [vec![b'a'; 60], vec![b'b'; 15]].concat(),
+                tail: vec![b'b'; 25],
+                omitted: 20,
+            }
+        );
+        assert!(display(output).contains("20 bytes omitted"));
+    }
+
+    #[test]
+    fn capped_bytes_is_identity_below_the_cap() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(b"hello");
+        bytes.push(b" world");
+        assert_eq!(
+            bytes.finish(),
+            CapturedOutput::Whole(b"hello world".to_vec())
+        );
+    }
+
+    #[test]
+    fn capped_bytes_bounds_a_single_huge_chunk() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'x'; 1_000_000]);
+        assert_eq!(
+            bytes.finish(),
+            CapturedOutput::Truncated {
+                head: vec![b'x'; 75],
+                tail: vec![b'x'; 25],
+                omitted: 999_900,
+            }
+        );
+    }
+
+    #[test]
+    fn capped_bytes_merges_tiny_chunks_and_keeps_the_newest() {
+        let mut bytes = CappedBytes::new(1024);
+        for n in 0..10_000 {
+            bytes.push(&[(n % 256) as u8]);
+        }
+        assert!(bytes.tail.len() <= 2, "{:?}", bytes.tail.len());
+        let CapturedOutput::Truncated { tail, .. } = bytes.finish() else {
+            panic!("expected capped output");
+        };
+        assert_eq!(
+            tail,
+            (9744..10_000).map(|n| (n % 256) as u8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn capped_bytes_preserves_raw_bytes_at_both_sides_of_the_gap() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'A'; 74]);
+        bytes.push(&[0xE4, 0xB8, 0xAD]);
+        bytes.push(&[0x81]);
+        bytes.push(&[b'B'; 24]);
+        let CapturedOutput::Truncated {
+            head,
+            tail,
+            omitted,
+        } = bytes.finish()
+        else {
+            panic!("expected capped output");
+        };
+        assert_eq!(head.last(), Some(&0xE4));
+        assert_eq!(tail.first(), Some(&0x81));
+        assert_eq!(omitted, 2);
+    }
+
+    #[test]
+    #[cfg(feature = "tools")]
+    fn the_capture_marker_is_distinct_from_the_artifact_marker() {
+        let mut bytes = CappedBytes::new(100);
+        bytes.push(&[b'x'; 1_000]);
+        let text = display(bytes.finish());
+        assert!(
+            text.contains("[atomcode: captured output truncated"),
+            "{text}"
+        );
+        assert!(!text.contains(crate::tools::output_artifact::ARTIFACT_TRUNCATION_MARKER_PREFIX));
+    }
+
+    struct Flood {
+        chunks: std::sync::Mutex<std::collections::VecDeque<Chunk>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Process for Flood {
+        async fn next_chunk(&self) -> Option<Chunk> {
+            self.chunks.lock().unwrap().pop_front()
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            Ok(Exit {
+                code: Some(0),
+                signal: None,
+            })
+        }
+        async fn kill(&self) {}
+    }
+
+    #[tokio::test]
+    async fn collect_within_capped_bounds_each_stream_and_marks_the_middle() {
+        let mut chunks = std::collections::VecDeque::new();
+        for _ in 0..100 {
+            chunks.push_back(Chunk::Stdout(vec![b'a'; 100]));
+            chunks.push_back(Chunk::Stderr(vec![b'e'; 100]));
+        }
+        let flood = Flood {
+            chunks: std::sync::Mutex::new(chunks),
+        };
+        let collected = flood
+            .collect_within_capped(None, Some(1_000))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            collected.stdout,
+            CapturedOutput::Truncated {
+                head: vec![b'a'; 750],
+                tail: vec![b'a'; 250],
+                omitted: 9_000,
+            }
+        );
+        assert_eq!(
+            collected.stderr,
+            CapturedOutput::Truncated {
+                head: vec![b'e'; 750],
+                tail: vec![b'e'; 250],
+                omitted: 9_000,
+            }
+        );
     }
 }

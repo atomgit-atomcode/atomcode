@@ -318,6 +318,30 @@ impl HostControl for TreeHost {
                 self.set_effort(&session, level).await
             }
             HostCommand::ListSessions { working_dir } => self.list(working_dir).await,
+            HostCommand::ListTaskSessions { session } => {
+                let live = self.live.lock().await;
+                let current = live.as_ref().ok_or(HostError::Unavailable)?;
+                if current.session != session {
+                    return Err(HostError::NotFound);
+                }
+                let store = current
+                    .app
+                    .context()
+                    .service::<atomcode_harness::seams::SessionPersistenceSvc>();
+                let sessions = match store {
+                    Some(store) => store
+                        .children(&session)
+                        .await
+                        .map_err(|message| HostError::Failed { message })?
+                        .into_iter()
+                        .filter_map(|header| {
+                            atomcode_host_api::TaskSession::from_header(header, &session)
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                Ok(HostReply::TaskSessions { sessions })
+            }
             // `None`, and that is the honest answer rather than a shrug: the
             // trees this host mounts carry no execution mode at all. `modes` is
             // a host-provided seam (`atomcode_harness::seam_map::HOST_PROVIDED`)

@@ -242,7 +242,19 @@ impl fmt::Display for SessionStoreError {
                 limit,
                 actual,
             } => {
-                write!(f, "{kind} exceeds {limit} bytes/items (actual {actual})")
+                let over = actual.saturating_sub(*limit);
+                // No "the {kind} is" phrasing: many kinds are plural
+                // collections. The overflow sentinels report actual == limit,
+                // where "(over by 0)" would contradict "over budget".
+                if over > 0 {
+                    // No unit: some kinds count bytes, others items or lines.
+                    write!(
+                        f,
+                        "{kind} over budget: limit {limit}, got {actual} (over by {over})"
+                    )
+                } else {
+                    write!(f, "{kind} size exceeds the addressable range: got {actual}")
+                }
             }
             Self::FutureSchema {
                 kind,
@@ -5584,16 +5596,14 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
     // transcript append below would fail with ERROR_ACCESS_DENIED (os error 5).
     // Note: `write(true)` is IGNORED when `append(true)` is set (Rust std), so
-    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here. Append
-    // semantics are unchanged.
+    // GENERIC_READ via `read(true)` is what satisfies LockFileEx here.
     options.create(true).append(true).read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         // `append(true)` alone grants only FILE_APPEND_DATA, which can write at
         // the end of the file but cannot truncate it; cutting off a torn tail
-        // (`set_len`) needs write access as well. FILE_APPEND_DATA is still set
-        // by the append flag, so writes keep landing at the end of the file.
+        // (`set_len`) needs write access as well.
         options.access_mode(0x8000_0000 | 0x4000_0000); // GENERIC_READ | GENERIC_WRITE
     }
     set_private_create_mode(&mut options);
@@ -5601,6 +5611,17 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let file = options.open(path).map_err(|e| io_at(path, e))?;
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
+    #[cfg(windows)]
+    let file = {
+        use std::io::{Seek, SeekFrom};
+
+        // The access mode above replaces FILE_APPEND_DATA. Position the
+        // cursor at the end so the first write appends instead of overwriting.
+        let mut file = file;
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| io_at(path, error))?;
+        file
+    };
     Ok(file)
 }
 
@@ -6561,6 +6582,43 @@ mod tests {
                 actual: 9
             })
         ));
+    }
+
+    #[test]
+    fn too_large_display_says_what_over_by_how_much() {
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "reference projection",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "reference projection over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // Plural kinds must not read as a singular subject–verb pair.
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session events",
+                limit: 8_388_608,
+                actual: 8_388_630,
+            }
+            .to_string(),
+            "session events over budget: limit 8388608, got 8388630 (over by 22)"
+        );
+        // The overflow sentinels report actual == limit: "over by 0" would
+        // contradict "over budget".
+        assert_eq!(
+            SessionStoreError::TooLarge {
+                kind: "session file",
+                limit: usize::MAX,
+                actual: usize::MAX,
+            }
+            .to_string(),
+            format!(
+                "session file size exceeds the addressable range: got {}",
+                usize::MAX
+            )
+        );
     }
 
     #[test]

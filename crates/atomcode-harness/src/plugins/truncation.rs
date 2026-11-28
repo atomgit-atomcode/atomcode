@@ -104,6 +104,12 @@ struct Row {
     /// that draws the question; off, giving up says so as a warning.
     #[serde(default)]
     checkpoint: bool,
+    /// Reasoning that ran out of output budget gets the next request's budget
+    /// doubled once, up to this ceiling (and a quarter of the context window).
+    /// The cut reasoning is usually not seen again, so the model thinks afresh;
+    /// more room is what lets that second attempt finish.
+    #[serde(default = "default_reasoning_output_ceiling")]
+    max_reasoning_output_tokens: u32,
 }
 
 impl Default for Row {
@@ -112,6 +118,7 @@ impl Default for Row {
             max_continuations: default_max(),
             max_reasoning_continuations: default_reasoning_max(),
             checkpoint: false,
+            max_reasoning_output_tokens: default_reasoning_output_ceiling(),
         }
     }
 }
@@ -122,6 +129,39 @@ const LEFT_CUT_OFF: &str =
 
 fn default_reasoning_max() -> u32 {
     1
+}
+
+/// A provider refusing the request because of its output-token field — the
+/// raised budget exceeds this endpoint's own limit.
+fn rejects_output_budget(error: &RequestError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    matches!(error.http_status, Some(400 | 422))
+        && [
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "max_new_tokens",
+        ]
+        .iter()
+        .any(|field| message.contains(field))
+}
+
+fn default_reasoning_output_ceiling() -> u32 {
+    65_536
+}
+
+/// The budget for the request after reasoning ran out of `current` (`None` = the
+/// adapter's default): double, never above `ceiling` or a quarter of `window`.
+/// `None` when that is no raise at all.
+fn raised_output_budget(current: Option<u32>, ceiling: u32, window: u32) -> Option<u32> {
+    let current = current.unwrap_or(atomcode_kernel::agent::DEFAULT_MAX_OUTPUT_TOKENS);
+    let ceiling = if window > 0 {
+        ceiling.min(window / 4)
+    } else {
+        ceiling
+    };
+    let next = current.saturating_mul(2).min(ceiling);
+    (next > current).then_some(next)
 }
 
 pub(crate) fn lower_effort(
@@ -174,6 +214,7 @@ struct RecoveryState {
     seen: u32,
     no_progress_seen: u32,
     next_effort: Option<ReasoningEffort>,
+    next_max_tokens: Option<u32>,
     last: Option<String>,
 }
 
@@ -183,6 +224,7 @@ struct OnTruncation {
     max_continuations: u32,
     max_reasoning_continuations: u32,
     checkpoint: bool,
+    max_reasoning_output_tokens: u32,
     states: Mutex<HashMap<String, Arc<Mutex<RecoveryState>>>>,
 }
 
@@ -319,7 +361,20 @@ impl Waterfall<AgentRequest> for OnTruncation {
         {
             req.options.reasoning_effort = Some(effort);
         }
-        let mut response = next.run(req).await?;
+        let raised_from = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_max_tokens
+            .take()
+            .map(|budget| std::mem::replace(&mut req.options.max_tokens, Some(budget)));
+        let mut response = match (next.run(req).await, raised_from) {
+            // The raise went past what this endpoint accepts: ask once more as before.
+            (Err(error), Some(original)) if rejects_output_budget(&error) => {
+                req.options.max_tokens = original;
+                next.run(req).await?
+            }
+            (result, _) => result?,
+        };
         // A reasoning-only reply to the harness's own note is the loop's to
         // settle as "nothing to add"; nudging it again would answer a nudge
         // with a nudge.
@@ -392,6 +447,25 @@ impl Waterfall<AgentRequest> for OnTruncation {
             .map(|call| !looks_complete(&call.arguments))
             .unwrap_or(false);
 
+        let raised = if reasoning_only(&response) && !response.ended_in_reasoning {
+            let window = crate::agent::scoped(&self.ctx)
+                .service::<crate::seams::LlmSvc>()
+                .map_or(0, |provider| provider.context_window());
+            raised_output_budget(
+                req.options.max_tokens,
+                self.max_reasoning_output_tokens,
+                window,
+            )
+        } else {
+            None
+        };
+        if let Some(budget) = raised {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .next_max_tokens = Some(budget);
+        }
+
         if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
             // Tell the driver as well as the model. The nudge is model-visible;
             // that the answer was cut off and is being resumed is something a
@@ -404,14 +478,16 @@ impl Waterfall<AgentRequest> for OnTruncation {
                     notice: crate::session::NoticeKind::OutputTruncated,
                     detail: format!(
                         "{}（连续恢复第 {attempt}/{limit} 次）",
-                        if response.ended_in_reasoning {
-                            "模型思考后没有给出正文，正在请它直接推进任务"
+                        if let Some(budget) = raised {
+                            format!("模型思考达到输出上限，正在把输出预算提高到 {budget} 后继续")
+                        } else if response.ended_in_reasoning {
+                            "模型思考后没有给出正文，正在请它直接推进任务".to_string()
                         } else if reasoning_only(&response) {
-                            "模型思考达到输出上限，正在请求直接推进任务"
+                            "模型思考达到输出上限，正在请求直接推进任务".to_string()
                         } else if no_visible_progress(&response) {
-                            "输出达到上限，尚无正文或完整工具调用，正在请求直接推进任务"
+                            "输出达到上限，尚无正文或完整工具调用，正在请求直接推进任务".to_string()
                         } else {
-                            "输出被截断，正在请模型接着写"
+                            "输出被截断，正在请模型接着写".to_string()
                         },
                     ),
                     retry: Some(RetryAttempt {
@@ -556,6 +632,7 @@ impl Plugin for TruncationPlugin {
             max_continuations: row.max_continuations,
             max_reasoning_continuations: row.max_reasoning_continuations,
             checkpoint: row.checkpoint,
+            max_reasoning_output_tokens: row.max_reasoning_output_tokens,
             states: Mutex::new(HashMap::new()),
         });
         let per_turn = on_truncation.clone();
@@ -612,5 +689,57 @@ mod redump_tests {
         assert!(!looks_complete(
             r#"{"path": "a.rs", "content": "fn main() {"#
         ));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{raised_output_budget, rejects_output_budget};
+    use crate::events::RequestError;
+    use atomcode_kernel::agent::DEFAULT_MAX_OUTPUT_TOKENS;
+
+    #[test]
+    fn reasoning_out_of_budget_gets_double_within_the_ceilings() {
+        assert_eq!(
+            raised_output_budget(Some(16_000), 65_536, 512_000),
+            Some(32_000)
+        );
+        assert_eq!(
+            raised_output_budget(None, 65_536, 0),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS * 2)
+        );
+        // Never past the configured ceiling, nor a quarter of the window.
+        assert_eq!(
+            raised_output_budget(Some(48_000), 65_536, 1_000_000),
+            Some(65_536)
+        );
+        assert_eq!(raised_output_budget(Some(16_000), 65_536, 64_000), None);
+        // Already at the ceiling (e.g. a declared 128K): no raise.
+        assert_eq!(raised_output_budget(Some(128_000), 65_536, 1_000_000), None);
+    }
+
+    #[test]
+    fn only_a_refused_output_field_counts_as_a_rejected_budget() {
+        let error = |status, message: &str| RequestError {
+            http_status: status,
+            ..RequestError::message(message)
+        };
+        assert!(rejects_output_budget(&error(
+            Some(400),
+            "max_tokens must be less than or equal to 16000"
+        )));
+        assert!(rejects_output_budget(&error(
+            Some(422),
+            "Invalid max_completion_tokens"
+        )));
+        assert!(!rejects_output_budget(&error(
+            Some(400),
+            "invalid tool schema"
+        )));
+        assert!(!rejects_output_budget(&error(
+            Some(500),
+            "max_tokens internal"
+        )));
+        assert!(!rejects_output_budget(&error(None, "max_tokens")));
     }
 }

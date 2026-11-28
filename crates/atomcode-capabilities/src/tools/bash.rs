@@ -24,6 +24,24 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
+/// How much of each stream a foreground command may retain.
+///
+/// Sized below the artifact ceiling. For UTF-8 output the captured bytes,
+/// markers and result framing stay under `MAX_ARTIFACT_BYTES`, so the capped
+/// result can still be saved and returned by `fetch_output`. Non-UTF-8 output
+/// can grow when `world.decode` turns it into a Rust `String` (GBK/UTF-16 to
+/// UTF-8), so the artifact gate may still trip there; this bound is on captured
+/// bytes, not on the decoded length. The two streams share the ceiling, so each
+/// gets half of it minus a margin.
+const MAX_CAPTURED_BYTES: usize =
+    (crate::tools::output_artifact::MAX_ARTIFACT_BYTES - 64 * 1024) / 2;
+
+// Two streams share the artifact ceiling; the margin covers the capture markers
+// and the `[stderr]` / `[exit code]` framing.
+const _: () = assert!(
+    MAX_CAPTURED_BYTES * 2 + 64 * 1024 <= crate::tools::output_artifact::MAX_ARTIFACT_BYTES
+);
+
 mod exit_diagnostic;
 #[cfg(any(windows, test))]
 mod windows_diagnostics;
@@ -400,20 +418,21 @@ impl Tool for BashTool {
             // The limit is on the command running, not on reading what it left
             // behind: a timeout landing in the post-exit drain would kill what the
             // command had just started and call a finished command a timeout.
-            res = process.collect_within(Some(dur)) => match res {
+            res = process.collect_within_capped(
+                Some(dur),
+                Some(MAX_CAPTURED_BYTES),
+            ) => match res {
                 Ok(Some(collected)) => {
+                    let stdout = self.world.decode_capture(collected.stdout);
+                    let stderr = self.world.decode_capture(collected.stderr);
                     if let Some(observer) = self.observer.as_ref().filter(|observer| observer.interested(ctx)) {
                         observer.completed(ctx, &ShellExecutionReceipt {
                             command: a.command.clone(), exit_code: collected.exit.code,
-                            stdout: self.world.decode(&collected.stdout),
-                            stderr: self.world.decode(&collected.stderr),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
                         });
                     }
-                    let mut result = format_output(
-                        &self.world.decode(&collected.stdout),
-                        &self.world.decode(&collected.stderr),
-                        collected.exit.code,
-                    );
+                    let mut result = format_output(&stdout, &stderr, collected.exit.code);
                     if let (Some(lines), Some(preview)) = (preview_lines, &output_preview) {
                         let status = collected.exit.code.map(|code| format!("[exit code {code}]"))
                             .unwrap_or_else(|| "[process terminated by signal]".into());
@@ -503,21 +522,11 @@ fn shell_tool_description(
              stdout/stderr and exit code. Default timeout 60s (max 300). Destructive \
              commands (recursive force delete, sudo, dd, history rewrites, …) are flagged \
              risky and may require approval.\n\
-             Prefer the dedicated tools over bash for file operations — they are \
-             gitignore-aware, cross-platform, and cheaper: read_file to read a file (NOT \
-             cat/head/tail), grep to search file contents (NOT grep/rg), glob to find \
-             files by name (NOT find/fd), list_directory for a directory tree (NOT ls), \
-             edit_file to MODIFY a file and write_file to create/overwrite one. NEVER edit \
-             a file with a shell command (sed/awk/perl -i, or `>`/`>>`/tee redirection) — \
-             it corrupts indentation and encoding (especially on Windows) and cascades; if \
-             edit_file reports it can't find your text, RE-READ the file and copy the exact \
-             text, or rewrite the whole file with write_file — do not fall back to sed. \
-             Reserve bash for real shell work — git, builds, package managers, running \
-             commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do. For long builds/tests use `bash_start` and wait \
-             for it the way the host's background completion policy says; unless the host \
-             says it resumes you when a job finishes, wait with `bash_poll` until the job \
-             ends before answering. Do not use shell sleep to wait or duplicate a running build.\n\
+             File work goes through the dedicated tools: read_file (NOT cat/head/tail), \
+             grep (NOT grep/rg), glob (NOT find/fd), list_directory (NOT ls), edit_file / \
+             write_file (NEVER sed/awk/perl -i or `>`/`>>`/tee redirection). Reserve bash for \
+             git, builds, package managers, running commands, and aggregation pipelines \
+             (wc, sort, uniq, git log). Long builds/tests go through `bash_start`.\n\
              This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
              program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
              editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
@@ -1290,10 +1299,92 @@ pub(crate) fn decode_output(bytes: &[u8]) -> String {
     decode_oem(bytes, console_codepage())
 }
 
+pub(super) fn decode_captured_output(output: crate::world::CapturedOutput) -> String {
+    use crate::world::{with_capture_gap, CapturedOutput};
+
+    let (head, tail, omitted) = match output {
+        CapturedOutput::Whole(bytes) => return decode_output(&bytes),
+        CapturedOutput::Truncated {
+            head,
+            tail,
+            omitted,
+        } => (head, tail, omitted),
+    };
+
+    // Both offsets are in the original stream. Probe only its head, which
+    // carries any BOM, and use the same byte order for the tail.
+    let even_end = head.len() & !1;
+    let utf16_head = |end| {
+        let bytes = &head[..end];
+        let (little_endian, decoded) = decode_utf16_with_order(bytes)?;
+        let last = bytes.chunks_exact(2).last()?;
+        // A truncated high surrogate is part of the gap, not visible text.
+        if (0xD800..=0xDBFF).contains(&utf16_unit(last, little_endian)) {
+            return None;
+        }
+        Some((end, little_endian, decoded))
+    };
+    if let Some((end, little_endian, decoded_head)) =
+        utf16_head(even_end).or_else(|| even_end.checked_sub(2).and_then(utf16_head))
+    {
+        let mut start = usize::from((head.len() as u64 + omitted) % 2 != 0).min(tail.len());
+        let mut units = tail[start..].chunks_exact(2);
+        if units
+            .next()
+            .is_some_and(|pair| (0xDC00..=0xDFFF).contains(&utf16_unit(pair, little_endian)))
+        {
+            start += 2;
+        }
+        let decoded_tail: String = char::decode_utf16(
+            tail[start..]
+                .chunks_exact(2)
+                .map(|pair| utf16_unit(pair, little_endian)),
+        )
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+        return with_capture_gap(
+            decoded_head,
+            decoded_tail,
+            omitted + (head.len() - end + start) as u64,
+        );
+    }
+
+    let utf8_end = match std::str::from_utf8(&head) {
+        Ok(text) if !text.is_ascii() => Some(head.len()),
+        Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
+        _ => None,
+    };
+    if let Some(end) = utf8_end {
+        let start = tail
+            .iter()
+            .take(3)
+            .take_while(|byte| **byte & 0xC0 == 0x80)
+            .count();
+        return with_capture_gap(
+            String::from_utf8_lossy(&head[..end]).into_owned(),
+            String::from_utf8_lossy(&tail[start..]).into_owned(),
+            omitted + (head.len() - end + start) as u64,
+        );
+    }
+    with_capture_gap(decode_output(&head), decode_output(&tail), omitted)
+}
+
+fn utf16_unit(pair: &[u8], little_endian: bool) -> u16 {
+    if little_endian {
+        u16::from_le_bytes([pair[0], pair[1]])
+    } else {
+        u16::from_be_bytes([pair[0], pair[1]])
+    }
+}
+
 /// Recognize redirected UTF-16 output by BOM or by the byte-position NUL bias of
 /// console diagnostics.  The no-BOM heuristic also requires valid UTF-16 and a
 /// printable decoded result, so ordinary binary/legacy output is not reinterpreted.
 fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
+    decode_utf16_with_order(bytes).map(|(_, text)| text)
+}
+
+fn decode_utf16_with_order(bytes: &[u8]) -> Option<(bool, String)> {
     let (little_endian, body, bom) = if bytes.starts_with(&[0xFF, 0xFE]) {
         (true, &bytes[2..], true)
     } else if bytes.starts_with(&[0xFE, 0xFF]) {
@@ -1325,26 +1416,23 @@ fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
     if body.len() % 2 != 0 {
         return None;
     }
-    let units = body.chunks_exact(2).map(|pair| {
-        if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
-        }
-    });
+    let units = body
+        .chunks_exact(2)
+        .map(|pair| utf16_unit(pair, little_endian));
     if bom {
-        return Some(
+        return Some((
+            little_endian,
             char::decode_utf16(units)
-                .map(|item| item.unwrap_or('\u{FFFD}'))
+                .map(|item| item.unwrap_or(char::REPLACEMENT_CHARACTER))
                 .collect(),
-        );
+        ));
     }
     let decoded: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
     let control_count = decoded
         .chars()
         .filter(|character| character.is_control() && !character.is_whitespace())
         .count();
-    (control_count <= decoded.chars().count() / 20).then_some(decoded)
+    (control_count <= decoded.chars().count() / 20).then_some((little_endian, decoded))
 }
 
 /// Decode `bytes` with a Windows OEM/ANSI codepage number. Pure and platform-independent
@@ -1452,13 +1540,24 @@ fn decode_stream_chunk(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> Option
         Err(_) => {}
     }
 
+    // Legacy bytes without a line ending still have to leave the live
+    // decoder. A chunk boundary can be lossy in the preview; the final
+    // capture keeps its own bytes and is decoded separately.
+    const MAX_STREAM_DECODE_BYTES: usize = 16 * 1024;
     let emit_len = if eof {
         pending.len()
     } else {
         pending
             .iter()
             .rposition(|byte| matches!(byte, b'\n' | b'\r'))
-            .map_or(0, |index| index + 1)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| {
+                if pending.len() >= MAX_STREAM_DECODE_BYTES {
+                    pending.len()
+                } else {
+                    0
+                }
+            })
     };
     if emit_len == 0 {
         return None;
@@ -3259,6 +3358,10 @@ impl crate::world::Shell for LocalShell {
         decode_output(bytes)
     }
 
+    fn decode_capture(&self, output: crate::world::CapturedOutput) -> String {
+        decode_captured_output(output)
+    }
+
     async fn spawn(
         &self,
         command: &str,
@@ -3526,7 +3629,11 @@ impl crate::world::Process for LocalProcess {
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
 /// (user-invoked `!` mode) both build on this.
 pub struct ShellOutcome {
+    /// Capped at `MAX_CAPTURED_BYTES`; over that, the head and tail around an
+    /// ASCII truncation marker, not the whole stream.
     pub stdout: String,
+    /// Capped at `MAX_CAPTURED_BYTES`; over that, the head and tail around an
+    /// ASCII truncation marker, not the whole stream.
     pub stderr: String,
     pub exit: ShellExit,
     pub elapsed_secs: f64,
@@ -3559,6 +3666,10 @@ pub enum ShellExit {
 ///
 /// No `ToolResult` framing, no approval, no error-signature tracking — those
 /// stay in the tool layer. `wd` is the working directory the command runs in.
+///
+/// Each captured stream is capped at `MAX_CAPTURED_BYTES`: a command that
+/// writes more keeps its head and tail, joins them with an ASCII truncation
+/// marker, and `stdout`/`stderr` describe only what was retained.
 pub async fn run_shell(
     world: &dyn crate::world::Shell,
     command: &str,
@@ -3588,8 +3699,8 @@ pub async fn run_shell(
         }
     };
 
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
+    let mut stdout_buf = crate::world::CappedBytes::new(MAX_CAPTURED_BYTES);
+    let mut stderr_buf = crate::world::CappedBytes::new(MAX_CAPTURED_BYTES);
     let mut stdout_decode_pending = Vec::new();
     let mut stderr_decode_pending = Vec::new();
     let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
@@ -3603,7 +3714,7 @@ pub async fn run_shell(
         loop {
             match tokio::time::timeout(idle_timeout, process.next_chunk()).await {
                 Ok(Some(Chunk::Stdout(bytes))) => {
-                    stdout_buf.extend_from_slice(&bytes);
+                    stdout_buf.push(&bytes);
                     has_any_output = true;
                     if let Some(chunk) =
                         decode_stream_chunk(&mut stdout_decode_pending, &bytes, false)
@@ -3612,7 +3723,7 @@ pub async fn run_shell(
                     }
                 }
                 Ok(Some(Chunk::Stderr(bytes))) => {
-                    stderr_buf.extend_from_slice(&bytes);
+                    stderr_buf.push(&bytes);
                     has_any_output = true;
                     if let Some(chunk) =
                         decode_stream_chunk(&mut stderr_decode_pending, &bytes, false)
@@ -3643,8 +3754,8 @@ pub async fn run_shell(
         chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
     }
 
-    let stdout_str = world.decode(&stdout_buf);
-    let stderr_str = world.decode(&stderr_buf);
+    let stdout_str = world.decode_capture(stdout_buf.finish());
+    let stderr_str = world.decode_capture(stderr_buf.finish());
     let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
     let exit = match result {
@@ -4003,6 +4114,62 @@ fn apply_askpass_env_sets_sudo_ssh_vars() {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolContext;
+
+    #[test]
+    fn capped_utf16_keeps_the_text_and_reports_the_gap() {
+        let text = format!("HEAD\n{}TAIL\n", "line🙂".repeat(100));
+        for little_endian in [false, true] {
+            for bom in [false, true] {
+                let encode = |unit: u16| {
+                    if little_endian {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    }
+                };
+                let mut bytes = Vec::new();
+                if bom {
+                    bytes.extend(encode(0xFEFF));
+                }
+                bytes.extend(text.encode_utf16().flat_map(encode));
+                for cap in 45..60 {
+                    let mut capture = crate::world::CappedBytes::new(cap);
+                    for chunk in bytes.chunks(7) {
+                        capture.push(chunk);
+                    }
+                    let shown = decode_captured_output(capture.finish());
+                    assert!(shown.starts_with("HEAD\n"), "{shown:?}");
+                    assert!(shown.ends_with("TAIL\n"), "{shown:?}");
+                    assert!(
+                        shown.contains("[atomcode: captured output truncated"),
+                        "{shown:?}"
+                    );
+                    assert!(!shown.contains(char::REPLACEMENT_CHARACTER), "{shown:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capped_utf8_does_not_decode_a_cut_tail_as_legacy_text() {
+        let text = "中".repeat(100) + "\n";
+        let mut capture = crate::world::CappedBytes::new(12);
+        capture.push(text.as_bytes());
+        let shown = decode_captured_output(capture.finish());
+        assert_eq!(
+            shown,
+            "中中中\n[atomcode: captured output truncated - 291 bytes omitted]\n\n"
+        );
+    }
+
+    #[test]
+    fn live_legacy_output_without_newlines_drains_the_decoder_buffer() {
+        let mut pending = Vec::new();
+        let block = [0xD6, 0xD0].repeat(4096);
+        assert!(decode_stream_chunk(&mut pending, &block, false).is_none());
+        assert!(decode_stream_chunk(&mut pending, &block, false).is_some());
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn grant_normalization_matches_join_with_comments_quotes_and_unicode() {
@@ -6075,5 +6242,139 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod capture_cap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_flood_keeps_its_head_and_tail_within_the_cap() {
+        // Distinct head and tail markers prove both ends survive the cap; the
+        // length bound proves the cap itself, not just "smaller than the input".
+        let outcome = run_shell(
+            &LocalShell,
+            "printf 'HEAD\\n'; yes x | head -n 3000000; printf 'TAIL\\n'",
+            &std::env::temp_dir(),
+            30,
+            |_| {},
+        )
+        .await;
+        let cap = MAX_CAPTURED_BYTES;
+        assert!(
+            outcome.stdout.len() <= cap + 256,
+            "captured {} bytes for a {cap}-byte cap",
+            outcome.stdout.len()
+        );
+        assert!(
+            outcome.stdout.starts_with("HEAD\n"),
+            "the head was dropped: {:?}",
+            &outcome.stdout[..outcome.stdout.len().min(40)]
+        );
+        assert!(
+            outcome.stdout.ends_with("TAIL\n"),
+            "the tail was dropped: {:?}",
+            &outcome.stdout[outcome.stdout.len().saturating_sub(40)..]
+        );
+        assert!(
+            outcome.stdout.contains("output truncated"),
+            "the middle was dropped without a marker"
+        );
+        assert!(
+            outcome.stdout.contains("bytes omitted"),
+            "the marker does not say how much was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bash_tool_caps_its_captured_output() {
+        // The tool path must use the capped collector. If it goes back to the
+        // uncapped one, the 6 MB command below reaches `result.content` whole.
+        let dir = tempfile::tempdir().unwrap();
+        let context = atomcode_kernel::tool::ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let result = BashTool::default()
+            .execute(
+                &serde_json::json!({
+                    "command": "printf 'HEAD\\n'; yes x | head -n 3000000; printf 'TAIL\\n'"
+                })
+                .to_string(),
+                &context,
+            )
+            .await;
+        assert!(
+            result.content.len() <= MAX_CAPTURED_BYTES + 4096,
+            "tool captured {} bytes for a {MAX_CAPTURED_BYTES}-byte cap",
+            result.content.len()
+        );
+        assert!(
+            result.content.starts_with("HEAD\n"),
+            "the tool lost the head: {:?}",
+            &result.content[..result.content.len().min(40)]
+        );
+        assert!(
+            result.content.ends_with("TAIL\n"),
+            "the tool lost the tail: {:?}",
+            &result.content[result.content.len().saturating_sub(40)..]
+        );
+        assert!(
+            result
+                .content
+                .contains("[atomcode: captured output truncated"),
+            "the tool did not cap its capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_flooded_streams_still_fit_the_artifact_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = atomcode_kernel::tool::ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let result = BashTool::default()
+            .execute(
+                &serde_json::json!({
+                    "command": "(printf 'HEAD\\n'; yes x | head -n 3000000; printf 'TAIL\\n') & (printf 'ERRHEAD\\n' >&2; yes e | head -n 3000000 >&2; printf 'ERRTAIL\\n' >&2) & wait"
+                })
+                .to_string(),
+                &context,
+            )
+            .await;
+        assert!(
+            result.content.len() <= crate::tools::output_artifact::MAX_ARTIFACT_BYTES,
+            "both streams captured {} bytes, over the artifact ceiling",
+            result.content.len()
+        );
+        assert!(
+            result.content.starts_with("HEAD\n"),
+            "the stdout head is missing: {:?}",
+            &result.content[..result.content.len().min(40)]
+        );
+        assert!(
+            result.content.contains("ERRHEAD\n"),
+            "the stderr head is missing"
+        );
+        assert!(
+            result.content.ends_with("ERRTAIL\n"),
+            "the stderr tail is missing: {:?}",
+            &result.content[result.content.len().saturating_sub(40)..]
+        );
+        assert_eq!(
+            result
+                .content
+                .matches("[atomcode: captured output truncated")
+                .count(),
+            2,
+            "each flooded stream needs its own marker: {:?}",
+            &result.content[..result.content.len().min(200)]
+        );
     }
 }

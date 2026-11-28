@@ -598,6 +598,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
         Msg::AgentsLead => "main · 这个会话本身".into(),
         Msg::AgentsStopped { name } => format!("{name} · 已停,日志还在").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "这个会话底下还没有别的 agent".into(),
         Msg::AgentsPickerHint => "看谁 · enter 切过去".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("需要更新版本才能打开 · {id}").into(),
@@ -1164,13 +1165,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "内部错误".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
-        Msg::StopWithOpenItems { count } => {
-            format!("已停下 · 任务清单还有 {count} 项没完成 —— 发一句「继续」接着做").into()
-        }
         Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-        Msg::StopWithMembersRunning { n } => format!("本轮结束 · 仍有 {n} 个子 agent 工作").into(),
         Msg::LiveWaitingForMember { n } => format!("等待 {n} 个子 agent 完成").into(),
         Msg::LiveStopping => "正在停止".into(),
         Msg::LiveRecognizingImage => "正在识别图片".into(),

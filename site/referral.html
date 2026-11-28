@@ -281,6 +281,13 @@
     .modal-overlay.open .modal-panel{transform:translateY(0)}
     .modal-body{padding:18px 16px}
   }
+  /* 触屏：可点元素 ≥44px */
+  @media (pointer:coarse){
+    .icon-btn{width:44px;height:44px}
+    .hdr-logo{min-height:44px}
+    .modal-close{width:44px;height:44px}
+    .modal-btn{min-height:44px}
+  }
 </style>
 </head>
 <body>
@@ -293,7 +300,7 @@
   <a class="hdr-logo" href="/index.html">
     <img src="https://cdn-news.gitcode.com/news/logo_1794046182088.png" alt="AtomCode">
     <span>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本" data-i18n-title="brand.version.title">v5.2.8</span>
+    <span class="ver" id="verBadge" title="当前版本" data-i18n-title="brand.version.title">v5.2.9</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="/index.html#features" data-i18n="nav.features">功能</a>

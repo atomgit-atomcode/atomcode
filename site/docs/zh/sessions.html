@@ -2,79 +2,76 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>会话与撤销 · AtomCode 文档</title>
 <meta name="description" content="会话与撤销 — AtomCode 文档。">
-<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<meta name="theme-color" content="#050605">
+<link rel="icon" type="image/svg+xml" href="../../assets/atomgit-mark.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../docs.css">
-<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+<script>try{if(localStorage.getItem('atomcode_theme')==='light')document.documentElement.classList.add('light')}catch(e){}</script>
 </head>
-<body data-page="sessions">
+<body data-page="sessions" data-lang="zh">
+<div class="prog" id="prog"></div>
 
-<header class="dhdr" id="dhdr">
-  <a class="dhdr-logo" href="../../index.html">
-    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
-    <span>AtomCode</span>
-    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v5.2.8</span>
-  </a>
-  <div class="dhdr-right">
-    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <span data-i18n="search.trigger.text">搜索文档…</span>
-      <span class="kbd">⌘K</span>
-    </button>
-    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
-    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
-    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
-    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
-  </div>
+<!-- ==================== 头部 ==================== -->
+<header class="dh">
+  <button class="ib sb-btn" id="sbBtn" aria-label="目录" aria-expanded="false">☰</button>
+  <a class="dh-brand" href="../../index.html"><img class="dh-mark" src="../../assets/atomgit-mark.svg" width="24" height="24" alt=""><span>AtomCode</span><em>DOCS</em><small>v5.2.9</small></a>
+  <button class="dh-search" id="sBtn"><b>/</b><span>搜索文档…</span><kbd>⌘K</kbd></button>
+  <nav class="dh-r">
+    <a class="ib txt" href="../../index.html">官网</a>
+    <a class="ib" href="../en/sessions.html" id="langBtn" hreflang="en" aria-label="English">EN</a>
+    <button class="ib" id="themeBtn" aria-label="切换主题"><span class="i-moon">◐</span></button>
+    <a class="ib txt" href="https://atomgit.com/atomgit_atomcode/atomcode">仓库 ↗</a>
+  </nav>
 </header>
 
-<div class="dlayout">
-  <aside class="dside" id="dside">
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
-    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
-    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
-    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
-    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
-    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
-    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
-    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
-    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
-    <a class="dside-link" href="./interactive-questions.html" data-slug="interactive-questions" data-i18n="side.interactive-questions">交互提问</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
-    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
-    <a class="dside-link" href="./subagents.html" data-slug="subagents" data-i18n="side.subagents">子代理</a>
-    <a class="dside-link" href="./approvals.html" data-slug="approvals" data-i18n="side.approvals">权限审批</a>
-    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
-    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
-    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
-    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
-    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
-    <a class="dside-link" href="./webui.html" data-slug="webui" data-i18n="side.webui">WebUI 界面</a>
-    <a class="dside-link" href="./webui-remote-access.html" data-slug="webui-remote-access" data-i18n="side.webui-remote-access">远程访问指南</a>
-  </div>
-
-  <div class="dside-group">
-    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
-    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
-  </div>
+<div class="dl">
+  <!-- ==================== 侧栏 ==================== -->
+  <aside class="ds" id="ds" aria-label="目录">
+<div class="sg"><div class="sg-t">概览</div>
+<a class="sl" href="./index.html"><i>Ac</i><span>文档首页</span></a>
+</div>
+<div class="sg"><div class="sg-t">开始</div>
+<a class="sl" href="./getting-started.html"><i>Qs</i><span>快速开始</span></a>
+<a class="sl" href="./login.html"><i>Lg</i><span>登录方式</span></a>
+<a class="sl" href="./configuration.html"><i>Cf</i><span>配置文件</span></a>
+</div>
+<div class="sg"><div class="sg-t">使用</div>
+<a class="sl" href="./basic-usage.html"><i>Bu</i><span>基本使用</span></a>
+<a class="sl" href="./slash-commands.html"><i>Sc</i><span>斜杠命令</span></a>
+<a class="sl" href="./keybindings.html"><i>Kb</i><span>快捷键</span></a>
+<a class="sl on" href="./sessions.html" aria-current="page"><i>Ud</i><span>会话与撤销</span></a>
+<a class="sl" href="./interactive-questions.html"><i>Iq</i><span>交互提问</span></a>
+</div>
+<div class="sg"><div class="sg-t">进阶</div>
+<a class="sl" href="./tools.html"><i>Tl</i><span>内置工具</span></a>
+<a class="sl" href="./subagents.html"><i>Sa</i><span>子代理</span></a>
+<a class="sl" href="./approvals.html"><i>Ap</i><span>权限审批</span></a>
+<a class="sl" href="./skills.html"><i>Sk</i><span>Skills 扩展</span></a>
+<a class="sl" href="./mcp.html"><i>Mc</i><span>MCP 集成</span></a>
+<a class="sl" href="./plugins.html"><i>Pl</i><span>Plugin 系统</span></a>
+<a class="sl" href="./memory.html"><i>Me</i><span>永久记忆</span></a>
+<a class="sl" href="./project-instructions.html"><i>Pi</i><span>项目指令文件</span></a>
+<a class="sl" href="./webui.html"><i>Wb</i><span>WebUI 界面</span></a>
+<a class="sl" href="./webui-remote-access.html"><i>Ra</i><span>远程访问指南</span></a>
+</div>
+<div class="sg"><div class="sg-t">问题</div>
+<a class="sl" href="./faq.html"><i>Fq</i><span>常见问题</span></a>
+</div>
+<div class="sg"><div class="sg-t">发布</div>
+<a class="sl" href="./changelog.html"><i>Cl</i><span>更新日志</span></a>
+</div>
   </aside>
+  <div class="ds-bg" id="dsBg"></div>
 
-  <main class="dmain prose-docs">
+  <!-- ==================== 正文 ==================== -->
+  <main class="dm">
+    <div class="crumb"><a href="./index.html">文档</a><span>/</span><span>使用</span><span>/</span><b>会话与撤销</b><em>10 分钟阅读</em></div>
+    <article class="prose" id="prose">
 <h1 id="会话与撤销">会话与撤销</h1>
       <p class="lede">AtomCode 默认持久化每一次对话,允许你随时恢复、继续、清空或压缩。一条 <code>/undo</code> 就能把对话记忆回退到此前任意一轮。</p>
 
@@ -91,14 +88,14 @@
 
       <h2 id="prompt-retention">系统提示与初始任务会保留吗？</h2>
       <p>这里需要区分<strong>系统提示</strong>和<strong>你发送的第一条任务消息</strong>：前者是 AtomCode 组装的角色、项目指令及能力说明，后者是你的实际输入。</p>
-      <table>
+      <div class="tw"><table>
         <thead><tr><th>内容</th><th>正常对话与压缩时的处理</th></tr></thead>
         <tbody>
           <tr><td>当前生效的系统提示</td><td>后续模型请求仍会使用，不会因常规历史摘要而丢弃。</td></tr>
           <tr><td>首条真实用户消息的文本</td><td>属于压缩保护范围，正常压缩不会删除或用摘要替换这条原始任务。</td></tr>
           <tr><td>后续历史消息与工具结果</td><td>可能被摘要或精简。会话记录已保存在磁盘，不代表每次请求都发送全部原文。</td></tr>
         </tbody>
-      </table>
+      </table></div>
       <p>这描述的是正常上下文压缩；主动执行 <code>/clear</code>、<code>/session</code>，或通过 <code>/undo</code> / <code>/rewind</code> 回退对话，会改变当前有效历史。图片等附件也可能单独转换或折叠，不能把文本保护理解为附件始终原样发送。</p>
 
       <h3 id="prompt-resume">恢复会话后，系统提示完全一样吗？</h3>
@@ -129,7 +126,7 @@
 
       <h2 id="bg">后台会话(<code>/background</code> · <code>/bg</code>)</h2>
       <p>需要同时跟进多条任务、又不想丢失当前对话上下文?<code>/background</code>(别名 <code>/bg</code>,二者等价)把当前会话挪到后台、打开一个全新前台,随时可以切回去。最多 <strong>16 个并行后台槽位</strong>。</p>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
@@ -141,7 +138,7 @@
           <tr><td><code>/bg drop &lt;N&gt;</code></td><td>丢弃第 N 号后台会话</td></tr>
           <tr><td><code>/bg help</code>(别名 <code>-h</code>、<code>--help</code>)</td><td>显示内置帮助</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h3 id="会话状态">会话状态</h3>
       <p><code>/bg list</code> 的"状态"列对应会话在后台时的运行情况:</p>
@@ -169,7 +166,7 @@
       <p>不同 <code>ATOMCODE_HOME</code> 可隔离配置与会话存储。会话锁和 home 隔离均不保护项目工作区；多个 agent 并行修改代码时建议使用独立 Git worktree，避免文件或 Git 操作互相覆盖。</p>
 
       <h2 id="清空-vs-压缩-vs-新建">清空 vs 压缩 vs 新建</h2>
-      <table>
+      <div class="tw"><table>
         <thead>
           <tr><th>命令</th><th>保留历史</th><th>保留会话 ID</th><th>何时使用</th></tr>
         </thead>
@@ -178,7 +175,7 @@
           <tr><td><code>/compact</code></td><td>部分(摘要)</td><td>是</td><td>上下文快撑爆,但不想丢失之前的脉络</td></tr>
           <tr><td><code>/session</code></td><td>另起一段</td><td>否(新 ID)</td><td>开始完全不相关的新任务</td></tr>
         </tbody>
-      </table>
+      </table></div>
 
       <h2 id="对话记忆回退-undo">对话记忆回退 <code>/undo</code></h2>
       <p><code>/undo</code> 把<strong>对话记忆</strong>回退到某一轮之前,删除那一轮及其后的全部消息,并把那一轮你输入的 prompt 还原回输入框,方便你修改后重发。</p>
@@ -214,33 +211,33 @@
       <p>AtomCode 的会话是按工作目录分组的。切换目录的推荐方式:</p>
       <ul>
         <li>从命令行启动时用 <code>-C</code> 指定</li>
-        <li>运行中用 <code>/cd</code> 切换,<code>default_workdir</code> 会自动落盘</li>
+        <li>在 TUI 中用 <code>/cd</code> 切换目录并新建会话。下次启动时用 <code>-C</code> 指定目录，或用 <code>/resume</code> 恢复对应会话。</li>
       </ul>
 
       <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./project-instructions.html">项目指令文件</a> —— 用 <code>.atomcode.md</code> 为每个项目固化上下文</li>
       </ul>
-
-    <footer class="dftr">
-      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
-      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
-    </footer>
+    </article>
+    <nav class="pager"><a class="pg prev" href="./keybindings.html"><small>← 上一篇</small><b><i>Kb</i>快捷键</b></a><a class="pg next" href="./interactive-questions.html"><small>下一篇 →</small><b><i>Iq</i>交互提问</b></a></nav>
+    <footer class="df"><span>© 2026 AtomCode · MIT</span><a href="https://atomgit.com/atomgit_atomcode/atomcode/issues">报告问题 ↗</a></footer>
   </main>
+
+  <!-- ==================== 本页目录 ==================== -->
+  <aside class="toc" id="toc" aria-label="本页目录"><p>本页目录</p><nav id="tocList"></nav><button id="toTop">↑ 回到顶部</button></aside>
 </div>
 
-<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
-  <div class="search-modal-bg"></div>
-  <div class="search-modal-box">
-    <div class="search-input-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
-      <span class="search-esc">ESC</span>
-    </div>
-    <div class="search-results" id="searchResults"></div>
+<!-- ==================== 搜索 ==================== -->
+<div class="sm" id="sm" role="dialog" aria-modal="true" aria-label="搜索文档…">
+  <div class="sm-box">
+    <div class="sm-in"><b>/</b><input id="sIn" type="search" autocomplete="off" spellcheck="false" placeholder="搜索文档…"><kbd>ESC</kbd></div>
+    <ul class="sm-list" id="sList" role="listbox"></ul>
+    <div class="sm-ft">↑↓ 选择 · ↵ 打开 · esc 关闭</div>
   </div>
 </div>
-
+<div class="toast" id="toast" role="status"></div>
+<script>window.DOCS_UI={"copy": "复制", "copied": "已复制", "noRes": "没有匹配的结果"};</script>
+<script src="../search-index.zh.js"></script>
 <script src="../docs.js"></script>
 </body>
 </html>

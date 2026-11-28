@@ -636,6 +636,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoRoster => "this screen has no agent roster: the launcher provided no `tui-team-roster`".into(),
         Msg::AgentsLead => "main · this session itself".into(),
         Msg::AgentsStopped { name } => format!("{name} · stopped; its log is still here").into(),
+        Msg::AgentsTaskChild { label } => format!("task · {label}").into(),
         Msg::AgentsNoneYet => "there is no other agent under this session yet".into(),
         Msg::AgentsPickerHint => "read which one · enter switches to it".into(),
         Msg::SessionNeedsNewerVersion { id } => format!("a newer version is needed to open it · {id}").into(),
@@ -1227,14 +1228,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopInternalError => "Internal error".into(),
         Msg::StopInvariantViolated => "stopped · an internal invariant was broken; this session should not be carried on".into(),
         Msg::StopMaxContinuations => "stopped · the automatic continuations ran out".into(),
-        Msg::StopWithOpenItems { count } => format!(
-            "stopped · {count} item(s) on the task list are still open — send \"continue\" to pick them up"
-        )
-        .into(),
         Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-        Msg::StopWithMembersRunning { n } => format!("Turn ended · {n} sub-agents still working").into(),
         Msg::LiveWaitingForMember { n } => format!("Waiting for {n} sub-agents").into(),
         Msg::LiveStopping => "stopping".into(),
         Msg::LiveRecognizingImage => "recognizing image".into(),

@@ -1,5 +1,7 @@
 //! Runtime-owned observations of `bash_start` completion requests.
-//! No process ownership: cancellation forgets notifications and leaves polling available.
+//! No process ownership: a cancelled turn leaves the job running, so its
+//! completion still wakes the model; a generation change forgets notifications
+//! and leaves polling available.
 use atomcode_capabilities::tools::bash::{observe_completion, BackgroundCompletion};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::tool::{ToolCall, ToolResult};
@@ -12,10 +14,19 @@ const NOTICE_BUDGET_CHARS: usize = 8000;
 const NOTICE_TAIL_CHARS: usize = 2000;
 
 pub(crate) fn completion_notice(batch: &[BackgroundCompletion], goal_waiting: bool) -> String {
-    let tail = (NOTICE_BUDGET_CHARS / batch.len().max(1)).min(NOTICE_TAIL_CHARS);
-    batch
+    let shown: Vec<_> = batch
         .iter()
         .filter(|completion| goal_waiting || !completion.killed)
+        .collect();
+    // Only output still in the store takes a share: a job `bash_poll` already
+    // collected adds no tail, and must not shrink the ones that do.
+    let collectable = shown
+        .iter()
+        .filter(|completion| observe_completion(&completion.job_id).is_some())
+        .count();
+    let tail = (NOTICE_BUDGET_CHARS / collectable.max(1)).min(NOTICE_TAIL_CHARS);
+    shown
+        .into_iter()
         .filter_map(|completion| {
             completion.notification_within(tail).or_else(|| {
                 // A terminal poll or store reclamation can remove the output
@@ -396,6 +407,43 @@ pub(crate) mod tests {
             .await;
         assert!(!result.is_error);
     }
+    /// A job `bash_poll` already collected still completes its observer, but
+    /// adds nothing to the notice — nor takes a share of its output budget.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn collected_completions_do_not_shrink_the_notice_tail() {
+        let mut jobs = BackgroundJobs::default();
+        for name in ["live", "a", "b", "c", "d"] {
+            let (mut call, mut result, finish) = job(true).await;
+            call.id = name.into();
+            result.call_id = name.into();
+            jobs.started(&call);
+            jobs.result(&result);
+            finish.cancel();
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut batch = vec![jobs.next().await];
+        batch.extend(jobs.ready());
+        assert_eq!(batch.len(), 5);
+        for completion in &batch[1..] {
+            collect(completion).await;
+        }
+        let text = completion_notice(&batch, false);
+        assert!(
+            text.contains(&format!("job {} has", batch[0].job_id)),
+            "{text}"
+        );
+        for completion in &batch[1..] {
+            assert!(
+                !text.contains(&format!("job {} has", completion.job_id)),
+                "{text}"
+            );
+        }
+        assert!(
+            text.contains(&format!("up to {NOTICE_TAIL_CHARS} characters")),
+            "{text}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn only_explicit_jobs_notify_and_generation_changes_forget_waits() {
         let (call, result, finish) = job(false).await;

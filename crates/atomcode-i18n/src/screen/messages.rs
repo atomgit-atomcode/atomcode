@@ -832,6 +832,9 @@ pub enum Msg<'a> {
     AgentsStopped {
         name: &'a str,
     },
+    AgentsTaskChild {
+        label: &'a str,
+    },
     AgentsNoneYet,
     AgentsPickerHint,
     SessionNeedsNewerVersion {
@@ -1841,16 +1844,8 @@ pub enum Msg<'a> {
     StopInvariantViolated,
     StopInternalError,
     StopMaxContinuations,
-    /// A turn the model ended on its own while the task list it kept still had
-    /// open items: not a failure, and not a finish either.
-    StopWithOpenItems {
-        count: usize,
-    },
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
-    StopWithMembersRunning {
-        n: usize,
-    },
     LiveWaitingForMember {
         n: usize,
     },
