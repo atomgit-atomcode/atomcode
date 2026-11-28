@@ -1,4 +1,8 @@
-//! Conditional Termux resolver for musl Linux artifacts. Never chooses public DNS.
+//! Conditional Termux resolver for musl Linux artifacts. It never picks a DNS
+//! server itself: it reads `$PREFIX/etc/resolv.conf`, which Termux ships as
+//! Google's public 8.8.8.8/8.8.4.4 until the user edits it, so on networks
+//! where those are unreliable lookups fail intermittently. A musl binary cannot
+//! reach Android's own resolver; see docs/troubleshooting/termux-dns.md.
 use reqwest::dns::Resolve;
 use std::sync::Arc;
 
