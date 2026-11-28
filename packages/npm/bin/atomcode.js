@@ -20,6 +20,10 @@ const PLATFORM_PACKAGES = {
   ohos: {
     arm64: "@atomgit.com/atomcode-ohos-arm64",
   },
+  // Termux. Node reports `android` there; the build links Android's libc.
+  android: {
+    arm64: "@atomgit.com/atomcode-android-arm64",
+  },
 };
 
 const os = process.platform;
@@ -29,7 +33,7 @@ const pkgName = PLATFORM_PACKAGES[os]?.[arch];
 if (!pkgName) {
   console.error(
     `Unsupported platform: ${os} ${arch}. ` +
-      "AtomCode provides binaries for darwin (arm64/x64), linux (arm64/x64), windows (x64), and ohos (arm64)."
+      "AtomCode provides binaries for darwin (arm64/x64), linux (arm64/x64), windows (x64), ohos (arm64), and android (arm64)."
   );
   process.exit(1);
 }

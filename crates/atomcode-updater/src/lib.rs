@@ -197,12 +197,59 @@ pub fn detect_target() -> Option<&'static str> {
             _ => None,
         };
     }
-    #[cfg(not(any(target_os = "ohos", target_env = "ohos")))]
+    // The Android artifact links bionic; pinned for the same reason as OHOS.
+    #[cfg(target_os = "android")]
+    {
+        return match std::env::consts::ARCH {
+            "aarch64" => Some("android-arm64"),
+            _ => None,
+        };
+    }
+    #[cfg(not(any(target_os = "ohos", target_env = "ohos", target_os = "android")))]
     {
         target_tag(std::env::consts::OS, std::env::consts::ARCH)
     }
 }
 
+/// The asset to install from `manifest`, given what [`detect_target`] said.
+///
+/// A static-musl `linux-arm64` running under Termux cannot use Android's DNS
+/// resolver (#1800), so it moves itself to the `android-arm64` build — but
+/// only once a release actually ships one; until then it stays on its own.
+fn release_target(detected: &'static str, manifest: &Manifest, on_termux: bool) -> &'static str {
+    const ANDROID: &str = "android-arm64";
+    if detected == "linux-arm64" && on_termux && manifest.binaries.contains_key(ANDROID) {
+        ANDROID
+    } else {
+        detected
+    }
+}
+
+/// Same detection the Termux DNS fallback uses (`atomcode-auth`'s `dns.rs`),
+/// plus the loader the Android build needs: a proot or chroot Linux rootfs can
+/// inherit Termux's environment yet be unable to run a bionic binary.
+fn on_termux() -> bool {
+    let termux = std::env::var_os("TERMUX_VERSION").is_some()
+        || std::env::var_os("PREFIX")
+            .is_some_and(|prefix| prefix.to_string_lossy().contains("/com.termux/"));
+    termux && std::path::Path::new("/system/bin/linker64").exists()
+}
+
+/// [`release_target`] for this process, saying so when it changes the build.
+fn install_target(detected: &'static str, manifest: &Manifest) -> &'static str {
+    let target = release_target(detected, manifest, on_termux());
+    if target != detected {
+        tracing::info!(
+            from = detected,
+            to = target,
+            "upgrade moves to another platform build"
+        );
+    }
+    target
+}
+
+// Unused on the pinned targets above; the tests still exercise it.
+#[cfg_attr(any(target_env = "ohos", target_os = "android"), allow(dead_code))]
 fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("darwin-arm64"),
@@ -879,6 +926,7 @@ pub async fn run_upgrade(
     ensure_writable(&exe)?;
 
     let manifest = fetch_manifest().await?;
+    let target = install_target(target, &manifest);
     let _ = tx.send(UpgradeEvent::ManifestFetched {
         version: manifest.version.clone(),
     });
@@ -1217,6 +1265,7 @@ pub async fn prepare_deferred_upgrade(
     })?;
 
     let manifest = fetch_manifest().await?;
+    let target = install_target(target, &manifest);
 
     if !is_newer(&manifest.version, current_version) {
         return Ok(None);
@@ -1939,6 +1988,34 @@ mod tests {
         assert_eq!(target_tag("windows", "x86_64"), Some("windows-x64"));
         assert_eq!(target_tag("windows", "aarch64"), Some("windows-arm64"));
         assert_eq!(target_tag("linux", "arm"), None);
+    }
+
+    fn manifest_with(targets: &[&str]) -> Manifest {
+        let entry = || BinaryEntry {
+            sha256: "00".into(),
+            size: 1,
+        };
+        Manifest {
+            version: "v5.3.0".into(),
+            released_at: None,
+            binaries: targets.iter().map(|t| (t.to_string(), entry())).collect(),
+        }
+    }
+
+    #[test]
+    fn a_termux_musl_install_moves_to_android_only_once_a_release_ships_it() {
+        let with = manifest_with(&["linux-arm64", "android-arm64"]);
+        let without = manifest_with(&["linux-arm64"]);
+        assert_eq!(release_target("linux-arm64", &with, true), "android-arm64");
+        // A release from before the Android build: stay on the build that exists.
+        assert_eq!(release_target("linux-arm64", &without, true), "linux-arm64");
+        // Ordinary Linux, and every other target, is never moved.
+        assert_eq!(release_target("linux-arm64", &with, false), "linux-arm64");
+        assert_eq!(release_target("linux-x64", &with, true), "linux-x64");
+        assert_eq!(
+            release_target("android-arm64", &with, true),
+            "android-arm64"
+        );
     }
 
     #[test]

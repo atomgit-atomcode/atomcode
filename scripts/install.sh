@@ -25,7 +25,15 @@ ext=""  # binary filename suffix; ".exe" on Windows shells (set below)
 
 case "$uname_s" in
     Darwin) os="darwin" ;;
-    Linux)  os="linux"  ;;
+    # Termux reports Linux. Its own build links Android's libc and so uses the
+    # system DNS resolver, which the static musl Linux build cannot (#1800).
+    Linux)
+        if [ "$(uname -o 2>/dev/null)" = "Android" ] || [ -n "${TERMUX_VERSION:-}" ]; then
+            os="android"
+        else
+            os="linux"
+        fi
+        ;;
     HarmonyOS) os="ohos" ;;
     # MSYS2 / MinGW / Git-Bash / Cygwin: a Unix shell running ON Windows. `uname -s` looks
     # like MSYS_NT-10.0-26100 / MINGW64_NT-... / CYGWIN_NT-.... Install the native Windows
@@ -39,6 +47,12 @@ case "$uname_m" in
     x86_64|amd64)  arch="x64"   ;;
     *) echo "Unsupported arch: $uname_m"; exit 1 ;;
 esac
+
+# Only arm64 has an Android build, and it needs Android's own loader — absent in
+# a proot/chroot Linux rootfs that inherited Termux's environment.
+if [ "$os" = "android" ] && { [ "$arch" != "arm64" ] || [ ! -e /system/bin/linker64 ]; }; then
+    os="linux"
+fi
 
 # --- pick install dir ---
 if [ -n "${ATOMCODE_PREFIX:-}" ]; then
@@ -153,7 +167,26 @@ URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
 
 echo "==> Downloading $BIN_NAME"
 echo "    from $URL"
-$_down "$DEST" "$URL"
+if [ "$os" != "android" ]; then
+    $_down "$DEST" "$URL"
+else
+    rc=0
+    $_down "$DEST" "$URL" || rc=$?
+    # A missing asset is an HTTP error (curl -f exits 22, wget 8) or an HTML page.
+    # Anything else — DNS, timeout, reset — is a failed download, not a reason
+    # to install the Linux build this platform was moved off (#1800).
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 22 ] && [ "$rc" -ne 8 ]; then
+        exit "$rc"
+    fi
+fi
+if [ "$os" = "android" ] && { [ "$rc" -ne 0 ] || head -c 4 "$DEST" | grep -q "<" 2>/dev/null; }; then
+    # Releases before the Android build only ship the Linux one; it still runs.
+    os="linux"
+    BIN_NAME="atomcode-${VERSION}-${os}-${arch}${ext}"
+    URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
+    echo "==> No Android build in ${VERSION}; downloading $BIN_NAME instead"
+    $_down "$DEST" "$URL"
+fi
 
 # Sanity check: must be a real binary, not an HTML 404 page
 if head -c 4 "$DEST" | grep -q "<" 2>/dev/null; then

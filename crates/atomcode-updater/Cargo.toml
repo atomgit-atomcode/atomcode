@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
 sha2 = "0.10"
+tracing = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time", "net"] }
 # `config_dir()` for the staged-upgrade path; `proxy` env items to apply the proxy
