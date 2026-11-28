@@ -166,3 +166,12 @@ export function projectTodoCalls(
 
   return { committed, preview, hasUnresolved, hasApplicable };
 }
+
+/** A server snapshot already includes all committed calls. Only older servers
+ * without this field need to replay the transcript to reconstruct the list. */
+export function restoreTodoProjection(
+  calls: readonly TodoProjectionCall[],
+  snapshot?: readonly TodoItem[],
+): TodoProjection {
+  return snapshot === undefined ? projectTodoCalls([], calls) : projectTodoCalls(snapshot, []);
+}

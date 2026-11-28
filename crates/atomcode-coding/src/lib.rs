@@ -140,7 +140,7 @@ pub use runtime::{
     UndoResult, UserInput, VisionNotice, WorkspaceScope,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
-pub use todo::TodoHook;
+pub use todo::{session_todo_state, TodoHook};
 pub use vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcome};
 
 /// Re-export the CC external-hooks types so host adapters that resolve

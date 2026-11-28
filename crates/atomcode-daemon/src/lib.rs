@@ -509,6 +509,9 @@ pub struct SessionDetail {
     /// a compaction that drained the transcript's todowrite calls (issue #1503).
     #[serde(default)]
     pub todos: Vec<atomcode_capabilities::session::manager::TodoSidecarItem>,
+    /// Effective state at the snapshot boundary, including explicit clears.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub todo_state: Option<Vec<atomcode_capabilities::session::manager::TodoSidecarItem>>,
 }
 
 /// Global project state store (current working directory)
@@ -2760,6 +2763,8 @@ async fn get_session_detail(
             // (Survives compaction that drained the transcript's todowrite calls;
             // the stale marker check happens inside `read_todo_sidecar`.)
             let todos = read_todo_sidecar_for_detail(&session);
+            let todo_state =
+                atomcode_coding::session_todo_state(&session.snapshot, &storage, &session.meta.id);
             let detail = SessionDetail {
                 history_seed,
                 history_older,
@@ -2775,6 +2780,7 @@ async fn get_session_detail(
                 message_count,
                 messages,
                 todos,
+                todo_state,
             };
             Json(detail).into_response()
         }

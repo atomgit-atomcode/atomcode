@@ -14,7 +14,7 @@ use atomcode_capabilities::tools::todo::{
 };
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
-use atomcode_kernel::message::{Conversation, Message, Role};
+use atomcode_kernel::message::{Conversation, Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::{ChatOptions, ToolChoice};
 
 use atomcode_config::config::TodoEagerness;
@@ -856,6 +856,45 @@ fn current_todos(
     })
 }
 
+/// Project a persisted session's todo state at the snapshot boundary. An empty
+/// list is a valid state. A sidecar from a later turn may already have been
+/// written while a live subscriber is still replaying that turn's events.
+pub fn session_todo_state(
+    snapshot: &SessionSnapshot,
+    manager: &SessionManager,
+    id: &str,
+) -> Option<Vec<TodoSidecarItem>> {
+    let todos = current_todos(&snapshot.messages, || {
+        let sidecar = manager.read_todo_sidecar(id).ok()??;
+        let turn = snapshot.turn_counter;
+        if sidecar.through.is_some_and(|position| position.turn > turn) {
+            let baseline = sidecar.baseline?;
+            if baseline
+                .through
+                .is_some_and(|position| position.turn > turn)
+            {
+                return None;
+            }
+            return Some(TodoSidecar {
+                todos: baseline.todos,
+                through: baseline.through,
+                ..Default::default()
+            });
+        }
+        Some(sidecar)
+    })?;
+    Some(
+        todos
+            .items
+            .into_iter()
+            .map(|item| TodoSidecarItem {
+                content: item.content,
+                status: todo_status_str(&item.status).to_owned(),
+            })
+            .collect(),
+    )
+}
+
 /// Read-only recap projection. Preserve unknown/unavailable instead of inventing
 /// an empty list; a retained full plan does not need the sidecar at all.
 pub(crate) fn recap_todos(
@@ -1346,6 +1385,43 @@ mod tests {
         msgs.push(synthetic_system_reminder("Current date: 2026-09-23 (Wed)"));
         msgs.push(step());
         assert!(tail(msgs).await.contains(NOTE));
+    }
+
+    #[test]
+    fn session_todo_state_recovers_compacted_plans_and_excludes_future_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_root(dir.path());
+        let id = "session";
+        let item = TodoSidecarItem {
+            content: "retained task".into(),
+            status: "in_progress".into(),
+        };
+        let position = |turn| TodoCallPosition {
+            turn,
+            round: 1,
+            index: 0,
+        };
+        let mut snapshot = SessionSnapshot::new(Vec::new());
+        snapshot.turn_counter = 3;
+        assert!(session_todo_state(&snapshot, &manager, id).is_none());
+        manager
+            .write_todo_sidecar(id, &[item], 10, Some(position(3)))
+            .unwrap();
+        assert_eq!(
+            session_todo_state(&snapshot, &manager, id).unwrap()[0].content,
+            "retained task"
+        );
+        manager
+            .write_todo_sidecar(id, &[], 11, Some(position(4)))
+            .unwrap();
+        assert_eq!(
+            session_todo_state(&snapshot, &manager, id).unwrap().len(),
+            1
+        );
+        snapshot.turn_counter = 4;
+        assert!(session_todo_state(&snapshot, &manager, id)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

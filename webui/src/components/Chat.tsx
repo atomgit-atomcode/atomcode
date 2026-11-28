@@ -99,6 +99,7 @@ import {
   isTodoTool,
   projectTodoCalls,
   reduceTodoPanelVisibility,
+  restoreTodoProjection,
   type TodoItem,
   type TodoProjectionCall,
 } from '../lib/todoState';
@@ -1275,8 +1276,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
           const cachedTodos = todoCacheRef.current.get(loadId);
           const cachedTodoVisibility = todoVisibilityCacheRef.current.get(loadId);
           // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
-          const loaded = sessionMessagesToDisplay(sessionResult.value.messages, !sessionResult.value.history_seed);
-          if (sessionResult.value.history_seed) sessionMessagesToDisplay(sessionResult.value.history_seed);
+          const loaded = restoreSessionMessages(sessionResult.value);
 
           if (currentCached && currentCached.length > 0) {
             // If the loaded messages from the backend are shorter than the cached messages,
@@ -1728,7 +1728,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
   }, [sync]);
 
   // ── Shared history → display conversion (reused by session load AND live snapshot) ──
-  function sessionMessagesToDisplay(msgs: SessionMessage[], projectState = true): Message[] {
+  function sessionMessagesToDisplay(msgs: SessionMessage[], projectState = true, todoState?: TodoItem[]): Message[] {
     const loaded: Message[] = [];
     const todoTitles: TodoTitles = new Map();
     const pendingTodoCalls = new Map<string, { name: string; args: string }>();
@@ -1801,7 +1801,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // system messages: skip
     }
     if (!projectState) return loaded;
-    const restoredProjection = projectTodoCalls([], orderedTodoCalls);
+    // The server supplies committed state, including plans lost to compaction.
+    // Pending work after that boundary arrives through the live tool events.
+    const restoredProjection = restoreTodoProjection(orderedTodoCalls, todoState);
     const restoredTodoItems = restoredProjection.committed;
     const priorTodoCalls = orderedTodoCalls.filter(
       (call) => (todoCallEpochs.get(call.id) ?? 0) < inputEpoch,
@@ -1811,11 +1813,8 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
     );
     const priorTodoItems = projectTodoCalls([], priorTodoCalls).committed;
     const restoredTodoVisible = restoredTodoItems.some((item) => item.status !== 'completed')
-      || projectTodoCalls(priorTodoItems, currentTodoCalls).hasApplicable;
-    todoTitlesRef.current = new Map(
-      restoredTodoItems.map((item, index) => [index + 1, item.content]),
-    );
-    pendingTodoCallsRef.current = pendingTodoCalls;
+      || projectTodoCalls(todoState ?? priorTodoItems, currentTodoCalls).hasApplicable;
+    pendingTodoCallsRef.current = todoState === undefined ? pendingTodoCalls : new Map();
     todoBatchRef.current = restoredProjection.hasUnresolved
       ? { base: [], calls: orderedTodoCalls, visibleBase: false }
       : { base: restoredTodoItems, calls: [], visibleBase: restoredTodoVisible };
@@ -1825,6 +1824,16 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       restoredTodoVisible
         && (restoredProjection.preview.length > 0 || restoredTodoItems.length > 0),
     );
+    return loaded;
+  }
+
+  function restoreSessionMessages(data: {
+    messages: SessionMessage[];
+    history_seed?: SessionMessage[];
+    todo_state?: TodoItem[];
+  }): Message[] {
+    const loaded = sessionMessagesToDisplay(data.messages, !data.history_seed, data.todo_state);
+    if (data.history_seed) sessionMessagesToDisplay(data.history_seed, true, data.todo_state);
     return loaded;
   }
 
@@ -1896,7 +1905,13 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
-      let loaded = segmentMessages(sessionMessagesToDisplay(e.messages, !e.history_seed));
+      const isNewSession = activeIdRef.current !== e.session_id;
+      if (e.session_id) {
+        if (isNewSession) sessionGenerationRef.current += 1;
+        activeIdRef.current = e.session_id;
+        loadedForRef.current = e.session_id;
+      }
+      let loaded = segmentMessages(restoreSessionMessages(e));
       const previousHistory = serverHistoryRef.current;
       const prefix = previousHistory.session === e.session_id
         ? preservedHistoryPrefix(messagesRef.current, loaded, previousHistory.baseline, e.history_older) : [];
@@ -1910,10 +1925,9 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
           timelineAnchorRef.current = null;
         }
       }
-      if (e.history_seed) sessionMessagesToDisplay(e.history_seed);
       // A new session starts at the bottom. Reconnection to the same session
       // must preserve whether the reader was following or inspecting history.
-      if (e.session_id && activeIdRef.current !== e.session_id) {
+      if (e.session_id && isNewSession) {
         scrollRestorationRef.current?.interact();
         atBottomRef.current = true;
         setShowJumpBtn(false);
@@ -1949,14 +1963,7 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
       // 把稳定的 session_id 告知 App，接入侧边栏历史 + URL 刷新恢复。
       // 与 /chat 的 'done' 事件同路径：activeIdRef + loadedForRef 标记，
       // 避免 App 回填 project_hash 时触发重复加载覆盖当前画布。
-      if (e.session_id) {
-        if (activeIdRef.current !== e.session_id) {
-          sessionGenerationRef.current += 1;
-        }
-        activeIdRef.current = e.session_id;
-        loadedForRef.current = e.session_id;
-        onSessionId(e.session_id);
-      }
+      if (e.session_id) onSessionId(e.session_id);
       return;
     }
     // 模型切换是进程级（全局），与正在查看哪个会话无关。provider 事件是运行时
@@ -2387,18 +2394,20 @@ export function Chat({ browseSession, onReturnToBound, onContinueBrowse, browseA
 
   const slashCommandMap = useMemo(() => buildCommandMap(FRONTEND_COMMANDS), []);
 
-  // Reload one session's transcript from disk into the view, guarded against a
-  // session switch racing the async fetch. Mirrors the session-load effect's activeIdRef guard.
+  // A later session visit or live observation supersedes this async reload.
   async function reloadSessionTranscript(id: string) {
     const projectHash = activeSession?.project_hash;
     if (!projectHash) return;
+    const generation = sessionGenerationRef.current;
+    const liveObservation = liveSessionObservationRef.current;
     try {
       const detail = await getSessionPage(projectHash, id);
-      if (activeIdRef.current === id) {
+      if (activeIdRef.current === id
+          && sessionGenerationRef.current === generation
+          && liveSessionObservationRef.current === liveObservation) {
         setServerHistory({ session: id, cursor: detail.history_older, baseline: detail.history_older });
         updateSummaryCount(detail.summary_count);
-        setMessages(sessionMessagesToDisplay(detail.messages, !detail.history_seed));
-        if (detail.history_seed) sessionMessagesToDisplay(detail.history_seed);
+        setMessages(restoreSessionMessages(detail));
       }
     } catch { /* refresh failure is non-fatal; the notice still gives feedback */ }
   }
