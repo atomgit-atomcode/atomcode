@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -5663,13 +5663,16 @@ pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     ensure_opened_regular(path, &file)?;
     ensure_private_file_permissions(path, &file)?;
     #[cfg(windows)]
-    {
-        // Park at the end, so a write that does not seek lands where an append
-        // would have put it.
-        use std::io::Seek;
-        file.seek(io::SeekFrom::End(0))
-            .map_err(|e| io_at(path, e))?;
-    }
+    let file = {
+        use std::io::{Seek, SeekFrom};
+
+        // The access mode above replaces FILE_APPEND_DATA. Position the
+        // cursor at the end so the first write appends instead of overwriting.
+        let mut file = file;
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| io_at(path, error))?;
+        file
+    };
     Ok(file)
 }
 
