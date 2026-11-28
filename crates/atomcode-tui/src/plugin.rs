@@ -1946,7 +1946,9 @@ pub struct Tui {
     /// How many allowance asks are in flight. Idle asks ride the current
     /// generation instead of bumping it, so a second ask of the same
     /// generation — an idle beat racing a turn-end ask — could land out of
-    /// order: the beat holds off until every in-flight ask is done.
+    /// order: the beat holds off until every in-flight ask is done. The ask
+    /// itself is wrapped in a budget timeout, so a host that never answers
+    /// still ends its task and the count cannot stick.
     allowance_asks_out: Arc<AtomicU64>,
     /// Whether the "out of quota — here is `/openrouter`" line has been said.
     /// Once per screen: the account stays out until the window turns over, and a
@@ -20312,7 +20314,36 @@ mod allowance_switch_tests {
             }),
         });
         assert!(host.moment.read().unwrap().allowance.is_none());
-        // A post-switch ask fails: the run of failed asks begins at the new
+        // A post-switch ask lands fresh figures: the standing mark the
+        // failed-run exemption is judged against now belongs to the NEW
+        // provider's generation. The switch's own handler re-asks after
+        // clearing the row, so the ask is already out here.
+        pending
+            .recv()
+            .await
+            .unwrap()
+            .send(reply(vec![atomcode_host_api::UsageWindow {
+                label: "5h".into(),
+                exhausted: false,
+                resets_at: "17:51".into(),
+                resets_in_seconds: 100,
+                window_seconds: 18_000,
+                used_percent: Some(40),
+                calls_used: None,
+                call_limit: None,
+            }]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            host.moment
+                .read()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .is_some_and(|left| left.percent == 40),
+            "the post-switch figures land and stand"
+        );
+        // The next ask fails: the run of failed asks begins at the newest
         // generation.
         tokio::time::advance(ALLOWANCE_EVERY).await;
         tui.check_allowance(false, false);
@@ -20335,8 +20366,14 @@ mod allowance_switch_tests {
         pre.send(reply(windows)).unwrap();
         tokio::task::yield_now().await;
         assert!(
-            host.moment.read().unwrap().allowance.is_none(),
-            "a pre-switch reply must not land across a model switch"
+            host.moment
+                .read()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .is_some_and(|left| left.percent == 40),
+            "a pre-switch reply must not land across a model switch: the \
+             standing figures are newer than it"
         );
     }
 }

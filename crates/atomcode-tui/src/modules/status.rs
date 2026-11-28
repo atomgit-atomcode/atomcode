@@ -650,7 +650,9 @@ const ALLOWANCE_SPENT: u8 = 95;
 
 /// Whether the badge is on the row right now — the cheap form of
 /// [`allowance_badge`], for callers that only need the visibility judgment
-/// and would otherwise build a string every heartbeat just to ask.
+/// and would otherwise build a string every heartbeat just to ask. The row's
+/// render draws through [`allowance_badge`], which keys on this exact
+/// predicate, so "visible here" and "drawn there" cannot disagree.
 pub(crate) fn badge_visible(
     left: &crate::moment::Allowance,
     now: crate::moment::Timestamp,
@@ -1139,6 +1141,31 @@ mod tests {
             !row.contains("滚动窗口") && !row.contains("窗口结束"),
             "{row}"
         );
+    }
+
+    /// The cheap visibility judgment and the badge it feeds must agree on
+    /// every input: the heartbeat asks `badge_visible`, the draw asks
+    /// `allowance_badge` — if the two ever disagreed, the row would say
+    /// "nothing to see" while drawing a badge, or the other way round.
+    #[test]
+    fn badge_visible_and_allowance_badge_never_disagree() {
+        let now = crate::moment::Timestamp::millis(0);
+        let left = |percent, resets_at: &str| crate::moment::Allowance {
+            label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
+            percent,
+            resets_at: resets_at.into(),
+            resets_by: None,
+        };
+        for percent in [0, 1, ALLOWANCE_NEAR - 1, ALLOWANCE_NEAR, 50, 99, 100] {
+            for resets_at in ["", "17:51"] {
+                let allowance = left(percent, resets_at);
+                assert_eq!(
+                    badge_visible(&allowance, now),
+                    allowance_badge(&allowance, now).is_some(),
+                    "visibility judgment and drawn badge must agree at {percent}% / {resets_at}"
+                );
+            }
+        }
     }
 
     /// A countdown is counted from when the host said it, not frozen at it: the
