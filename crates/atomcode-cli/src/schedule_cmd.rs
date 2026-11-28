@@ -627,6 +627,25 @@ pub(crate) fn mode_from_str(s: &str) -> atomcode_coding::RuntimeMode {
     }
 }
 
+/// The mode an unattended scheduled run actually uses.
+///
+/// Mirrors `atomcode_daemon::schedule_runner`'s rule exactly: `auto` answers
+/// approval requests inside the runtime, so with nobody present it would run
+/// shell commands without anyone able to refuse. It therefore needs the task's
+/// explicit `allow_unattended_auto`; otherwise it is capped at `AcceptEdits`
+/// (edits applied, shell still asks and is refused).
+pub(crate) fn scheduled_mode(
+    mode: atomcode_coding::RuntimeMode,
+    allow_unattended_auto: bool,
+) -> atomcode_coding::RuntimeMode {
+    use atomcode_coding::RuntimeMode;
+    if mode == RuntimeMode::Auto && !allow_unattended_auto {
+        RuntimeMode::AcceptEdits
+    } else {
+        mode
+    }
+}
+
 /// Map a headless exit code to the status appended to the run ledger.
 pub(crate) fn last_status_for(exit_code: i32) -> &'static str {
     match exit_code {
@@ -793,14 +812,14 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
     }
 
     // 8. Set the runtime mode after spawn.
-    //    Scheduled tasks cap Auto at AcceptEdits so the middleware layer does not
-    //    blanket-approve dangerous bash — the strict approver in run_native_headless
-    //    provides the second safety net.  Plan and AcceptEdits pass through unchanged.
-    let effective_mode = if mode == atomcode_coding::RuntimeMode::Auto {
-        atomcode_coding::RuntimeMode::AcceptEdits
-    } else {
-        mode
-    };
+    //    A scheduled task runs unattended, so `auto` is capped at AcceptEdits
+    //    unless the task carries `allow_unattended_auto`: `auto` answers approval
+    //    requests inside the runtime, and the strict approver in
+    //    run_native_headless would never see one to refuse. The daemon's
+    //    schedule_runner degrades by exactly this rule — the two entries must not
+    //    disagree about what the same stored task means. Plan and AcceptEdits
+    //    pass through unchanged.
+    let effective_mode = scheduled_mode(mode, task.allow_unattended_auto);
     runtime
         .handle
         .set_mode(effective_mode)
@@ -1056,6 +1075,26 @@ mod tests {
         assert_eq!(mode_from_str("accept_edits"), RuntimeMode::AcceptEdits);
         assert_eq!(mode_from_str("auto"), RuntimeMode::Auto);
         assert_eq!(mode_from_str("bogus"), RuntimeMode::Plan); // safe default
+    }
+
+    // The daemon's schedule_runner uses this same rule. If the two ever drift,
+    // one and the same stored task means different things depending on which
+    // entry fired it, and the opt-in flag lies about what it controls.
+    #[test]
+    fn an_unattended_run_caps_auto_unless_the_task_opts_in() {
+        use atomcode_coding::RuntimeMode;
+        assert_eq!(
+            scheduled_mode(RuntimeMode::Auto, false),
+            RuntimeMode::AcceptEdits
+        );
+        assert_eq!(scheduled_mode(RuntimeMode::Auto, true), RuntimeMode::Auto);
+
+        // The flag is about `auto` only; it must not promote anything else.
+        assert_eq!(scheduled_mode(RuntimeMode::Plan, true), RuntimeMode::Plan);
+        assert_eq!(
+            scheduled_mode(RuntimeMode::AcceptEdits, true),
+            RuntimeMode::AcceptEdits
+        );
     }
 
     #[test]

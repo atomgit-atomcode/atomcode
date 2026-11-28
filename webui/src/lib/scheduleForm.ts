@@ -7,17 +7,30 @@ function canonical(value: unknown): string {
   if (value !== null && typeof value === 'object') return `{${Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).map(([key,v])=>`${JSON.stringify(key)}:${canonical(v)}`).join(',')}}`;
   return JSON.stringify(value) ?? 'undefined';
 }
+/** A field as it should be compared.
+ *
+ * `allow_unattended_auto` is newer than the schedule API: a daemon built before
+ * it omits the key, and an absent opt-in means "off", not "unknown". Comparing
+ * `undefined` against the editor's `false` would make every such task look
+ * edited the moment it is opened.
+ */
+function comparable(task: ScheduledTask, key: Field): unknown {
+  return key === 'allow_unattended_auto' ? Boolean(task[key]) : task[key];
+}
 export function sameTask(a: ScheduledTask, b: ScheduledTask): boolean {
-  return editable.every(key => canonical(a[key]) === canonical(b[key]));
+  return editable.every(key => canonical(comparable(a, key)) === canonical(comparable(b, key)));
 }
 /** Refresh untouched fields; never silently overwrite a field changed by both editors. */
 export function rebaseSchedule(base: ScheduleEntry, draft: ScheduledTask, incoming: ScheduleEntry): { draft: ScheduledTask; conflicts: Field[] } {
   const result = structuredClone(incoming.task);
   const conflicts: Field[] = [];
   for (const key of editable) {
-    if (canonical(draft[key]) === canonical(base.task[key])) continue;
-    if (canonical(incoming.task[key]) !== canonical(base.task[key]) && canonical(incoming.task[key]) !== canonical(draft[key])) conflicts.push(key);
-    Object.assign(result, { [key]: structuredClone(draft[key]) });
+    const mine = canonical(comparable(draft, key));
+    const theirs = canonical(comparable(incoming.task, key));
+    const original = canonical(comparable(base.task, key));
+    if (mine === original) continue;
+    if (theirs !== original && theirs !== mine) conflicts.push(key);
+    Object.assign(result, { [key]: structuredClone(comparable(draft, key)) });
   }
   return { draft: result, conflicts };
 }

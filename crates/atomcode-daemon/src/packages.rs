@@ -755,6 +755,10 @@ pub fn rollback(name: &str) -> Result<PackageRecord, String> {
     if !is_package_name(name) {
         return Err(format!("invalid package name: {name:?}"));
     }
+    // Same lock as install and remove: a rollback moves `current` and `previous`
+    // through a third name, which an install running at the same time would see
+    // as half-swapped trees.
+    let _serialized = install_guard();
     let root = packages_root();
     let current = root.join(name);
     let previous = root.join(format!(".previous-{name}"));
@@ -2473,6 +2477,9 @@ fn remove(name: &str) -> Result<bool, String> {
     if !is_package_name(name) {
         return Err(format!("invalid package name: {name:?}"));
     }
+    // An install of the same package running now would recreate the directory
+    // this is about to delete, or delete the tree it just moved into place.
+    let _serialized = install_guard();
     let root = packages_root();
     let dir = root.join(name);
     if !dir.exists() {

@@ -34,15 +34,6 @@ pub fn remove(key: &str) {
     }
 }
 
-/// Apply the registry to a `std` child command.
-pub fn apply(cmd: &mut std::process::Command) {
-    if let Ok(map) = table().read() {
-        for (key, value) in map.iter() {
-            cmd.env(key, value);
-        }
-    }
-}
-
 /// Apply the registry to a `tokio` child command.
 pub fn apply_async(cmd: &mut tokio::process::Command) {
     let Ok(map) = table().read() else {
