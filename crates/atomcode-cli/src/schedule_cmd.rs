@@ -747,11 +747,16 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
         config.resolve_model(Some(selection))?;
         atomcode_schedule::timing::validate(task)?;
     }
-    let runtime_cfg = crate::runtime_config_from(
+    let mut runtime_cfg = crate::runtime_config_from(
         &config, &cwd, selection, None,  // no per-task telemetry arc needed
         false, // dangerously_skip_permissions=false — scheduled: never full bypass
         false, // headless: fail-closed approval timeout
     );
+    // The cap has to be in the config, not applied with `set_mode` afterwards:
+    // the runtime applies `initial_mode` at startup, and a globally configured
+    // `auto` default would otherwise be in force between the spawn and that
+    // later call. Set here it is the mode the runtime is born with.
+    runtime_cfg.initial_mode = scheduled_mode(mode, task.allow_unattended_auto);
 
     // The run lease protects this binding across OS/manual launches. Never fork
     // a busy conversation or silently start over after deletion/resume failure.
@@ -811,14 +816,17 @@ async fn execute_task(lease: &atomcode_schedule::RunLease) -> Result<(i32, Optio
         })?;
     }
 
-    // 8. Set the runtime mode after spawn.
-    //    A scheduled task runs unattended, so `auto` is capped at AcceptEdits
-    //    unless the task carries `allow_unattended_auto`: `auto` answers approval
-    //    requests inside the runtime, and the strict approver in
-    //    run_native_headless would never see one to refuse. The daemon's
-    //    schedule_runner degrades by exactly this rule — the two entries must not
-    //    disagree about what the same stored task means. Plan and AcceptEdits
-    //    pass through unchanged.
+    // 8. Re-assert the mode on the live runtime.
+    //    The cap was already written into `runtime_cfg.initial_mode`, so the
+    //    runtime was born with it; this keeps the live state explicit for any
+    //    driver watching, and is a no-op when the two agree.
+    //
+    //    The rule itself: a scheduled task runs unattended, so `auto` is capped
+    //    at AcceptEdits unless the task carries `allow_unattended_auto`. `auto`
+    //    answers approval requests inside the runtime, and the strict approver
+    //    in run_native_headless would never see one to refuse. The daemon's
+    //    schedule_runner degrades by exactly this rule — the two entries must
+    //    not disagree about what the same stored task means.
     let effective_mode = scheduled_mode(mode, task.allow_unattended_auto);
     runtime
         .handle

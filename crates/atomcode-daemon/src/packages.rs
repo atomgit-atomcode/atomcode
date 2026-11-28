@@ -306,6 +306,16 @@ const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 /// compressed cap, which every shipped bundle (CPython, numpy, node) is under.
 const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The most entries a bundle may carry, counting directories and links too.
+///
+/// `MAX_UNPACKED_BYTES` only counts *file bodies*. Tar headers are ~512 bytes
+/// each and cost nothing after gzip, so a bundle of one-byte files can stay
+/// inside the byte budget while creating hundreds of millions of files — each
+/// taking an inode and a filesystem block, which exhausts the disk long before
+/// any byte limit is reached. A real bundle (CPython, numpy, node) is a few
+/// tens of thousands of entries; this is generous by an order of magnitude.
+const MAX_ENTRIES: u64 = 200_000;
+
 /// GET /packages
 pub(crate) async fn list_packages() -> impl IntoResponse {
     match scan() {
@@ -1572,9 +1582,18 @@ fn unpack_tar_gz(
         .map_err(|error| format!("bundle is not a valid .tar.gz: {error}"))?;
     let mut files = 0u64;
     let mut unpacked = 0u64;
+    let mut entries_seen = 0u64;
     let mut next_report = UNPACK_STEP;
     for entry in entries {
         let mut entry = entry.map_err(|error| format!("corrupt bundle entry: {error}"))?;
+        // Every entry is one inode on disk, whatever its size, so the count is
+        // capped independently of the byte budget above.
+        entries_seen += 1;
+        if entries_seen > MAX_ENTRIES {
+            return Err(format!(
+                "bundle has more than {MAX_ENTRIES} entries, over the limit"
+            ));
+        }
         let path = entry
             .path()
             .map_err(|error| format!("corrupt bundle path: {error}"))?
@@ -1643,9 +1662,45 @@ fn unpack_tar_gz(
             files += 1;
             continue;
         }
+        // A hard link names its source relative to the **archive root**, unlike a
+        // symlink (which is relative to its own directory). tar writes one
+        // whenever two files share an inode upstream, so refusing it would make
+        // legitimate bundles uninstallable rather than safer.
+        if entry_type.is_hard_link() {
+            let link = entry
+                .link_name()
+                .map_err(|error| format!("corrupt bundle hard link: {error}"))?
+                .ok_or_else(|| format!("bundle hard link {} has no source", path.display()))?
+                .into_owned();
+            let source = match classify(&link) {
+                Relative::Inside(inside) => destination.join(inside),
+                Relative::RootDir => {
+                    return Err(format!(
+                        "bundle hard link {} has no source path",
+                        path.display()
+                    ))
+                }
+                Relative::Escape => {
+                    return Err(format!(
+                        "bundle hard link escapes the package root: {} -> {}",
+                        path.display(),
+                        link.display()
+                    ))
+                }
+            };
+            std::fs::hard_link(&source, &target).map_err(|error| {
+                format!(
+                    "cannot link {} to {}: {error}",
+                    target.display(),
+                    source.display()
+                )
+            })?;
+            files += 1;
+            continue;
+        }
         if !entry_type.is_file() {
             return Err(format!(
-                "bundle entry {} is not a regular file, directory or symlink",
+                "bundle entry {} is not a regular file, directory, symlink or hard link",
                 path.display()
             ));
         }
@@ -2092,7 +2147,6 @@ const RESERVED_COMMANDS: &[&str] = &[
     "git-receive-pack",
     "git-credential-store",
     "bash",
-    "sh",
 ];
 
 /// Refuse only what cannot be restored.
@@ -2527,6 +2581,48 @@ mod tests {
             add(path, body);
         }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// tar writes a hard-link entry whenever two upstream files share an inode,
+    /// so refusing that entry type would make a legitimate bundle uninstallable
+    /// rather than safer. The source is archive-root-relative (unlike a
+    /// symlink's target, which is relative to its own directory).
+    #[test]
+    fn a_hard_link_entry_is_installed_as_a_link() {
+        with_temp_root(|| {
+            let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            let mut add = |path: &str, body: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, body).unwrap();
+            };
+            add(
+                "package.json",
+                br#"{"name":"demo","version":"1","entry":"lib/demo.so"}"#,
+            );
+            add("lib/demo.so", b"\x7fELF");
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_path("lib/alias.so").unwrap();
+            header.set_link_name("lib/demo.so").unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            let bundle = builder.into_inner().unwrap().finish().unwrap();
+
+            install_bytes(&bundle).expect("a hard-link entry installs");
+            let dir = packages_root().join("demo");
+            assert_eq!(
+                std::fs::read(dir.join("lib/alias.so")).expect("the link exists"),
+                b"\x7fELF"
+            );
+        });
     }
 
     /// A bundle without a digest is refused.

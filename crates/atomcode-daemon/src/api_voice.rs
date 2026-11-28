@@ -221,9 +221,20 @@ fn read_recording_in(root: &std::path::Path, path: &std::path::Path) -> Result<V
             metadata.len()
         ));
     }
+    // Bound the read as well as the size check: the same inode can grow between
+    // the two (another writer appending), and `read_to_end` would then run past
+    // the limit it just passed.
     let mut audio = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut audio)
-        .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut file, MAX_RECORDING_BYTES + 1),
+        &mut audio,
+    )
+    .map_err(|error| format!("cannot read the recording {}: {error}", resolved.display()))?;
+    if audio.len() as u64 > MAX_RECORDING_BYTES {
+        return Err(format!(
+            "the recording grew past the {MAX_RECORDING_BYTES} byte limit while being read"
+        ));
+    }
     let is_wav = audio.len() >= 12 && &audio[0..4] == b"RIFF" && &audio[8..12] == b"WAVE";
     if !is_wav {
         return Err("the recording is not a WAV file".to_string());
