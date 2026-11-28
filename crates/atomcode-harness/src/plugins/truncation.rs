@@ -366,11 +366,29 @@ impl Waterfall<AgentRequest> for OnTruncation {
             .unwrap_or_else(|e| e.into_inner())
             .next_max_tokens
             .take()
-            .map(|budget| std::mem::replace(&mut req.options.max_tokens, Some(budget)));
+            .map(|budget| {
+                (
+                    budget,
+                    std::mem::replace(&mut req.options.max_tokens, Some(budget)),
+                )
+            });
         let mut response = match (next.run(req).await, raised_from) {
-            // The raise went past what this endpoint accepts: ask once more as before.
-            (Err(error), Some(original)) if rejects_output_budget(&error) => {
+            // The raise went past what this endpoint accepts: ask once more as
+            // before, and tell the person the raise the last notice announced
+            // did not happen — otherwise the screen keeps claiming a budget the
+            // request never used.
+            (Err(error), Some((budget, original))) if rejects_output_budget(&error) => {
                 req.options.max_tokens = original;
+                crate::session::commit(
+                    &self.ctx,
+                    &session,
+                    SessionEvent::Notice {
+                        turn: session.current_turn(),
+                        notice: crate::session::NoticeKind::OutputTruncated,
+                        detail: format!("服务商不接受把输出预算提高到 {budget}，已退回原预算重发"),
+                        retry: None,
+                    },
+                );
                 next.run(req).await?
             }
             (result, _) => result?,
