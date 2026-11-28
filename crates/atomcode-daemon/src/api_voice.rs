@@ -642,6 +642,52 @@ mod tests {
         assert_eq!(body, b"RIFF");
     }
 
+    /// On Windows the guard takes a different shape: `FILE_FLAG_OPEN_REPARSE_POINT`
+    /// opens the **link itself** instead of refusing to open it, so the open
+    /// succeeds and the handle refers to the reparse point. The property the
+    /// caller relies on is the same on both platforms, though: the target's
+    /// bytes must not come out.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlinked_recording_never_yields_the_target_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real.wav");
+        let secret = b"RIFF-and-then-the-secret-part";
+        std::fs::write(&real, secret).expect("write");
+        let link = dir.path().join("link.wav");
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            // Creating a symlink needs SeCreateSymbolicLinkPrivilege (or
+            // Developer Mode). Without it there is no link to be tricked by, and
+            // failing the test would report a privilege problem as a product
+            // one.
+            eprintln!("skipping: this account cannot create symlinks");
+            return;
+        }
+
+        let mut body = Vec::new();
+        match open_without_following(&link) {
+            Ok(mut file) => {
+                // Reading a reparse point handle either fails or yields
+                // nothing; what matters is that the target's bytes are not
+                // among them.
+                let _ = std::io::Read::read_to_end(&mut file, &mut body);
+            }
+            Err(_) => {
+                // Refusing to open the link is also an acceptable outcome.
+            }
+        }
+        assert!(
+            !body.windows(secret.len()).any(|window| window == secret),
+            "the link's target bytes must not be readable through it"
+        );
+
+        // The real file still opens and still reads — the guard is about links.
+        let mut file = open_without_following(&real).expect("the real file opens");
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut body).expect("read");
+        assert_eq!(body, secret);
+    }
+
     /// A stale recording is swept away; a fresh one is left alone.
     ///
     /// The normal path deletes a take as soon as it is transcribed. This is the

@@ -95,8 +95,14 @@ pub enum ScheduleCli {
         #[arg(long, value_parser = ["off", "important", "all"])]
         notify: Option<String>,
         /// Allow `--mode auto` to run unattended (see `add --allow-unattended-auto`).
-        #[arg(long)]
+        ///
+        /// `--no-allow-unattended-auto` takes the allowance back; without either
+        /// the flag the stored value is left as it is.
+        #[arg(long, overrides_with = "no_allow_unattended_auto")]
         allow_unattended_auto: bool,
+        /// Take the unattended-`auto` allowance away from a task.
+        #[arg(long)]
+        no_allow_unattended_auto: bool,
         /// Reject the edit if the task no longer has this observed revision.
         #[arg(long)]
         expected: Option<String>,
@@ -458,6 +464,7 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             mode,
             notify,
             allow_unattended_auto,
+            no_allow_unattended_auto,
             expected,
         } => {
             let service = task_service();
@@ -479,11 +486,14 @@ pub async fn handle_schedule(cli: ScheduleCli) -> Result<i32> {
             if let Some(value) = notify {
                 task.notify = value;
             }
-            // The flag only ever raises the allowance: `--allow-unattended-auto`
-            // turns it on, and there is no flag to turn it back off (use
-            // `--mode` for that). Editing a task must not silently hand a task
-            // more permission than it had.
-            if allow_unattended_auto {
+            // The flag can be turned on *and* off: `--allow-unattended-auto`
+            // grants the allowance and `--no-allow-unattended-auto` takes it
+            // back. A flag that only ever raises the allowance would leave a
+            // task stuck in the more permissive state with no way back from the
+            // command line.
+            if no_allow_unattended_auto {
+                task.allow_unattended_auto = false;
+            } else if allow_unattended_auto {
                 task.allow_unattended_auto = true;
             }
             if daily.is_some() || weekly.is_some() || every.is_some() || hourly {
@@ -1103,6 +1113,33 @@ mod tests {
             scheduled_mode(RuntimeMode::AcceptEdits, true),
             RuntimeMode::AcceptEdits
         );
+    }
+
+    /// The allowance has to be revocable from the command line.
+    ///
+    /// A flag that only ever raises it leaves a task stuck in the permissive
+    /// state with no way back — the webui checkbox can untick it, the CLI
+    /// could not.
+    #[test]
+    fn the_unattended_auto_allowance_can_be_granted_and_taken_back() {
+        let mut task = build_task(
+            "Brief",
+            "summarize",
+            "/tmp/p",
+            Schedule::Hourly,
+            "auto",
+            "off",
+            false,
+        );
+        assert!(!task.allow_unattended_auto);
+
+        // Granted.
+        task.allow_unattended_auto = true;
+        assert!(task.allow_unattended_auto);
+
+        // Taken back.
+        task.allow_unattended_auto = false;
+        assert!(!task.allow_unattended_auto);
     }
 
     #[test]

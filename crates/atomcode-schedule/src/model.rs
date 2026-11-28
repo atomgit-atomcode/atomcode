@@ -88,9 +88,19 @@ impl Service {
                 Mutation::Create { task }
             }
             "schedule_update" => {
-                let task: ScheduleTask = serde_json::from_value(args["task"].clone())?;
+                let mut task: ScheduleTask = serde_json::from_value(args["task"].clone())?;
                 scoped(&task.cwd, working_dir)?;
                 scoped(&self.store.get(&task.id)?.task.cwd, working_dir)?;
+                // The model may not manage the unattended-`auto` allowance: the
+                // tool's schema does not carry it (and `schedule_create`
+                // refuses `auto` outright), so a task that had it would silently
+                // lose it on **any** edit the model makes — renaming a task
+                // would turn the permission back off. Keep what is stored; the
+                // person who granted it is the one who takes it back, through
+                // the CLI or the panel.
+                if let Ok(current) = self.store.get(&task.id) {
+                    task.allow_unattended_auto = current.task.allow_unattended_auto;
+                }
                 Mutation::Update {
                     task,
                     expected: args["expected"]
@@ -179,5 +189,64 @@ mod tests {
                 &cancel
             )
             .is_err());
+    }
+
+    /// The model may not manage the unattended-`auto` allowance, so it must not
+    /// be able to clear it either.
+    ///
+    /// The tool's schema does not carry the field, so every model edit arrives
+    /// without it. Without the carry-over, renaming a task would turn the
+    /// permission back off — the model would be able to revoke a decision it
+    /// was never allowed to make, and the person who granted it would not know.
+    #[test]
+    fn a_model_edit_keeps_the_stored_unattended_auto_allowance() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let service = Service::new(crate::Store::new(root.path()), None);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let created = service
+            .call(
+                "schedule_create",
+                json!({"title":"Review","prompt":"Review changes","schedule":{"kind":"daily","time":"09:00"}}),
+                project.path(),
+                &cancel,
+            )
+            .unwrap();
+        let task = created["entry"]["task"].clone();
+        let revision = created["entry"]["revision"].clone();
+
+        // Grant the allowance the way the panel does — through the store. The
+        // model tool cannot grant it: `schedule_create` refuses `auto`, and
+        // `schedule_update`'s schema does not carry the field.
+        let mut granted = task.clone();
+        granted["allow_unattended_auto"] = json!(true);
+        let mut task_value: ScheduleTask = serde_json::from_value(granted).unwrap();
+        task_value.cwd = std::fs::canonicalize(project.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let stored = service
+            .store
+            .put(&task_value, Some(revision.as_str().unwrap()))
+            .unwrap();
+        let revision = stored.revision.clone();
+
+        // Now an edit that carries no such field — what the model always sends.
+        let mut renamed = task.clone();
+        renamed["title"] = json!("Renamed");
+        let edited = service
+            .call(
+                "schedule_update",
+                json!({"task":renamed,"expected":revision}),
+                project.path(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(
+            edited["entry"]["task"]["allow_unattended_auto"],
+            json!(true),
+            "a model edit must not revoke the allowance"
+        );
     }
 }
